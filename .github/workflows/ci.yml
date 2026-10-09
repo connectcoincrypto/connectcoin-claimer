@@ -51,9 +51,16 @@ jobs:
         run: npm run build:claims
         env:
           PYTHON: ${{ steps.python.outputs.python-path }}
+      - name: Install native ZIP tools
+        if: runner.os == 'Linux'
+        run: |
+          if ! command -v zip >/dev/null || ! command -v unzip >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install --no-install-recommends -y zip unzip
+          fi
       - name: Build portable executable and archive
         run: npm run build -- --archive
-      - name: Verify relocated package without Node or Python on PATH
+      - name: Extract ZIP and verify offline with an empty PATH
         run: npm run test:package
       - name: Upload verified portable archives
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
@@ -62,8 +69,6 @@ jobs:
           path: |
             dist/connectcoin-claimer-*-${{ matrix.platform }}-x64.zip
             dist/connectcoin-claimer-*-${{ matrix.platform }}-x64.zip.sha256
-            dist/connectcoin-claimer-*-${{ matrix.platform }}-x64.tar.gz
-            dist/connectcoin-claimer-*-${{ matrix.platform }}-x64.tar.gz.sha256
           if-no-files-found: error
           compression-level: 0
           retention-days: 14

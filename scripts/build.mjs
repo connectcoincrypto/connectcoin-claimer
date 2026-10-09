@@ -135,7 +135,7 @@ try {
   });
   if (!windows) await chmod(executable, 0o755);
   await cp(helperSource, join(stage, 'helpers', 'bin', 'connectwallet-claims'), { recursive: true, dereference: true });
-  for (const name of ['claimer.conf.example', 'README.md', 'LICENSE', 'THIRD_PARTY_NOTICES.md', 'PROVENANCE.md']) {
+  for (const name of ['README.md', 'LICENSE', 'THIRD_PARTY_NOTICES.md', 'PROVENANCE.md']) {
     await copyFile(join(root, name), join(stage, name));
   }
   for (const name of ['helpers/PROVENANCE.md', 'helpers/p2c_roots_v1.pem', 'helpers/vendor/LICENSE.connectcoin-p2c-tools']) {
@@ -172,17 +172,24 @@ try {
   } catch (error) { if (error.code !== 'ENOENT') throw error; }
   await rename(stage, destination);
   if (args.includes('--archive')) {
-    const archive = join(dist, `${packageName}${windows ? '.zip' : '.tar.gz'}`);
+    const archive = join(dist, `${packageName}.zip`);
+    // Always create a new archive: zip updates an existing file and can retain
+    // obsolete entries, including configuration from an older package.
+    const freshArchive = join(scratch, `${packageName}.zip`);
     if (windows) {
       // Windows 10+ includes bsdtar; -a chooses ZIP from the archive extension.
       // Avoid PowerShell module auto-loading and its inherited PSModulePath.
       const tar = join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'tar.exe');
-      await run(tar, ['-a', '-cf', archive, '-C', dist, packageName]);
+      await run(tar, ['-a', '-cf', freshArchive, '-C', dist, packageName]);
     } else {
-      await run('tar', ['-czf', archive, '-C', dist, packageName]);
+      // Info-ZIP preserves Unix executable modes for native unzip extraction.
+      await run('zip', ['-q', '-r', freshArchive, packageName], { cwd: dist });
     }
-    const checksum = createHash('sha256').update(await readFile(archive)).digest('hex');
-    await writeFile(`${archive}.sha256`, `${checksum}  ${basename(archive)}\n`);
+    const checksum = createHash('sha256').update(await readFile(freshArchive)).digest('hex');
+    const freshChecksum = `${freshArchive}.sha256`;
+    await writeFile(freshChecksum, `${checksum}  ${basename(archive)}\n`);
+    await rename(freshArchive, archive);
+    await rename(freshChecksum, `${archive}.sha256`);
     console.log(`Archive: ${archive}`);
   }
   console.log(`Portable package: ${destination}`);

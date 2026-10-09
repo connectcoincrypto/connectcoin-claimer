@@ -1,45 +1,80 @@
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { cp, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { cp, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { dirname, isAbsolute, join, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { promisify } from 'node:util';
 import { ConnectionPool } from '../src/core/claim-pool.mjs';
+import { CONFIG_TEMPLATE } from '../src/config.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const windows = process.platform === 'win32';
 const pkg = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'));
-if (process.argv.length > 3) throw new Error('Usage: node scripts/test-package.mjs [package-directory]');
-const source = resolve(process.argv[2] ?? join(root, 'dist', `connectcoin-claimer-${pkg.version}-${windows ? 'win' : process.platform}-${process.arch}`));
-const manifest = JSON.parse(await readFile(join(source, 'package-manifest.json'), 'utf8'));
-assert.equal(manifest.name, 'connectcoin-claimer');
-assert.equal(manifest.version, pkg.version);
-assert.equal(manifest.platform, process.platform);
-assert.equal(manifest.arch, process.arch);
-assert.equal(manifest.entrypoint, windows ? 'claimer.exe' : 'claimer');
+if (process.argv.length > 3) throw new Error('Usage: node scripts/test-package.mjs [package.zip]');
+const packageName = `connectcoin-claimer-${pkg.version}-${windows ? 'win' : process.platform}-${process.arch}`;
+const archive = resolve(process.argv[2] ?? join(root, 'dist', `${packageName}.zip`));
+assert.ok(archive.endsWith('.zip'), 'Package verification requires the distributed ZIP.');
+const archiveHash = createHash('sha256').update(await readFile(archive)).digest('hex');
+assert.equal(await readFile(`${archive}.sha256`, 'utf8'), `${archiveHash}  ${basename(archive)}\n`, 'ZIP checksum must match the exact archive.');
+const forbiddenPackagePath = /(^|\/)(?:node_modules|\.claims-venv|\.git)(\/|$)|\.conf(?:[./]|$)|\.state\.json(?:[./]|$)|\.lock(?:[./]|$)|(^|\/)wallet\.json$/i;
 
 async function filesBelow(directory, prefix = '') {
   const files = [];
   for (const entry of await readdir(directory, { withFileTypes: true })) {
     const name = prefix ? `${prefix}/${entry.name}` : entry.name;
     if (entry.isDirectory()) files.push(...await filesBelow(join(directory, entry.name), name));
-    else files.push(name);
+    else if (entry.isFile()) files.push(name);
+    else throw new Error(`Unsupported package entry: ${name}`);
   }
   return files.sort();
 }
 
-for (const entry of manifest.files) {
-  assert.ok(!isAbsolute(entry.path) && !entry.path.split(/[\\/]/).includes('..'), 'Manifest paths must stay inside the package.');
-  const bytes = await readFile(join(source, entry.path));
-  assert.equal(bytes.length, entry.bytes, entry.path);
-  assert.equal(createHash('sha256').update(bytes).digest('hex'), entry.sha256, entry.path);
-}
-assert.deepEqual(await filesBelow(source), [...manifest.files.map((entry) => entry.path), 'package-manifest.json', 'SHA256SUMS'].sort());
-assert.ok(!manifest.files.some(({ path }) => /(^|\/)(?:node_modules|\.claims-venv|\.git)(\/|$)|\.conf$|\.state\.json$|wallet\.json$/i.test(path)), 'The release must not contain working credentials, configuration or development environments.');
-
 const scratch = await mkdtemp(join(tmpdir(), 'claimer package test '));
 try {
+  const extract = join(scratch, 'extracted ZIP');
+  await mkdir(extract);
+  const nativeArchiveTool = windows ? join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'tar.exe') : 'unzip';
+  const runArchiveTool = promisify(execFile);
+  const archiveOptions = { windowsHide: true, timeout: 120_000, maxBuffer: 16 * 1024 * 1024 };
+  const { stdout: listing } = await runArchiveTool(nativeArchiveTool, windows ? ['-tf', archive] : ['-Z1', archive], archiveOptions);
+  const archiveEntries = listing.trimEnd().split(/\r?\n/);
+  assert.ok(archiveEntries.length > 0, 'The ZIP must contain a package.');
+  assert.equal(new Set(archiveEntries).size, archiveEntries.length, 'The ZIP must not contain duplicate entries.');
+  for (const entry of archiveEntries) {
+    const parts = entry.replace(/\/$/, '').split('/');
+    assert.ok(!isAbsolute(entry) && !/[\\:]/.test(entry) && parts.every((part) => part && part !== '.' && part !== '..'), 'ZIP paths must stay inside the extraction folder.');
+    assert.equal(parts[0], packageName, 'The ZIP must contain exactly the named package folder.');
+    assert.ok(!forbiddenPackagePath.test(entry), `Release ZIP contains configuration, runtime state, credentials or development files: ${entry}`);
+  }
+  await runArchiveTool(nativeArchiveTool, windows ? ['-xf', archive, '-C', extract] : ['-q', archive, '-d', extract], archiveOptions);
+  const source = join(extract, packageName);
+  const manifestBytes = await readFile(join(source, 'package-manifest.json'));
+  const manifest = JSON.parse(manifestBytes);
+  assert.equal(manifest.format, 1);
+  assert.equal(manifest.name, 'connectcoin-claimer');
+  assert.equal(manifest.version, pkg.version);
+  assert.equal(manifest.platform, process.platform);
+  assert.equal(manifest.arch, process.arch);
+  assert.equal(manifest.entrypoint, windows ? 'claimer.exe' : 'claimer');
+  for (const entry of manifest.files) {
+    assert.ok(!isAbsolute(entry.path) && !/[\\:]/.test(entry.path) && entry.path.split('/').every((part) => part && part !== '.' && part !== '..'), 'Manifest paths must stay inside the package.');
+    assert.ok(!forbiddenPackagePath.test(entry.path), `Forbidden release file: ${entry.path}`);
+    const bytes = await readFile(join(source, entry.path));
+    assert.equal(bytes.length, entry.bytes, entry.path);
+    assert.equal(createHash('sha256').update(bytes).digest('hex'), entry.sha256, entry.path);
+  }
+  const pristineFiles = [...manifest.files.map((entry) => entry.path), 'package-manifest.json', 'SHA256SUMS'].sort();
+  assert.deepEqual(await filesBelow(source), pristineFiles, 'Every extracted file must appear exactly once in the manifest.');
+  const manifestHash = createHash('sha256').update(manifestBytes).digest('hex');
+  assert.equal(await readFile(join(source, 'SHA256SUMS'), 'utf8'), `${manifest.files.map((entry) => `${entry.sha256}  ${entry.path}`).join('\n')}\n${manifestHash}  package-manifest.json\n`, 'SHA256SUMS must match all files and the manifest exactly.');
+  const helperPath = join('helpers', 'bin', 'connectwallet-claims', windows ? 'connectwallet-claims.exe' : 'connectwallet-claims');
+  if (!windows) {
+    for (const name of [manifest.entrypoint, helperPath]) {
+      assert.ok((await stat(join(source, name))).mode & 0o111, `ZIP extraction must preserve executable permissions: ${name}`);
+    }
+  }
   const portable = join(scratch, 'portable folder with spaces');
   const elsewhere = join(scratch, 'unrelated working directory');
   await cp(source, portable, { recursive: true });
@@ -64,8 +99,8 @@ try {
   }
   assert.ok((await run(executable, ['--version'])).includes(pkg.version));
   assert.match(await run(executable, ['--help']), /--config/);
-  assert.ok(!(await filesBelow(portable)).includes('claimer.conf'), '--help/--version must not create a config.');
-  const helper = join(portable, 'helpers', 'bin', 'connectwallet-claims', windows ? 'connectwallet-claims.exe' : 'connectwallet-claims');
+  assert.deepEqual(await filesBelow(portable), pristineFiles, '--help/--version must not create any files.');
+  const helper = join(portable, helperPath);
   await run(helper, ['--self-test']);
   const pool = new ConnectionPool({
     basePath: portable,
@@ -79,9 +114,12 @@ try {
   // Public test fixture only. --check is offline and must never start mining or RPC.
   const address = 'cc1pr6lfwrhp9h65ffn7zs20ce4r56zh3uvucuzxp0w6xp9yzx847c7qeejl6q';
   const defaultConfig = join(portable, 'claimer.conf');
-  await run(executable, [], 2);
+  assert.match(await run(executable, [], 2), /No connections were made\./);
   const template = await readFile(defaultConfig, 'utf8');
+  assert.equal(template, CONFIG_TEMPLATE, 'First launch must create the default configuration with a blank receiving address.');
   assert.match(template, /^receiving_address=\s*$/m);
+  assert.deepEqual(await filesBelow(portable), [...pristineFiles, 'claimer.conf'].sort(), 'First launch may only create the blank configuration, never state or a lock.');
+  assert.deepEqual(await filesBelow(elsewhere), [], 'First launch must write beside the executable, not in the working directory.');
   await run(executable, ['--init']);
   assert.equal(await readFile(defaultConfig, 'utf8'), template, '--init must preserve an existing configuration.');
   await run(executable, ['--check'], 1);
@@ -92,9 +130,10 @@ try {
   assert.match(await run(executable, ['--config', explicitConfig, '--check']), /Configuration valid\./);
   await writeFile(explicitConfig, 'receiving_address=invalid\n');
   await run(executable, ['--config', explicitConfig, '--check'], 1);
-  assert.ok(!(await filesBelow(portable)).some((name) => name.endsWith('.state.json')), 'Offline check must not create state.');
-  assert.ok(!(await filesBelow(elsewhere)).some((name) => name.endsWith('.state.json')), 'Explicit offline check must not create state.');
-  console.log('Portable executable and bundled claims helper passed offline checks with an empty PATH, relocated package, and unrelated working directory.');
+  assert.deepEqual(await filesBelow(portable), [...pristineFiles, 'claimer.conf'].sort(), 'Offline checks must not create state or lock files.');
+  assert.deepEqual(await filesBelow(elsewhere), ['explicit configuration.conf'], 'Explicit offline checks must not create state or lock files.');
+  assert.deepEqual(await filesBelow(source), pristineFiles, 'Verification must preserve the pristine extracted package.');
+  console.log('Distributed ZIP, exact file hashes, executable modes, first-launch configuration and bundled helper passed offline checks with an empty PATH and relocated package.');
 } finally {
   await rm(scratch, { recursive: true, force: true });
 }

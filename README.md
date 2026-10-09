@@ -12,10 +12,11 @@ configuration.
 
 ## Run the portable program
 
-1. Extract the **whole** archive into a writable folder. Keep `claimer.exe`
+1. Extract the **whole ZIP** into a writable folder. Keep `claimer.exe`
    (Windows) or `claimer` (Linux) together with its `helpers` directory.
-2. Run `claimer.exe` / `./claimer`. If `claimer.conf` is missing, the program
-   creates it beside the executable and exits without connecting.
+2. Run `claimer.exe` / `./claimer`. The ZIP contains no configuration file or
+   example. On first launch, the program creates `claimer.conf` beside the
+   executable with a blank receiving address and exits without connecting.
 3. Set `receiving_address` to **your own mainnet `cc1p...` address**.
 4. Optionally run `claimer.exe --check` (or `./claimer --check`). This validates
    the configuration and helper availability offline, without making claims.
@@ -131,8 +132,9 @@ these protections risks duplicate work.
 ## Build from source
 
 Requires Node.js **24.19.0 or newer within Node 24**, Python **3.11+**, and the
-native build architecture. Packaging targets: Windows x64 and Linux x64; each
-CI job tests its native artifact before uploading it.
+native build architecture. Linux archive builds also require `zip` and `unzip`.
+Packaging targets: Windows x64 and Linux x64; each CI job extracts and tests its
+native ZIP before uploading it, including Linux executable permissions.
 
 ```sh
 npm ci
@@ -146,8 +148,13 @@ npm run test:package
 runs the Python/loopback tests, and builds the native helper. Set `PYTHON` to an
 explicit Python executable if needed. It does not alter global Python packages.
 `build` bundles the JS into a Node single executable application (SEA), includes
-the helper and dependency licenses, and produces `dist/` portable archives with
-SHA-256 manifests. The entire extracted folder is required, not just the EXE.
+the helper and all of its runtime libraries, dependency licenses, and produces
+`dist/` portable ZIP archives with SHA-256 manifests and archive checksums. No
+installer is produced. The entire extracted folder is required, not just the
+EXE. `test:package` verifies the ZIP checksum, extracts it, checks every packaged
+file and tests first launch offline. An explicit ZIP path can be passed with
+`npm run test:package -- /path/to/package.zip`. The source-only
+`claimer.conf.example` is not included in release ZIPs.
 
 For development: `npm start -- --init`, edit `claimer.conf`, then `npm start`.
 Tests use fake workers or loopback servers; they do not claim real bounties or
