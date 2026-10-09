@@ -1,0 +1,20 @@
+{
+  "name": "connectcoin-claimer",
+  "version": "1.0.0",
+  "description": "Address-only, headless ConnectCoin Automatic Claims client",
+  "type": "module",
+  "private": true,
+  "license": "MIT",
+  "engines": { "node": ">=24.19.0 <25" },
+  "repository": { "type": "git", "url": "https://github.com/connectcoincrypto/connectcoin-claimer.git" },
+  "scripts": {
+    "start": "node src/cli.mjs",
+    "test": "node --test --test-timeout=60000 test/*.test.mjs",
+    "setup:claims": "node scripts/setup-claims.mjs",
+    "build:claims": "node scripts/setup-claims.mjs --build",
+    "build": "node scripts/build.mjs",
+    "test:package": "node scripts/test-package.mjs"
+  },
+  "dependencies": { "@noble/curves": "2.4.0", "@scure/base": "2.4.0" },
+  "devDependencies": { "esbuild": "0.28.2", "postject": "1.0.0-alpha.6" }
+}

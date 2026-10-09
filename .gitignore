@@ -1,0 +1,12 @@
+node_modules/
+.claims-venv/
+helpers/bin/
+tmp/
+dist/
+__pycache__/
+*.pyc
+claimer.conf
+*.state.json
+*.lock
+*.log
+*.tmp

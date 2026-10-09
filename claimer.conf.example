@@ -1,0 +1,12 @@
+# ConnectCoin Claimer - mainnet. Never put a private key or recovery phrase here.
+receiving_address=
+max_connections_per_second=100
+max_simultaneous_connections=100
+min_connects_per_connection_second=1000
+
+# Optional settings. RPC is ConnectCoin's public JSON-RPC service, not Core RPC.
+rpc_host=connectcoin4.com
+rpc_port=48190
+lookback_blocks=600
+# Atomic connects per virtual byte (1 CONN = 10000000000 connects).
+fee_rate=1500

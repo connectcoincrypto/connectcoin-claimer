@@ -1,0 +1,69 @@
+name: Claimer checks and portable builds
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: claimer-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.platform }} / x64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-2022
+            platform: win
+          - runner: ubuntu-22.04
+            platform: linux
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: '24.19.0'
+          architecture: x64
+          cache: npm
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        id: python
+        with:
+          python-version: '3.13'
+          architecture: x64
+          cache: pip
+          cache-dependency-path: |
+            helpers/requirements.txt
+            helpers/requirements-build.txt
+      - name: Install locked JavaScript dependencies
+        run: npm ci
+      - name: Test application
+        run: npm test
+      - name: Build and verify the standalone claims helper
+        run: npm run build:claims
+        env:
+          PYTHON: ${{ steps.python.outputs.python-path }}
+      - name: Build portable executable and archive
+        run: npm run build -- --archive
+      - name: Verify relocated package without Node or Python on PATH
+        run: npm run test:package
+      - name: Upload verified portable archives
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: connectcoin-claimer-${{ matrix.platform }}-x64-${{ github.sha }}
+          path: |
+            dist/connectcoin-claimer-*-${{ matrix.platform }}-x64.zip
+            dist/connectcoin-claimer-*-${{ matrix.platform }}-x64.zip.sha256
+            dist/connectcoin-claimer-*-${{ matrix.platform }}-x64.tar.gz
+            dist/connectcoin-claimer-*-${{ matrix.platform }}-x64.tar.gz.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
