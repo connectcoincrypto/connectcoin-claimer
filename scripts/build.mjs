@@ -6,18 +6,17 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'nod
 import { fileURLToPath } from 'node:url';
 import { build } from 'esbuild';
 import postject from 'postject';
+import { packageTarget } from './package-target.mjs';
+import { verifyMacOSPackage } from './macos-package.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const windows = process.platform === 'win32';
-const platform = windows ? 'win' : process.platform;
-const executableName = windows ? 'claimer.exe' : 'claimer';
+const macos = process.platform === 'darwin';
+const { platform, executable: executableName } = packageTarget();
 const helperName = windows ? 'connectwallet-claims.exe' : 'connectwallet-claims';
 const manifestName = 'package-manifest.json';
 const args = process.argv.slice(2);
 if (args.some((arg) => arg !== '--archive')) throw new Error('Usage: node scripts/build.mjs [--archive]');
-if (!['win32', 'linux'].includes(process.platform) || !['x64', 'arm64'].includes(process.arch)) {
-  throw new Error('Build on native Windows or Linux, with matching 64-bit Node.js and Python.');
-}
 const [nodeMajor, nodeMinor] = process.versions.node.split('.').map(Number);
 if (nodeMajor !== 24 || nodeMinor < 19) throw new Error('Build with Node.js 24.19.0 or newer within the Node.js 24 LTS line.');
 const pkg = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'));
@@ -130,10 +129,15 @@ try {
   await run(process.execPath, ['--experimental-sea-config', config]);
   const executable = join(stage, executableName);
   await copyFile(process.execPath, executable);
+  // Injection changes signed Mach-O bytes. Remove the copied Node signature,
+  // use Node's SEA segment, then sign the finished binary (no Developer ID).
+  if (macos) await run('/usr/bin/codesign', ['--remove-signature', executable]);
   await postject.inject(executable, 'NODE_SEA_BLOB', await readFile(blob), {
     sentinelFuse: 'NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2',
+    ...(macos ? { machoSegmentName: 'NODE_SEA' } : {}),
   });
   if (!windows) await chmod(executable, 0o755);
+  if (macos) await run('/usr/bin/codesign', ['--force', '--sign', '-', executable]);
   await cp(helperSource, join(stage, 'helpers', 'bin', 'connectwallet-claims'), { recursive: true, dereference: true });
   for (const name of ['README.md', 'LICENSE', 'THIRD_PARTY_NOTICES.md', 'PROVENANCE.md']) {
     await copyFile(join(root, name), join(stage, name));
@@ -143,6 +147,7 @@ try {
     await copyFile(join(root, name), join(stage, name));
   }
   await writeLicenses(stage, result.metafile);
+  if (macos) await verifyMacOSPackage(stage);
   await run(executable, ['--version'], { cwd: stage });
   await run(join(stage, 'helpers', 'bin', 'connectwallet-claims', helperName), ['--self-test'], { cwd: stage });
   const entries = [];

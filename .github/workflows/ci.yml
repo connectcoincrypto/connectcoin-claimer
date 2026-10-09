@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   build:
-    name: ${{ matrix.platform }} / x64
+    name: ${{ matrix.platform }} / ${{ matrix.arch }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     strategy:
@@ -23,8 +23,16 @@ jobs:
         include:
           - runner: windows-2022
             platform: win
+            arch: x64
           - runner: ubuntu-22.04
             platform: linux
+            arch: x64
+          - runner: macos-15
+            platform: macos
+            arch: arm64
+          - runner: macos-15-intel
+            platform: macos
+            arch: x64
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -32,13 +40,13 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: '24.19.0'
-          architecture: x64
+          architecture: ${{ matrix.arch }}
           cache: npm
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         id: python
         with:
           python-version: '3.13'
-          architecture: x64
+          architecture: ${{ matrix.arch }}
           cache: pip
           cache-dependency-path: |
             helpers/requirements.txt
@@ -47,6 +55,19 @@ jobs:
         run: npm ci
       - name: Test application
         run: npm test
+      - name: Prepare native macOS toolchain
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          echo "MACOSX_DEPLOYMENT_TARGET=15.0" >> "$GITHUB_ENV"
+          xcrun --find clang
+          if [[ "${{ matrix.arch }}" == "x64" ]]; then
+            brew list openssl@3 >/dev/null 2>&1 || brew install openssl@3
+            test -f "$(brew --prefix openssl@3)/lib/libssl.a"
+            test -f "$(brew --prefix openssl@3)/lib/libcrypto.a"
+            rustc --version
+            cargo --version
+          fi
       - name: Build and verify the standalone claims helper
         run: npm run build:claims
         env:
@@ -65,10 +86,10 @@ jobs:
       - name: Upload verified portable archives
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
-          name: connectcoin-claimer-${{ matrix.platform }}-x64-${{ github.sha }}
+          name: connectcoin-claimer-${{ matrix.platform }}-${{ matrix.arch }}-${{ github.sha }}
           path: |
-            dist/connectcoin-claimer-*-${{ matrix.platform }}-x64.zip
-            dist/connectcoin-claimer-*-${{ matrix.platform }}-x64.zip.sha256
+            dist/connectcoin-claimer-*-${{ matrix.platform }}-${{ matrix.arch }}.zip
+            dist/connectcoin-claimer-*-${{ matrix.platform }}-${{ matrix.arch }}.zip.sha256
           if-no-files-found: error
           compression-level: 0
           retention-days: 14

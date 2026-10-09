@@ -8,12 +8,15 @@ import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { ConnectionPool } from '../src/core/claim-pool.mjs';
 import { CONFIG_TEMPLATE } from '../src/config.mjs';
+import { packageTarget } from './package-target.mjs';
+import { verifyMacOSPackage } from './macos-package.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const windows = process.platform === 'win32';
 const pkg = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'));
 if (process.argv.length > 3) throw new Error('Usage: node scripts/test-package.mjs [package.zip]');
-const packageName = `connectcoin-claimer-${pkg.version}-${windows ? 'win' : process.platform}-${process.arch}`;
+const target = packageTarget();
+const packageName = `connectcoin-claimer-${pkg.version}-${target.platform}-${target.arch}`;
 const archive = resolve(process.argv[2] ?? join(root, 'dist', `${packageName}.zip`));
 assert.ok(archive.endsWith('.zip'), 'Package verification requires the distributed ZIP.');
 const archiveHash = createHash('sha256').update(await readFile(archive)).digest('hex');
@@ -79,8 +82,9 @@ try {
   const elsewhere = join(scratch, 'unrelated working directory');
   await cp(source, portable, { recursive: true });
   await mkdir(elsewhere);
+  if (process.platform === 'darwin') await verifyMacOSPackage(portable);
   const executable = join(portable, manifest.entrypoint);
-  const env = Object.fromEntries(Object.entries(process.env).filter(([name]) => !/^(?:PATH|PYTHON.*|NODE.*|VIRTUAL_ENV|CONDA.*|CLAIMER.*|CONNECT.*)$/i.test(name)));
+  const env = Object.fromEntries(Object.entries(process.env).filter(([name]) => !/^(?:PATH|PYTHON.*|NODE.*|VIRTUAL_ENV|CONDA.*|DYLD_.*|CLAIMER.*|CONNECT.*)$/i.test(name)));
   env.PATH = '';
   function run(command, args, expected = 0) {
     return new Promise((accept, reject) => {

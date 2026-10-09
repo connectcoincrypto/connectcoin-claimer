@@ -13,7 +13,7 @@ configuration.
 ## Run the portable program
 
 1. Extract the **whole ZIP** into a writable folder. Keep `claimer.exe`
-   (Windows) or `claimer` (Linux) together with its `helpers` directory.
+   (Windows) or `claimer` (Linux/macOS) together with its `helpers` directory.
 2. Run `claimer.exe` / `./claimer`. The ZIP contains no configuration file or
    example. On first launch, the program creates `claimer.conf` beside the
    executable with a blank receiving address and exits without connecting.
@@ -27,7 +27,15 @@ configuration.
 You do not need Node.js, Python, Electron, or ConnectCoin Core installed to use
 the portable package. Windows binaries are currently unsigned. The Linux x64
 CI package is built on Ubuntu 22.04 and requires a compatible glibc-based OS;
-it is not an Alpine/musl package. macOS packaging is not included yet.
+it is not an Alpine/musl package.
+
+macOS ZIPs are separate native builds: `macos-arm64` for Apple Silicon and
+`macos-x64` for Intel. They target **macOS 15 or newer** and are tested on macOS
+15. Run `./claimer` in Terminal from the extracted folder. No Homebrew, Node.js
+or Python installation is needed. The binaries have **ad-hoc signatures**, not
+Apple Developer ID signatures or notarization; Gatekeeper may block downloaded
+executables. Only approve software you trust using macOS Privacy & Security;
+do not disable Gatekeeper globally. Verify the published SHA-256 first.
 
 ## Configuration
 
@@ -132,9 +140,15 @@ these protections risks duplicate work.
 ## Build from source
 
 Requires Node.js **24.19.0 or newer within Node 24**, Python **3.11+**, and the
-native build architecture. Linux archive builds also require `zip` and `unzip`.
-Packaging targets: Windows x64 and Linux x64; each CI job extracts and tests its
-native ZIP before uploading it, including Linux executable permissions.
+native build architecture. Unix archive builds require `zip` and `unzip`.
+Packaging targets: Windows x64, Linux x64, macOS arm64 and macOS x64. Each CI
+job extracts and tests its native ZIP before uploading it, including executable
+permissions. macOS builds also require Xcode command-line tools. Intel macOS
+builds require Rust/Cargo and static OpenSSL 3 libraries (e.g. Homebrew
+`openssl@3`) to build the pinned cryptography provider without a conflicting
+dynamic OpenSSL dependency. Those are build tools, not end-user requirements.
+The packaged Mach-O files are checked for native architecture, valid code
+signatures and library references limited to the package or system libraries.
 
 ```sh
 npm ci

@@ -68,6 +68,7 @@ await run(python, ['-m', 'unittest', 'discover', '-s', resolve(base, 'helpers/te
 if (build) {
   await run(python, [resolve(base, 'helpers/collect_licenses.py')]);
   await run(python, ['-m', 'PyInstaller', '--noconfirm', '--clean', '--onedir', '--name', 'connectwallet-claims',
+    ...(process.platform === 'darwin' ? ['--target-architecture', process.arch === 'x64' ? 'x86_64' : 'arm64'] : []),
     '--distpath', resolve(base, 'helpers/bin'), '--workpath', resolve(base, 'tmp/claims-build'),
     '--specpath', resolve(base, 'tmp'), '--paths', resolve(base, 'helpers/vendor'),
     '--add-data', `${resolve(base, 'helpers/p2c_roots_v1.pem')}${windows ? ';' : ':'}.`,
