@@ -115,8 +115,8 @@ class FixtureTests(unittest.TestCase):
 
 class PacingClock:
     """Deterministic local waits; no socket or real sleeping is involved."""
-    def __init__(self, quantum=0.0):
-        self.now = 100.0
+    def __init__(self, quantum=0.0, *, start=100.0):
+        self.now = start
         self.quantum = quantum
         self.sleeps = []
         self.reads = 0
@@ -692,6 +692,25 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(h.resolve.call_count, 1)
             self.assertEqual([call.args[0].ip for call in h.capture.call_args_list], ["8.8.8.8", "1.1.1.1", "8.8.8.8"])
 
+    def test_dns_expiration_rejects_capture_until_refreshed_at_exact_deadline(self):
+        with PacingClock(start=0.0) as clock, Fixture() as h:
+            self.assertTrue(h.resolve_domain()["ok"])
+            clock.now = service.DNS_TTL - 0.001
+            h.attempt(2)
+            self.assertTrue(h.wait("attempt", 2)["captured"])
+            clock.now = service.DNS_TTL
+            h.attempt(3)
+            expired = h.wait("attempt", 3)
+            self.assertFalse(expired["started"] or expired["captured"])
+            self.assertEqual(expired["message"], "Public DNS resolution is required")
+            self.assertEqual(h.capture.call_count, 1)
+            self.assertTrue(h.resolve_domain(4)["ok"])
+            self.assertEqual(h.resolve.call_count, 2)
+            self.assertEqual(h.service.dns["example.com"]["expires"], 2 * service.DNS_TTL)
+            h.attempt(5)
+            self.assertTrue(h.wait("attempt", 5)["captured"])
+            self.assertEqual(h.capture.call_count, 2)
+
     def test_failed_endpoint_does_not_block_new_attempts_or_reduce_configured_concurrency(self):
         release = threading.Event()
         with Fixture(concurrency=12) as h:
@@ -772,22 +791,26 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(h.service.next_connection, phase)
 
     def test_service_captures_through_certificate_verify_and_measures_after_start_acknowledgement(self):
-        with Fixture() as h:
-            h.resolve_domain()
-            clock = [100.0]
-            emit = h.service.emit_callback
-            def blocked_emit(frame):
-                if frame["type"] == "started": clock[0] += 11
-                emit(frame)
-            h.service.emit_callback = blocked_emit
-            with patch.object(service.time, "monotonic", side_effect=lambda: clock[0]):
+        # DNS expiration and capture timestamps must use the same clock. On a
+        # freshly booted runner, resolving with real uptime before jumping to
+        # a synthetic 100 seconds made the cached endpoint appear expired.
+        for uptime in (0.0, 1.0, 39.0, 40.0, 100.0, 1_000_000.0):
+            with self.subTest(uptime=uptime), PacingClock(start=uptime) as clock, Fixture() as h:
+                self.assertTrue(h.resolve_domain()["ok"])
+                self.assertEqual(h.service.dns["example.com"]["expires"], uptime + service.DNS_TTL)
+                emit = h.service.emit_callback
+                def blocked_emit(frame):
+                    if frame["type"] == "started": clock.now += 11
+                    emit(frame)
+                h.service.emit_callback = blocked_emit
                 h.attempt(2)
                 result = h.wait("attempt", 2)
-            self.assertTrue(result["captured"])
-            self.assertEqual(result["seconds"], 0)
-            self.assertIs(h.capture.call_args.kwargs["complete_handshake"], False)
-            h.verify.assert_called_once()
-            self.assertTrue(result["validationPassed"])
+                self.assertTrue(result["captured"], result)
+                self.assertEqual(result["seconds"], 0)
+                self.assertEqual(clock.now, uptime + 11)
+                self.assertIs(h.capture.call_args.kwargs["complete_handshake"], False)
+                h.verify.assert_called_once()
+                self.assertTrue(result["validationPassed"])
 
     def test_exact_two_expected_gate_is_strict_and_counts_only_success(self):
         with Fixture() as h:
@@ -1168,13 +1191,12 @@ class EndpointSelectionTests(unittest.TestCase):
 
     def test_only_terminal_validation_updates_ema_once_before_emit_and_excludes_local_waits(self):
         for valid in (True, False):
-            with self.subTest(valid=valid), Fixture() as h:
+            with self.subTest(valid=valid), PacingClock() as clock, Fixture() as h:
                 h.resolve_domain()
-                clock = [time.monotonic()]
                 snapshots = []
                 original_emit = h.service.emit_callback
                 def emit(frame):
-                    if frame["type"] == "started": clock[0] += 11
+                    if frame["type"] == "started": clock.now += 11
                     if frame["type"] in ("capture", "attempt"):
                         score = h.service.dns["example.com"]["scores"][endpoint()][1]
                         snapshots.append((frame["type"], score.connections, score.total_time))
@@ -1182,17 +1204,16 @@ class EndpointSelectionTests(unittest.TestCase):
                 h.service.emit_callback = emit
                 def capture(*args, **kwargs):
                     result = fake_capture(*args, **kwargs)
-                    clock[0] += 0.2
+                    clock.now += 0.2
                     return result
                 def verify(*_):
-                    clock[0] += 20
+                    clock.now += 20
                     if not valid: raise ProofVerificationError("invalid certificate")
                 h.capture.side_effect = capture
                 h.verify.side_effect = verify
                 h.meets.return_value = False  # A target miss is still a valid connection.
-                with patch.object(service.time, "monotonic", side_effect=lambda: clock[0]):
-                    h.attempt(2)
-                    result = h.wait("attempt", 2)
+                h.attempt(2)
+                result = h.wait("attempt", 2)
                 self.assertEqual(result["seconds"], 0.2)
                 self.assertIs(result["validationPassed"], valid)
                 self.assertFalse(result["verified"])

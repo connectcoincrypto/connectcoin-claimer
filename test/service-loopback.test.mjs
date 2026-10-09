@@ -9,21 +9,15 @@ import { ClaimerService } from '../src/service.mjs';
 import { GENESIS } from '../src/core/config.mjs';
 
 const line = value => JSON.stringify(value) + '\n';
-const waitUntil = async predicate => {
-  for (let pass = 0; pass < 100; pass++) {
-    if (predicate()) return;
-    await new Promise(accept => setImmediate(accept));
-  }
-  assert.fail('Loopback integration did not reach the expected state.');
-};
 
-test('real TCP discovery caches empty blocks, follows tips/reorgs, reconnects, and drains on shutdown without TLS attempts', async t => {
+test('real TCP discovery caches empty blocks, follows tips/reorgs, reconnects, and drains on shutdown without TLS attempts', { timeout: 10000 }, async t => {
   const directory = await mkdtemp(join(tmpdir(), 'connectcoin-claimer-loopback-test-'));
   const statePath = join(directory, 'claimer.conf.state.json');
   const genesis = GENESIS.main, firstTip = '4'.repeat(64), reorgTip = '5'.repeat(64);
   const network = { tip: { height: 0, hash: genesis, mediantime: 1700000000, chain: 'main', genesis_hash: genesis },
     blocks: [{ height: 0, hash: genesis }], cursor: 'first-epoch' };
   const sockets = new Set(), requests = [], streams = [];
+  const poolStarted = Promise.withResolvers();
   let connections = 0, streamSequence = 0, poolStarts = 0, poolCloses = 0, tlsAttempts = 0, service;
   const server = net.createServer(socket => {
     connections++; sockets.add(socket);
@@ -72,7 +66,11 @@ test('real TCP discovery caches empty blocks, follows tips/reorgs, reconnects, a
       minExpectedReturn: 1000, rpc: { host: '127.0.0.1', port: server.address().port }, network: 'main', lookbackBlocks: 600, feeRate: 1500 },
     statePath,
     // All production components except the external TLS worker are exercised.
-    poolFactory: () => ({ pacesStarts: true, async start() { poolStarts++; }, async close() { poolCloses++; },
+    poolFactory: () => ({ pacesStarts: true, async start() {
+      // Helper startup is asynchronous in production; do not rely on a fixed
+      // number of event-loop turns being enough for it to become ready.
+      await new Promise(accept => setTimeout(accept, 10)); poolStarts++; poolStarted.resolve();
+    }, async close() { poolCloses++; },
       async resolve() { assert.fail('An empty bounty list must not resolve claim domains.'); },
       async attempt() { tlsAttempts++; assert.fail('This test must not make TLS attempts.'); },
     }),
@@ -80,7 +78,8 @@ test('real TCP discovery caches empty blocks, follows tips/reorgs, reconnects, a
   });
 
   await service.start();
-  await waitUntil(() => poolStarts === 1);
+  await poolStarted.promise;
+  assert.equal(poolStarts, 1);
   assert.equal(service.snapshot().ready, true);
   assert.equal(service.snapshot().height, 0);
   assert.deepEqual(streams, [genesis]);
@@ -117,8 +116,10 @@ test('real TCP discovery caches empty blocks, follows tips/reorgs, reconnects, a
   assert.equal(tlsAttempts, 0);
   assert.equal(requests.some(request => request.method === 'sendrawtransaction'), false);
 
+  const socketsClosed = Promise.all([...sockets].map(socket => once(socket, 'close')));
   await service.stop();
-  await waitUntil(() => sockets.size === 0);
+  await socketsClosed;
+  assert.equal(sockets.size, 0);
   assert.equal(service.snapshot().status, 'stopped');
   assert.equal(service.rpc.closed, true);
   assert.equal(poolCloses, poolStarts);
