@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { build } from 'esbuild';
 import postject from 'postject';
 import { packageTarget } from './package-target.mjs';
-import { verifyMacOSPackage } from './macos-package.mjs';
+import { signMacOSFrameworks, verifyMacOSPackage } from './macos-package.mjs';
 import { packageEntries } from './package-files.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -141,7 +141,12 @@ try {
     await copyFile(join(root, name), join(stage, name));
   }
   await writeLicenses(stage, result.metafile);
-  if (macos) await verifyMacOSPackage(stage);
+  if (macos) {
+    // PyInstaller signs individual cached binaries before assembling onedir
+    // frameworks. Seal the complete framework resources in their final layout.
+    await signMacOSFrameworks(stage);
+    await verifyMacOSPackage(stage);
+  }
   await run(executable, ['--version'], { cwd: stage });
   await run(join(stage, 'helpers', 'bin', 'connectwallet-claims', helperName), ['--self-test'], { cwd: stage });
   const inventory = await packageEntries(stage, { allowSymlinks: macos });

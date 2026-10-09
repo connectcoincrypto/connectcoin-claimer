@@ -117,6 +117,43 @@ export function resolveMachODependency(dependency, { binaryPath, executablePath,
   throw new Error(`Library is not bundled or resolvable from its own RPATHs: ${dependency} (${binaryPath})`);
 }
 
+export function macOSFrameworkPaths(entries) {
+  const frameworks = new Set();
+  for (const { path, type } of entries) {
+    if (typeof path !== 'string' || !path || posix.isAbsolute(path) || /[\\:\0\r\n]/.test(path)
+      || path.split('/').some((part) => !part || part === '.' || part === '..')
+      || !['file', 'symlink'].includes(type)) throw new Error('Unsafe package entry for framework signing.');
+    const parts = path.split('/');
+    // Entries represent files/links, never directories. Ignore a final file
+    // named *.framework and do not follow aliases to discover more bundles.
+    for (let index = 0; index < parts.length - 1; index++) {
+      if (parts[index].endsWith('.framework')) frameworks.add(parts.slice(0, index + 1).join('/'));
+    }
+  }
+  // Nested code must be sealed before its containing framework is signed.
+  return [...frameworks].sort((left, right) => right.split('/').length - left.split('/').length || (left < right ? -1 : left > right ? 1 : 0));
+}
+
+export async function signMacOSFrameworks(directory) {
+  if (process.platform !== 'darwin') throw new Error('Native macOS framework signing requires macOS.');
+  const root = await realpath(resolve(directory));
+  const entries = await packageEntries(root, { allowSymlinks: true });
+  const frameworks = macOSFrameworkPaths(entries);
+  const options = { timeout: 30_000, maxBuffer: 2 * 1024 * 1024, encoding: 'utf8', shell: false };
+  for (const relative of frameworks) {
+    const framework = posix.join(root, relative);
+    // PyInstaller signs cached Mach-O files before COLLECT assembles the
+    // framework resources. Seal each completed bundle now, inside out and
+    // without --deep, before recording release hashes. This is ad-hoc signing,
+    // not Developer ID authentication or notarization.
+    // https://developer.apple.com/library/archive/technotes/tn2206/_index.html
+    await execute('/usr/bin/codesign', ['--force', '--sign', '-', '--timestamp=none', framework], options);
+    await execute('/usr/bin/codesign', ['--verify', '--strict', '--verbose=2', framework], options);
+  }
+  console.log(`Ad-hoc signed and verified ${frameworks.length} completed macOS framework bundles.`);
+  return { frameworkCount: frameworks.length };
+}
+
 /**
  * Strict audit for this portable Node SEA + PyInstaller onedir layout.
  * PyInstaller gives each collected binary its own relative LC_RPATH:

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { assertMacOSArchitecture, isMachO, parseMachOLoadCommands, resolveMachODependency } from '../scripts/macos-package.mjs';
+import { assertMacOSArchitecture, isMachO, macOSFrameworkPaths, parseMachOLoadCommands, resolveMachODependency } from '../scripts/macos-package.mjs';
 
 test('Mach-O detection recognizes thin and universal binaries, not Java or short files', () => {
   for (const magic of ['feedface', 'cefaedfe', 'feedfacf', 'cffaedfe']) assert.ok(isMachO(Buffer.from(magic, 'hex')));
@@ -118,4 +118,36 @@ test('library resolver advances past a missing alias candidate and propagates cy
   assert.throws(() => resolveMachODependency('@rpath/libssl.3.dylib', {
     ...context, resolvePath: () => { const error = new Error('Symlink cycle'); error.code = 'ELOOP'; throw error; },
   }), /Symlink cycle/);
+});
+
+test('framework signing plan deduplicates bundles and seals nested frameworks first', () => {
+  assert.deepEqual(macOSFrameworkPaths([
+    { type: 'file', path: 'helpers/_internal/Python.framework/Versions/3.13/Python' },
+    { type: 'file', path: 'helpers/_internal/Python.framework/Versions/3.13/Resources/Info.plist' },
+    { type: 'symlink', path: 'helpers/_internal/Python.framework/Versions/Current', target: '3.13' },
+    { type: 'symlink', path: 'helpers/_internal/Python.framework/Python', target: 'Versions/Current/Python' },
+    { type: 'file', path: 'helpers/_internal/Outer.framework/Versions/A/Frameworks/Inner.framework/Versions/A/Inner' },
+    { type: 'file', path: 'helpers/_internal/Outer.framework/Versions/A/Outer' },
+    { type: 'file', path: 'helpers/_internal/Standalone.dylib' },
+  ]), [
+    'helpers/_internal/Outer.framework/Versions/A/Frameworks/Inner.framework',
+    'helpers/_internal/Outer.framework',
+    'helpers/_internal/Python.framework',
+  ]);
+});
+
+test('framework signing plan ignores framework-named files and does not follow aliases', () => {
+  assert.deepEqual(macOSFrameworkPaths([
+    { type: 'file', path: 'not-a-bundle.framework' },
+    { type: 'symlink', path: 'alias.framework', target: 'real.framework' },
+    { type: 'file', path: 'framework-not-a-suffix.framework-backup/binary' },
+  ]), []);
+  assert.deepEqual(macOSFrameworkPaths([{ type: 'file', path: 'folder with spaces/Native.framework/Versions/A/Native' }]), ['folder with spaces/Native.framework']);
+});
+
+test('framework signing plan rejects absolute, escaping, ambiguous and unsupported entries', () => {
+  for (const path of ['/external/F.framework/Versions/A/F', '../F.framework/Versions/A/F', 'a/../F.framework/F', 'a//F.framework/F', 'a\\F.framework\\F', 'C:/F.framework/F', 'F.framework/F\0', './F.framework/F', '']) {
+    assert.throws(() => macOSFrameworkPaths([{ type: 'file', path }]), /Unsafe/);
+  }
+  assert.throws(() => macOSFrameworkPaths([{ type: 'directory', path: 'Native.framework' }]), /Unsafe/);
 });
