@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { execFile, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { cp, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
+import { cp, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -10,9 +10,11 @@ import { ConnectionPool } from '../src/core/claim-pool.mjs';
 import { CONFIG_TEMPLATE } from '../src/config.mjs';
 import { packageTarget } from './package-target.mjs';
 import { verifyMacOSPackage } from './macos-package.mjs';
+import { packageEntries } from './package-files.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const windows = process.platform === 'win32';
+const macos = process.platform === 'darwin';
 const pkg = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'));
 if (process.argv.length > 3) throw new Error('Usage: node scripts/test-package.mjs [package.zip]');
 const target = packageTarget();
@@ -23,15 +25,8 @@ const archiveHash = createHash('sha256').update(await readFile(archive)).digest(
 assert.equal(await readFile(`${archive}.sha256`, 'utf8'), `${archiveHash}  ${basename(archive)}\n`, 'ZIP checksum must match the exact archive.');
 const forbiddenPackagePath = /(^|\/)(?:node_modules|\.claims-venv|\.git)(\/|$)|\.conf(?:[./]|$)|\.state\.json(?:[./]|$)|\.lock(?:[./]|$)|(^|\/)wallet\.json$/i;
 
-async function filesBelow(directory, prefix = '') {
-  const files = [];
-  for (const entry of await readdir(directory, { withFileTypes: true })) {
-    const name = prefix ? `${prefix}/${entry.name}` : entry.name;
-    if (entry.isDirectory()) files.push(...await filesBelow(join(directory, entry.name), name));
-    else if (entry.isFile()) files.push(name);
-    else throw new Error(`Unsupported package entry: ${name}`);
-  }
-  return files.sort();
+async function filesBelow(directory) {
+  return (await packageEntries(directory, { allowSymlinks: macos })).map((entry) => entry.path);
 }
 
 const scratch = await mkdtemp(join(tmpdir(), 'claimer package test '));
@@ -55,7 +50,7 @@ try {
   const source = join(extract, packageName);
   const manifestBytes = await readFile(join(source, 'package-manifest.json'));
   const manifest = JSON.parse(manifestBytes);
-  assert.equal(manifest.format, 1);
+  assert.equal(manifest.format, macos ? 2 : 1);
   assert.equal(manifest.name, 'connectcoin-claimer');
   assert.equal(manifest.version, pkg.version);
   assert.equal(manifest.platform, process.platform);
@@ -68,7 +63,14 @@ try {
     assert.equal(bytes.length, entry.bytes, entry.path);
     assert.equal(createHash('sha256').update(bytes).digest('hex'), entry.sha256, entry.path);
   }
-  const pristineFiles = [...manifest.files.map((entry) => entry.path), 'package-manifest.json', 'SHA256SUMS'].sort();
+  const links = manifest.symlinks ?? [];
+  if (!macos) assert.deepEqual(links, [], 'Only macOS packages may contain framework links.');
+  const extractedEntries = await packageEntries(source, { allowSymlinks: macos });
+  assert.deepEqual(extractedEntries.filter((entry) => entry.type === 'symlink').map(({ path, target }) => ({ path, target })), links, 'Every relative framework link must match the manifest exactly.');
+  for (const { path, target } of links) {
+    assert.ok(!forbiddenPackagePath.test(path) && !forbiddenPackagePath.test(target), `Forbidden framework link: ${path}`);
+  }
+  const pristineFiles = [...manifest.files.map((entry) => entry.path), ...links.map((entry) => entry.path), 'package-manifest.json', 'SHA256SUMS'].sort();
   assert.deepEqual(await filesBelow(source), pristineFiles, 'Every extracted file must appear exactly once in the manifest.');
   const manifestHash = createHash('sha256').update(manifestBytes).digest('hex');
   assert.equal(await readFile(join(source, 'SHA256SUMS'), 'utf8'), `${manifest.files.map((entry) => `${entry.sha256}  ${entry.path}`).join('\n')}\n${manifestHash}  package-manifest.json\n`, 'SHA256SUMS must match all files and the manifest exactly.');
@@ -80,7 +82,7 @@ try {
   }
   const portable = join(scratch, 'portable folder with spaces');
   const elsewhere = join(scratch, 'unrelated working directory');
-  await cp(source, portable, { recursive: true });
+  await cp(source, portable, { recursive: true, ...(macos ? { verbatimSymlinks: true } : {}) });
   await mkdir(elsewhere);
   if (process.platform === 'darwin') await verifyMacOSPackage(portable);
   const executable = join(portable, manifest.entrypoint);

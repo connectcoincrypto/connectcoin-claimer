@@ -76,6 +76,8 @@ test('library resolver fails for missing bundled dependencies, unsafe anchors an
   assert.throws(() => resolveMachODependency('@loader_path_extra/libssl.3.dylib', context), /Unsupported relative/);
   assert.throws(() => resolveMachODependency('@loader_path/../../../../../../tmp/libssl.dylib', context), /escapes/);
   assert.throws(() => resolveMachODependency('@rpath/../../../../../../tmp/libssl.dylib', context), /escapes/);
+  assert.throws(() => resolveMachODependency('@loader_path/../../../../../../usr/lib/libSystem.B.dylib', context), /escapes/);
+  assert.throws(() => resolveMachODependency('@rpath/../../../../../../usr/lib/libSystem.B.dylib', context), /escapes/);
   for (const rpath of ['/opt/homebrew/lib', '/usr/local/lib', '/Users/runner/work', '@rpath/nested', 'relative', '@loader_path/../../../../../']) {
     assert.throws(() => resolveMachODependency('@rpath/libssl.3.dylib', { ...context, rpaths: [rpath] }), /RPATH/);
   }
@@ -86,4 +88,34 @@ test('library resolver rejects path-prefix lookalikes and checks RPATH candidate
   assert.throws(() => resolveMachODependency('@executable_path/../../../../relocated package-evil/lib.dylib', context), /escapes/);
   assert.throws(() => resolveMachODependency('/usr/lib-evil/lib.dylib', context), /Non-portable/);
   assert.deepEqual(resolveMachODependency('@rpath/libssl.3.dylib', { ...context, rpaths: ['@loader_path', '@loader_path/..'] }), { system: false, path: '/relocated package/helpers/bin/helper/_internal/libssl.3.dylib' });
+});
+
+test('library resolver follows framework file and directory aliases to an audited Mach-O', () => {
+  const base = '/relocated package/helpers/bin/helper/_internal/Python.framework';
+  const canonical = `${base}/Versions/3.13/Python`;
+  const aliases = new Map([[`${base}/Python`, canonical], [`${base}/Versions/Current/Python`, canonical]]);
+  const linkedContext = { ...context, resolvePath: (path) => aliases.get(path) ?? path };
+  assert.deepEqual(resolveMachODependency('@rpath/Python.framework/Python', linkedContext), { system: false, path: canonical });
+  assert.deepEqual(resolveMachODependency('@rpath/Python.framework/Versions/Current/Python', linkedContext), { system: false, path: canonical });
+  assert.throws(() => resolveMachODependency('@rpath/Python.framework/Resources/Info.plist', linkedContext), /not bundled/);
+});
+
+test('library resolver rejects aliases outside the package and aliases to unaudited files', () => {
+  for (const target of ['/opt/homebrew/lib/libssl.3.dylib', '/relocated package-evil/libssl.3.dylib', '/usr/lib/libssl.3.dylib']) {
+    assert.throws(() => resolveMachODependency('@rpath/libssl.3.dylib', { ...context, resolvePath: () => target }), /escapes/);
+  }
+  assert.throws(() => resolveMachODependency('@rpath/libssl.3.dylib', { ...context, resolvePath: () => '/relocated package/README.md' }), /not bundled/);
+  assert.throws(() => resolveMachODependency('@rpath/libssl.3.dylib', { ...context, resolvePath: () => null }), /not bundled/);
+});
+
+test('library resolver advances past a missing alias candidate and propagates cyclic-link errors', () => {
+  const canonical = '/relocated package/helpers/bin/helper/_internal/libssl.3.dylib';
+  assert.deepEqual(resolveMachODependency('@rpath/libssl.3.dylib', {
+    ...context,
+    rpaths: ['@loader_path', '@loader_path/..'],
+    resolvePath: (path) => path === canonical ? canonical : null,
+  }), { system: false, path: canonical });
+  assert.throws(() => resolveMachODependency('@rpath/libssl.3.dylib', {
+    ...context, resolvePath: () => { const error = new Error('Symlink cycle'); error.code = 'ELOOP'; throw error; },
+  }), /Symlink cycle/);
 });

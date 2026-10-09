@@ -8,6 +8,7 @@ import { build } from 'esbuild';
 import postject from 'postject';
 import { packageTarget } from './package-target.mjs';
 import { verifyMacOSPackage } from './macos-package.mjs';
+import { packageEntries } from './package-files.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const windows = process.platform === 'win32';
@@ -36,17 +37,6 @@ function run(command, commandArgs, options = {}) {
     child.once('error', reject);
     child.once('exit', (code, signal) => code === 0 ? accept() : reject(new Error(`${basename(command)} failed (${signal ?? code}).`)));
   });
-}
-
-async function filesBelow(directory, prefix = '') {
-  const files = [];
-  for (const entry of await readdir(directory, { withFileTypes: true })) {
-    const name = prefix ? `${prefix}/${entry.name}` : entry.name;
-    if (entry.isDirectory()) files.push(...await filesBelow(join(directory, entry.name), name));
-    else if (entry.isFile() || entry.isSymbolicLink()) files.push(name);
-    else throw new Error(`Unsupported package entry: ${name}`);
-  }
-  return files.sort();
 }
 
 async function writeLicenses(directory, metafile) {
@@ -138,7 +128,11 @@ try {
   });
   if (!windows) await chmod(executable, 0o755);
   if (macos) await run('/usr/bin/codesign', ['--force', '--sign', '-', executable]);
-  await cp(helperSource, join(stage, 'helpers', 'bin', 'connectwallet-claims'), { recursive: true, dereference: true });
+  // macOS framework aliases are part of the signed bundle layout. Preserve
+  // their relative targets, then validate every link before archiving.
+  await cp(helperSource, join(stage, 'helpers', 'bin', 'connectwallet-claims'), {
+    recursive: true, dereference: !macos, ...(macos ? { verbatimSymlinks: true } : {}),
+  });
   for (const name of ['README.md', 'LICENSE', 'THIRD_PARTY_NOTICES.md', 'PROVENANCE.md']) {
     await copyFile(join(root, name), join(stage, name));
   }
@@ -150,15 +144,17 @@ try {
   if (macos) await verifyMacOSPackage(stage);
   await run(executable, ['--version'], { cwd: stage });
   await run(join(stage, 'helpers', 'bin', 'connectwallet-claims', helperName), ['--self-test'], { cwd: stage });
+  const inventory = await packageEntries(stage, { allowSymlinks: macos });
   const entries = [];
-  for (const name of await filesBelow(stage)) {
+  for (const { path: name } of inventory.filter((entry) => entry.type === 'file')) {
     const bytes = await readFile(join(stage, name));
     entries.push({ path: name, bytes: bytes.length, sha256: createHash('sha256').update(bytes).digest('hex') });
   }
   await writeFile(join(stage, manifestName), `${JSON.stringify({
-    format: 1, name: 'connectcoin-claimer', version: pkg.version,
+    format: macos ? 2 : 1, name: 'connectcoin-claimer', version: pkg.version,
     platform: process.platform, arch: process.arch, node: process.version,
     entrypoint: executableName, buildInputs, files: entries,
+    ...(macos ? { symlinks: inventory.filter((entry) => entry.type === 'symlink').map(({ path, target }) => ({ path, target })) } : {}),
   }, null, 2)}\n`);
   const manifestHash = createHash('sha256').update(await readFile(join(stage, manifestName))).digest('hex');
   await writeFile(join(stage, 'SHA256SUMS'), `${entries.map((entry) => `${entry.sha256}  ${entry.path}`).join('\n')}\n${manifestHash}  ${manifestName}\n`);
@@ -166,8 +162,8 @@ try {
     await stat(destination);
     const previous = JSON.parse(await readFile(join(destination, manifestName), 'utf8'));
     if (previous.name !== 'connectcoin-claimer' || previous.version !== pkg.version) throw new Error('Existing output is not a generated claimer package.');
-    const expected = new Set([...previous.files.map((entry) => entry.path), manifestName, 'SHA256SUMS']);
-    for (const name of await filesBelow(destination)) {
+    const expected = new Set([...previous.files.map((entry) => entry.path), ...(previous.symlinks ?? []).map((entry) => entry.path), manifestName, 'SHA256SUMS']);
+    for (const { path: name } of await packageEntries(destination, { allowSymlinks: macos })) {
       if (!expected.has(name)) throw new Error(`Existing output contains user files (${name}); move that folder before rebuilding.`);
     }
     const fromDist = relative(dist, destination);
@@ -188,7 +184,7 @@ try {
       await run(tar, ['-a', '-cf', freshArchive, '-C', dist, packageName]);
     } else {
       // Info-ZIP preserves Unix executable modes for native unzip extraction.
-      await run('zip', ['-q', '-r', freshArchive, packageName], { cwd: dist });
+      await run('zip', ['-q', '-r', ...(macos ? ['-y'] : []), freshArchive, packageName], { cwd: dist });
     }
     const checksum = createHash('sha256').update(await readFile(freshArchive)).digest('hex');
     const freshChecksum = `${freshArchive}.sha256`;

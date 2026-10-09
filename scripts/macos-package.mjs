@@ -1,7 +1,9 @@
 import { execFile } from 'node:child_process';
-import { open, readdir, realpath } from 'node:fs/promises';
+import { realpathSync } from 'node:fs';
+import { open, realpath } from 'node:fs/promises';
 import { posix, resolve } from 'node:path';
 import { promisify } from 'node:util';
+import { packageEntries } from './package-files.mjs';
 
 const execute = promisify(execFile);
 const dylibCommands = new Set(['LC_LOAD_DYLIB', 'LC_LOAD_WEAK_DYLIB', 'LC_REEXPORT_DYLIB', 'LC_LOAD_UPWARD_DYLIB', 'LC_LAZY_LOAD_DYLIB']);
@@ -70,7 +72,7 @@ function expandAnchor(value, binaryPath, executablePath) {
   return null;
 }
 
-export function resolveMachODependency(dependency, { binaryPath, executablePath, rpaths, packageRoot, availablePaths }) {
+export function resolveMachODependency(dependency, { binaryPath, executablePath, rpaths, packageRoot, availablePaths, resolvePath = (path) => path }) {
   const root = posix.normalize(packageRoot);
   for (const path of [root, binaryPath, executablePath]) {
     if (!posix.isAbsolute(path) || /[\0\r\n]/.test(path)) throw new Error('Mach-O audit requires absolute POSIX paths.');
@@ -91,20 +93,26 @@ export function resolveMachODependency(dependency, { binaryPath, executablePath,
       const anchored = expandAnchor(path, binaryPath, executablePath);
       if (anchored !== null) {
         if (!within(root, anchored)) throw new Error(`RPATH escapes the package: ${path}`);
-        return posix.resolve(anchored, suffix);
+        return { path: posix.resolve(anchored, suffix), system: false };
       }
-      if (posix.isAbsolute(path) && systemLibrary(`${posix.normalize(path)}/`)) return posix.resolve(path, suffix);
+      if (posix.isAbsolute(path) && systemLibrary(`${posix.normalize(path)}/`)) return { path: posix.resolve(path, suffix), system: true };
       throw new Error(`Non-portable or unsupported RPATH: ${path}`);
     });
   } else {
     const anchored = expandAnchor(dependency, binaryPath, executablePath);
     if (anchored === null) throw new Error(`Unsupported relative library dependency: ${dependency}`);
-    candidates = [anchored];
+    candidates = [{ path: anchored, system: false }];
   }
-  for (const path of candidates) {
-    if (systemLibrary(path)) return { system: true, path };
+  for (const { path, system } of candidates) {
+    if (system && systemLibrary(path)) return { system: true, path };
     if (!within(root, path)) throw new Error(`Library dependency escapes the package: ${dependency}`);
-    if (availablePaths.has(path)) return { system: false, path };
+    // Frameworks use both file aliases (Python -> Versions/Current/Python)
+    // and directory aliases (Current -> 3.13). Resolve only this candidate;
+    // never recurse through linked directories while enumerating the package.
+    const canonical = resolvePath(path);
+    if (canonical === null) continue;
+    if (typeof canonical !== 'string' || !within(root, canonical)) throw new Error(`Resolved library dependency escapes the package: ${dependency}`);
+    if (availablePaths.has(canonical)) return { system: false, path: canonical };
   }
   throw new Error(`Library is not bundled or resolvable from its own RPATHs: ${dependency} (${binaryPath})`);
 }
@@ -120,16 +128,10 @@ export function resolveMachODependency(dependency, { binaryPath, executablePath,
 export async function verifyMacOSPackage(directory, { arch = process.arch, executable = 'claimer', helper = 'helpers/bin/connectwallet-claims/connectwallet-claims' } = {}) {
   if (process.platform !== 'darwin') throw new Error('Native macOS package verification requires macOS.');
   const root = await realpath(resolve(directory));
-  const files = [];
-  async function visit(path) {
-    for (const entry of await readdir(path, { withFileTypes: true })) {
-      const child = posix.join(path, entry.name);
-      if (entry.isDirectory()) await visit(child);
-      else if (entry.isFile()) files.push(child);
-      else throw new Error(`Package contains a symlink or unsupported file: ${child}`);
-    }
-  }
-  await visit(root);
+  // Shared inventory rejects absolute, escaping, dangling and cyclic links.
+  // Keep the real framework structure intact for codesign resource checking.
+  const entries = await packageEntries(root, { allowSymlinks: true });
+  const files = entries.filter((entry) => entry.type === 'file').map((entry) => posix.join(root, entry.path));
   const binaries = new Map();
   const options = { timeout: 30_000, maxBuffer: 2 * 1024 * 1024, encoding: 'utf8', shell: false };
   for (const file of files) {
@@ -154,11 +156,19 @@ export async function verifyMacOSPackage(directory, { arch = process.arch, execu
     if (!within(root, entry) || !binaries.has(entry)) throw new Error(`Expected Mach-O executable is missing: ${entry}`);
   }
   const availablePaths = new Set(binaries.keys());
+  const resolvePath = (path) => {
+    try { return realpathSync(path); }
+    catch (error) {
+      // An absent first RPATH candidate is normal; dyld tries the next one.
+      if (error.code === 'ENOENT' || error.code === 'ENOTDIR') return null;
+      throw error;
+    }
+  };
   let dependencyCount = 0;
   for (const [binaryPath, { dependencies, rpaths }] of binaries) {
     const executablePath = within(posix.dirname(helperExecutable), binaryPath) ? helperExecutable : main;
     for (const dependency of dependencies) {
-      resolveMachODependency(dependency, { binaryPath, executablePath, rpaths, packageRoot: root, availablePaths });
+      resolveMachODependency(dependency, { binaryPath, executablePath, rpaths, packageRoot: root, availablePaths, resolvePath });
       dependencyCount++;
     }
   }
