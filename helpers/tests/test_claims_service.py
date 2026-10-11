@@ -60,7 +60,8 @@ class Fixture:
         self.service = service.ClaimsService(self.options, self.emit, claims_bridge.parse_context, HELPERS / "p2c_roots_v1.pem")
         return self
 
-    def emit(self, frame):
+    def emit(self, encoded):
+        frame = json.loads(encoded)
         with self.condition:
             self.frames.append(frame)
             self.condition.notify_all()
@@ -102,7 +103,7 @@ class FixtureTests(unittest.TestCase):
             self.assertLessEqual(remaining, 4)
             advance, frame = next(notifications)
             clock[0] += advance
-            h.emit(frame)
+            h.emit(json.dumps(frame))
         # Force the capture notification to wake the waiter before the terminal
         # frame. The former shared clock expired here after the first jump.
         with patch.object(service.time, "monotonic", side_effect=lambda: clock[0]), \
@@ -205,9 +206,10 @@ class PacingTests(unittest.TestCase):
                         clock.now = h.service.next_connection
                     before = clock.now
                     emit = h.service.emit_callback
-                    def delayed_emit(frame):
+                    def delayed_emit(encoded):
+                        frame = json.loads(encoded)
                         if frame["type"] == "started": clock.now += 3.0
-                        emit(frame)
+                        emit(encoded)
                     h.service.emit_callback = delayed_emit
                     job = self.job(h.service, 2)
                     h.service._connecting(job)
@@ -221,9 +223,10 @@ class PacingTests(unittest.TestCase):
                 h.service._connecting(self.job(h.service))
                 clock.now = h.service.next_connection
                 emit = h.service.emit_callback
-                def delayed_emit(frame):
+                def delayed_emit(encoded):
+                    frame = json.loads(encoded)
                     if frame["type"] == "started": clock.now += 1.5 / rate
-                    emit(frame)
+                    emit(encoded)
                 h.service.emit_callback = delayed_emit
                 starts = []
                 for identifier in range(2, 6):
@@ -423,7 +426,8 @@ class ServiceTests(unittest.TestCase):
         frames = []
         payload = [{"type": "start", "protocol": 4, "options": {"connectionsPerSecond": 100, "concurrency": 100}}, {"type": "shutdown"}]
         stream = io.BytesIO(b"".join(json.dumps(frame).encode() + b"\n" for frame in payload))
-        self.assertEqual(service.run_service(stream, frames.append, claims_bridge.parse_context, HELPERS / "p2c_roots_v1.pem"), 0)
+        self.assertEqual(service.run_service(stream, lambda encoded: frames.append(json.loads(encoded)),
+                                            claims_bridge.parse_context, HELPERS / "p2c_roots_v1.pem"), 0)
         self.assertEqual(frames, [{"type": "ready", "protocol": 4, "roots": 1,
                                    "security": {"rsaPublicExponentMaxBits": 64}}])
 
@@ -539,10 +543,11 @@ class ServiceTests(unittest.TestCase):
         with Fixture() as h:
             h.resolve_domain()
             original_emit = h.service.emit_callback
-            def emit(frame):
+            def emit(encoded):
+                frame = json.loads(encoded)
                 if frame["type"] == "capture":
                     h.service.command({"type": "cancel", "id": frame["id"]})
-                original_emit(frame)
+                original_emit(encoded)
             h.service.emit_callback = emit
             h.attempt(2)
             result = h.wait("attempt", 2)
@@ -559,10 +564,11 @@ class ServiceTests(unittest.TestCase):
                 raise OSError("connection failed")
             h.capture.side_effect = fails
             original_emit = h.service.emit_callback
-            def emit(frame):
+            def emit(encoded):
+                frame = json.loads(encoded)
                 if frame["type"] == "capture":
                     h.service.command({"type": "cancel", "id": frame["id"]})
-                original_emit(frame)
+                original_emit(encoded)
             h.service.emit_callback = emit
             h.attempt(2)
             result = h.wait("attempt", 2)
@@ -798,9 +804,10 @@ class ServiceTests(unittest.TestCase):
                 self.assertTrue(h.resolve_domain()["ok"])
                 self.assertEqual(h.service.dns["example.com"]["expires"], uptime + service.DNS_TTL)
                 emit = h.service.emit_callback
-                def blocked_emit(frame):
+                def blocked_emit(encoded):
+                    frame = json.loads(encoded)
                     if frame["type"] == "started": clock.now += 11
-                    emit(frame)
+                    emit(encoded)
                 h.service.emit_callback = blocked_emit
                 h.attempt(2)
                 result = h.wait("attempt", 2)
@@ -942,10 +949,11 @@ class ServiceTests(unittest.TestCase):
                 if len(permits) == 1:
                     clock.now += 0.25  # Preemption after the permit was granted.
             original_emit = h.service.emit_callback
-            def emit(frame):
+            def emit(encoded):
+                frame = json.loads(encoded)
                 if frame["type"] == "started" and frame["id"] == 4:
                     clock.now += 2.25  # Delayed IPC exceeds the one-second debt cap.
-                original_emit(frame)
+                original_emit(encoded)
             h.service.emit_callback = emit
             with patch.object(h.service, "_connecting", side_effect=connect):
                 while h.service.pending:
@@ -1194,12 +1202,13 @@ class EndpointSelectionTests(unittest.TestCase):
                 h.resolve_domain()
                 snapshots = []
                 original_emit = h.service.emit_callback
-                def emit(frame):
+                def emit(encoded):
+                    frame = json.loads(encoded)
                     if frame["type"] == "started": clock.now += 11
                     if frame["type"] in ("capture", "attempt"):
                         score = h.service.dns["example.com"]["scores"][endpoint()][1]
                         snapshots.append((frame["type"], score.connections, score.total_time))
-                    original_emit(frame)
+                    original_emit(encoded)
                 h.service.emit_callback = emit
                 def capture(*args, **kwargs):
                     result = fake_capture(*args, **kwargs)
@@ -1235,9 +1244,10 @@ class EndpointSelectionTests(unittest.TestCase):
                     h.capture.side_effect = capture
                 elif reason == "before_validation":
                     emit = h.service.emit_callback
-                    def cancel_at_capture(frame):
+                    def cancel_at_capture(encoded):
+                        frame = json.loads(encoded)
                         if frame["type"] == "capture": h.service.command({"type": "cancel", "id": frame["id"]})
-                        emit(frame)
+                        emit(encoded)
                     h.service.emit_callback = cancel_at_capture
                 h.attempt(2, successes="3" if reason == "budget" else "0")
                 result = h.wait("attempt", 2)

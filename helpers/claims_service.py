@@ -125,7 +125,6 @@ class ClaimsService:
         self.parse_context = parse_context
         self.condition = threading.Condition(threading.RLock())
         self.output_lock = threading.Lock()
-        self.capture_lock = threading.Lock()
         self.connection_lock = threading.Lock()
         self.jobs = {}
         self.pending = deque()
@@ -144,12 +143,15 @@ class ClaimsService:
         self.scheduler.start()
 
     def emit(self, value):
-        # One writer prevents interleaved NDJSON from concurrent captures.
+        # Encode/validate once, outside the writer lock. The callback accepts
+        # this immutable JSON text, not the original mutable dictionary.
         encoded = json.dumps(value, separators=(",", ":"), allow_nan=False)
         if len(encoded.encode("utf-8")) > 160 * 1024:
             raise ValueError("helper response exceeds 160 KiB")
+        # Keep synchronous, serialized writes: started must be acknowledged
+        # before TCP, and each request emits capture before its terminal frame.
         with self.output_lock:
-            self.emit_callback(value)
+            self.emit_callback(encoded)
 
     def command(self, command):
         if not isinstance(command, dict) or not isinstance(command.get("type"), str):
@@ -418,17 +420,20 @@ class ClaimsService:
             finally:
                 if job.started:
                     elapsed = time.monotonic() - job.started_at
-                    # Capture order is independent of potentially slow certificate
-                    # verification. This frame measures raw captures and the
-                    # successful-connection budget, not validated EMA outcomes.
-                    with self.capture_lock:
+                    # Count each raw capture and freeze this job's snapshot
+                    # atomically, independently of slow verification or output.
+                    # Other jobs may publish their snapshots first: the parent
+                    # merges global totals with max(), while this request keeps
+                    # the same count in its capture and terminal frames.
+                    with self.condition:
                         job.seconds = round(max(0.0, elapsed), 6)
-                        with self.condition:
-                            if job.captured:
-                                budget = self.budgets[job.bounty_id]
-                                budget.successes = min(MAX_UINT64, budget.successes + 1)
-                            job.successful_connections = self.budgets[job.bounty_id].successes
-                        self.emit({"type": "capture", **self._fields(job)})
+                        budget = self.budgets[job.bounty_id]
+                        if job.captured:
+                            budget.successes = min(MAX_UINT64, budget.successes + 1)
+                        job.successful_connections = budget.successes
+                    # No bookkeeping lock spans JSON encoding or a pipe write.
+                    # This remains synchronous and precedes proof verification.
+                    self.emit({"type": "capture", **self._fields(job)})
             if not job.control.cancelled():
                 validation_started = True
                 candidate = replace(job.context, proof=captured.encoded_proof)

@@ -158,6 +158,17 @@ it. Wallet lock/stop terminates the entire helper. OS DNS calls cannot be interr
 remains the hard shutdown bound for a stuck resolver. Input/output frames are
 limited to 16/160 KiB and concurrent output is serialized.
 
+The persistent claimer service encodes and checks each output frame once before
+taking its writer lock; the bridge writes the already-encoded JSON unchanged.
+Capture accounting and each job's uint64 counter snapshot are updated atomically
+under the state lock, but JSON encoding and pipe writes hold no capture/state
+lock. Different requests can therefore publish their capture totals out of order;
+the main process merges those authoritative totals with `max`, never addition.
+Within each request, synchronous `started`, `capture` and terminal events retain
+their order, and the terminal repeats that request's captured counter snapshot.
+Socket-start acknowledgments remain synchronous under the global pacing gate.
+No certificate, signature, root-pin, budget or protocol-frame validation is skipped.
+
 For development, run `node scripts/setup-claims.mjs`. It creates a private
 Python virtual environment and installs the pinned provider. Python 3.11+
 must already be installed. This is a local setup operation, never an automatic

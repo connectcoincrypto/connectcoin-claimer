@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import tempfile
@@ -210,7 +211,8 @@ class VerificationReuseTests(unittest.TestCase):
         frames = []
         captured_proof = [self.valid.proof]
 
-        def emit(frame):
+        def emit(encoded):
+            frame = json.loads(encoded)
             with condition:
                 frames.append(frame)
                 condition.notify_all()

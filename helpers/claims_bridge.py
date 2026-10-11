@@ -61,9 +61,14 @@ def security_provider_versions() -> dict[str, str | int]:
             "rsaPublicExponentMaxBits": MAX_RSA_PUBLIC_EXPONENT_BITS}
 
 
-def emit(value: dict) -> None:
-    sys.stdout.write(json.dumps(value, separators=(",", ":"), allow_nan=False) + "\n")
+def emit_encoded(encoded: str) -> None:
+    """Write one already-encoded frame; the persistent service serializes writers."""
+    sys.stdout.write(encoded + "\n")
     sys.stdout.flush()
+
+
+def emit(value: dict) -> None:
+    emit_encoded(json.dumps(value, separators=(",", ":"), allow_nan=False))
 
 
 def bounded_int(value: object, name: str, minimum: int, maximum: int) -> int:
@@ -150,7 +155,7 @@ def main() -> int:
         return run_probe(sys.stdin.buffer, emit, ROOT / "p2c_roots_v1.pem", deadline=deadline)
     if mode == "--service":
         from claims_service import run_service
-        return run_service(sys.stdin.buffer, emit, parse_context, ROOT / "p2c_roots_v1.pem")
+        return run_service(sys.stdin.buffer, emit_encoded, parse_context, ROOT / "p2c_roots_v1.pem")
     if mode == "--self-test":
         from connectcoin_p2c_tools.verify import validate_root_bundle
         security = security_provider_versions()

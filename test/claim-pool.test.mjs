@@ -51,6 +51,31 @@ function complete(command, child, overrides = {}) {
   child.send({ type: 'attempt', ...value, proof: '020100', verified: true });
 }
 
+test('capture frames may overtake other requests without changing each request counter snapshot', async t => {
+  const pending = [];
+  const { pool, children } = fixture(t, command => pending.push(command));
+  await pool.start({ connectionsPerSecond: 400, concurrency: 3 });
+  const captures = [], starts = [];
+  const requests = Array.from({ length: 3 }, () => pool.attempt(context(), {
+    bountyId, successfulConnections: 7n,
+    onStarted: () => starts.push(true), onCapture: frame => captures.push(frame.successfulConnections),
+  }));
+  const child = children[0];
+  for (const command of pending) child.send({ type: 'started', id: command.id });
+  // Accounting happened 8,9,10, but independent workers acquire the output
+  // lock in a different order. Each request still emits capture before result.
+  const frames = pending.map((command, index) => observation(command, { successfulConnections: String(8 + index) }));
+  for (const index of [2, 0, 1]) child.send({ type: 'capture', ...frames[index] });
+  for (const index of [1, 2, 0]) child.send({ type: 'attempt', ...frames[index], proof: null, verified: false });
+  const results = await Promise.all(requests);
+  assert.equal(starts.length, 3);
+  assert.deepEqual(captures, ['10', '8', '9']);
+  assert.deepEqual(results.map(frame => frame.successfulConnections), ['8', '9', '10']);
+  assert.ok(results.every(frame => frame.validationPassed === true));
+  assert.equal(pool.failure, undefined);
+  assert.equal(pool.requests.size, 0);
+});
+
 test('exhausted capture budget is a no-start result, not an attempt or failed observation', async t => {
   const { pool } = fixture(t, (command, child) => child.send({ type: 'attempt', ...observation(command, {
     started: false, captured: false, seconds: 0, successfulConnections: command.successfulConnections,
