@@ -73,7 +73,9 @@ def _check_rsa_public_exponents(certificates: Iterable[x509.Certificate]) -> Non
             raise ProofVerificationError("P2C certificate RSA public exponent exceeds 64 bits")
 
 
-def _load_certificate_chain(encoded_chain: tuple[bytes, ...]) -> list[x509.Certificate]:
+@lru_cache(maxsize=64)
+def _parse_certificate_chain(encoded_chain: tuple[bytes, ...]) -> tuple[x509.Certificate, ...]:
+    """Cache only immutable DER decoding/key bounds, never authentication."""
     certificates: list[x509.Certificate] = []
     for position, encoded in enumerate(encoded_chain):
         try:
@@ -83,7 +85,12 @@ def _load_certificate_chain(encoded_chain: tuple[bytes, ...]) -> list[x509.Certi
                 f"certificate {position} is not a valid DER X.509 certificate"
             ) from exc
     _check_rsa_public_exponents(certificates)
-    return certificates
+    return tuple(certificates)
+
+
+def _load_certificate_chain(encoded_chain: tuple[bytes, ...]) -> list[x509.Certificate]:
+    # Capture preflight and verification see identical DER; callers own the list.
+    return list(_parse_certificate_chain(encoded_chain))
 
 
 def _load_certificates(parsed: ParsedProof) -> list[x509.Certificate]:
@@ -95,7 +102,7 @@ def validate_certificate_message(message: bytes) -> None:
     _load_certificate_chain(parse_certificate_message(message))
 
 
-def _load_roots(path: str | Path, version: int, enforce_root_pin: bool) -> list[x509.Certificate]:
+def _read_root_bundle(path: str | Path, version: int, enforce_root_pin: bool) -> bytes:
     try:
         encoded = Path(path).read_bytes()
     except OSError as exc:
@@ -106,9 +113,13 @@ def _load_roots(path: str | Path, version: int, enforce_root_pin: bool) -> list[
         raise ProofVerificationError(
             "root bundle version 1 does not match its consensus SHA-256 pin"
         )
-    # Always read and authenticate the current file before reusing parsed roots.
+    # Always read and authenticate the current file, even when caches are warm.
+    return encoded
+
+
+def _load_roots(path: str | Path, version: int, enforce_root_pin: bool) -> list[x509.Certificate]:
     # Each caller owns its list; only immutable certificate objects are shared.
-    return list(_parse_roots(encoded))
+    return list(_parse_roots(_read_root_bundle(path, version, enforce_root_pin)))
 
 
 @lru_cache(maxsize=1)
@@ -129,11 +140,18 @@ def _parse_roots(encoded: bytes) -> tuple[x509.Certificate, ...]:
     return tuple(roots)
 
 
+@lru_cache(maxsize=1)
+def _root_store(encoded: bytes) -> Store:
+    """Reuse the immutable trust-anchor index, not time/domain/path decisions."""
+    return Store(_parse_roots(encoded))
+
+
 def validate_root_bundle(
     roots_path: str | Path, root_certificates_version: int, *, enforce_root_pin: bool = True
 ) -> None:
     """Validate a root bundle before a potentially long proof search."""
-    _load_roots(roots_path, root_certificates_version, enforce_root_pin)
+    # Prewarm the shared Store before concurrent capture workers are started.
+    _root_store(_read_root_bundle(roots_path, root_certificates_version, enforce_root_pin))
 
 
 def _check_supplied_certificate_times(
@@ -175,7 +193,7 @@ def _check_leaf_usage(leaf: x509.Certificate) -> None:
 
 def _verify_path(
     certificates: list[x509.Certificate],
-    roots: list[x509.Certificate],
+    roots: Store,
     domain: str,
     validation_time: int,
 ) -> None:
@@ -183,7 +201,7 @@ def _verify_path(
         moment = datetime.fromtimestamp(validation_time, UTC)
         verifier = (
             PolicyBuilder()
-            .store(Store(roots))
+            .store(roots)
             .time(moment)
             .max_chain_depth(MAX_CERTIFICATES - 1)
             .build_server_verifier(x509.DNSName(domain))
@@ -369,7 +387,8 @@ def verify_connection_proof(
     if not meets_work_target(parsed.connection_work_hash, envelope.connection_work_target):
         raise ProofVerificationError("connection work hash exceeds the output target")
     certificates = _load_certificates(parsed)
-    roots = _load_roots(roots_path, envelope.root_certificates_version, enforce_root_pin)
+    roots = _root_store(_read_root_bundle(
+        roots_path, envelope.root_certificates_version, enforce_root_pin))
     _check_supplied_certificate_times(certificates, envelope.validation_time)
     _check_leaf_usage(certificates[0])
     _verify_path(certificates, roots, envelope.domain, envelope.validation_time)

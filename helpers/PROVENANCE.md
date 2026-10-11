@@ -76,9 +76,18 @@ ConnectCoin Core. Its SHA-256 is
 `f66dff1bdf8f96060b8177976f8b7d9254bc89bc4db933d769f7384d28480bc9`.
 The provider verifies this pin before connecting and re-reads and checks the
 current bundle on every proof verification. A one-entry cache keyed by exact
-bundle bytes reuses only parsed, immutable root certificates and their RSA
-exponent checks; each caller receives its own list. Peer certificate, time,
-domain, path, policy and proof-signature checks still run for every proof.
+bundle bytes reuses parsed, immutable root certificates, their RSA exponent
+checks and the provider's immutable trust-anchor Store. Every verification
+creates a fresh time/domain-specific verifier and validates the path. A bounded
+64-entry cache reuses DER decoding and RSA exponent checks only for identical
+certificate-chain bytes; callers receive separate lists of immutable certificates.
+A bounded 512-entry cache reuses structural proof parsing only for identical
+proof bytes, domain and challenge. Accepted proofs are at most 64 KiB; retained
+message/certificate slices also contribute to the bounded cache memory. The
+claims service uses the verified work hash instead of parsing the proof again.
+Time, domain, path, policy, usage, target and live CertificateVerify signature
+checks are not cached and still run for every proof, including valid target
+misses in the claims service. No proof-authentication outcome is reused.
 Do not refresh the bundle with the operating system's current roots: a new
 consensus bundle requires a new version. Its source and attribution are in its header.
 

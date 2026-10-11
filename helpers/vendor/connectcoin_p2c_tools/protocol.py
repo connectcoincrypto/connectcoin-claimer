@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
+from functools import lru_cache
 
 from .domain import is_canonical_domain
 from .errors import ProofFormatError
@@ -344,7 +345,14 @@ def _parse_certificate_verify(body: bytes, client: _ClientState) -> tuple[int, b
     return scheme, signature
 
 
+@lru_cache(maxsize=512)
 def parse_proof(encoded: bytes, expected_domain: str, expected_challenge: bytes) -> ParsedProof:
+    """Reuse structural parsing for exact bytes/domain/challenge, not validity.
+
+    ParsedProof is immutable. Time, roots, policy, target, certificate path and
+    CertificateVerify authentication are checked by the verifier on every call.
+    Both entry count and the accepted proof size bound retained memory.
+    """
     if not is_canonical_domain(expected_domain):
         raise ProofFormatError("expected domain is not canonical lower-case ASCII DNS form")
     if len(expected_challenge) != 32:

@@ -22,7 +22,6 @@ sys.path.insert(0, str(HELPERS))
 import claims_bridge
 import claims_service as service
 from connectcoin_p2c_tools.errors import ProofVerificationError
-from connectcoin_p2c_tools.protocol import parse_proof
 from connectcoin_p2c_tools.tls13 import CaptureCancelled, CaptureControl, Endpoint, TLSGenerationError, capture_tls13_proof
 from test_verifier_security import certificate, signed_proof, verify_fixture
 
@@ -55,9 +54,9 @@ class Fixture:
     def __enter__(self):
         self.resolve = self.stack.enter_context(patch.object(service, "resolve_endpoints", return_value=(endpoint(),)))
         self.capture = self.stack.enter_context(patch.object(service, "capture_tls13_proof", side_effect=fake_capture))
-        self.parse = self.stack.enter_context(patch.object(service, "parse_proof", return_value=SimpleNamespace(connection_work_hash=b"\x00" * 32)))
         self.meets = self.stack.enter_context(patch.object(service, "meets_work_target", return_value=True))
-        self.verify = self.stack.enter_context(patch.object(service, "verify_connection_proof"))
+        self.verify = self.stack.enter_context(patch.object(service, "verify_connection_proof",
+            return_value=SimpleNamespace(connection_work_hash="00" * 32)))
         self.service = service.ClaimsService(self.options, self.emit, claims_bridge.parse_context, HELPERS / "p2c_roots_v1.pem")
         return self
 
@@ -507,7 +506,6 @@ class ServiceTests(unittest.TestCase):
                     fake_capture(*args, **kwargs)
                     return SimpleNamespace(encoded_proof=envelope.proof)
                 h.capture.side_effect = capture
-                h.parse.side_effect = parse_proof
                 h.meets.side_effect = None
                 h.meets.return_value = False
                 # This fixture alone substitutes its generated test trust root;
@@ -529,12 +527,13 @@ class ServiceTests(unittest.TestCase):
     def test_malformed_proof_is_validation_failure_after_full_capture(self):
         with Fixture() as h:
             h.resolve_domain()
-            h.parse.side_effect = ValueError("invalid encoded proof")
+            h.verify.side_effect = ValueError("invalid encoded proof")
             h.attempt(2)
             result = h.wait("attempt", 2)
             self.assertTrue(result["captured"])
             self.assertIs(result["validationPassed"], False)
-            h.verify.assert_not_called()
+            h.verify.assert_called_once()
+            h.meets.assert_not_called()
 
     def test_cancellation_before_verification_has_no_validated_observation(self):
         with Fixture() as h:

@@ -16,7 +16,6 @@ from pathlib import Path
 from connectcoin_p2c_tools.domain import is_canonical_domain
 from connectcoin_p2c_tools.generator import MAX_CONNECTION_LIMIT, resolve_endpoints
 from connectcoin_p2c_tools.hashes import meets_work_target
-from connectcoin_p2c_tools.protocol import parse_proof
 from connectcoin_p2c_tools.tls13 import CaptureCancelled, CaptureControl, TLSGenerationError, capture_tls13_proof
 from connectcoin_p2c_tools.verify import (
     MAX_RSA_PUBLIC_EXPONENT_BITS,
@@ -433,14 +432,16 @@ class ClaimsService:
             if not job.control.cancelled():
                 validation_started = True
                 candidate = replace(job.context, proof=captured.encoded_proof)
-                parsed = parse_proof(candidate.proof, candidate.domain, candidate.challenge)
                 # A hash miss is still a validated TLS connection. Verify every
                 # certificate path and CertificateVerify signature with only
                 # the work threshold relaxed, then apply the real target.
                 preflight = replace(candidate, connection_work_target="f" * 64)
-                verify_connection_proof(preflight, self.roots_path)
+                verified = verify_connection_proof(preflight, self.roots_path)
                 validation_passed = True
-                if meets_work_target(parsed.connection_work_hash, candidate.connection_work_target):
+                # VerificationResult exposes display-order hex, while the target
+                # helper accepts the original internal byte order.
+                work_hash = bytes.fromhex(verified.connection_work_hash)[::-1]
+                if meets_work_target(work_hash, candidate.connection_work_target):
                     if not job.control.cancelled(): proof = candidate.proof.hex()
         except BudgetExhausted:
             blocked = "budget"
