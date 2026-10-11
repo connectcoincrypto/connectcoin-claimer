@@ -98,7 +98,10 @@ test('socket loss rejects old capacity waiters; explicit subsequent request alon
   const waiting = [regular(f.client, 100), observed(f.client.request('sendrawtransaction', { transaction_hex: hash(101) }))];
   await until(() => f.client.capacityWaiters.length === 2);
   f.requests[0].socket.destroy();
-  assert.ok((await Promise.all([...holding, ...waiting])).every(result => result.error && !result.error.unknownOutcome));
+  const results = await Promise.all([...holding, ...waiting]);
+  assert.ok(results.every(result => result.error && !result.error.unknownOutcome));
+  assert.ok(results.slice(12).every(result => result.error.notSent === true));
+  assert.ok(results.slice(0, 12).every(result => result.error.notSent !== true));
   assert.equal(f.client.capacityWaiters.length, 0); assert.equal(f.requests.length, 12); assert.equal(f.connections, 1);
   const next = regular(f.client, 102); await until(() => f.requests.length === 13); f.answer(12);
   assert.equal((await next).value, true); assert.equal(f.connections, 2);

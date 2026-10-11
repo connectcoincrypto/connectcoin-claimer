@@ -18,7 +18,7 @@ test('real TCP discovery caches empty blocks, follows tips/reorgs, reconnects, a
     blocks: [{ height: 0, hash: genesis }], cursor: 'first-epoch' };
   const sockets = new Set(), requests = [], streams = [];
   const poolStarted = Promise.withResolvers();
-  let connections = 0, streamSequence = 0, poolStarts = 0, poolCloses = 0, tlsAttempts = 0, service;
+  let connections = 0, streamSequence = 0, poolConstructions = 0, poolStarts = 0, poolCloses = 0, tlsAttempts = 0, service;
   const server = net.createServer(socket => {
     connections++; sockets.add(socket);
     socket.on('error', () => {}); socket.on('close', () => sockets.delete(socket));
@@ -66,19 +66,20 @@ test('real TCP discovery caches empty blocks, follows tips/reorgs, reconnects, a
       minExpectedReturn: 1000, rpc: { host: '127.0.0.1', port: server.address().port }, network: 'main', lookbackBlocks: 600, feeRate: 1500 },
     statePath,
     // All production components except the external TLS worker are exercised.
-    poolFactory: () => ({ pacesStarts: true, async start() {
+    poolFactory: () => { poolConstructions++; return { pacesStarts: true, async start() {
       // Helper startup is asynchronous in production; do not rely on a fixed
       // number of event-loop turns being enough for it to become ready.
       await new Promise(accept => setTimeout(accept, 10)); poolStarts++; poolStarted.resolve();
     }, async close() { poolCloses++; },
       async resolve() { assert.fail('An empty bounty list must not resolve claim domains.'); },
       async attempt() { tlsAttempts++; assert.fail('This test must not make TLS attempts.'); },
-    }),
+    }; },
     setTimer: (callback, delay) => ({ callback, delay, unref() {} }), clearTimer() {},
   });
 
   await service.start();
   await poolStarted.promise;
+  assert.equal(poolConstructions, 1);
   assert.equal(poolStarts, 1);
   assert.equal(service.snapshot().ready, true);
   assert.equal(service.snapshot().height, 0);
@@ -102,17 +103,32 @@ test('real TCP discovery caches empty blocks, follows tips/reorgs, reconnects, a
   await disconnected;
   assert.equal(service.ready, false);
   await service.cycle();
+  // Reconnection intentionally starts a new helper, but cycle() publishes the
+  // catalog before its asynchronous startup finishes. Await THIS generation,
+  // not poolStarted (which was already resolved by the first helper), before
+  // comparing completed starts across the subsequent catalog-only reset.
+  assert.ok(service.engine.poolReady);
+  await service.engine.poolReady;
   assert.equal(connections, 2);
+  assert.equal(poolConstructions, 2);
+  assert.equal(poolStarts, 2);
+  assert.equal(poolCloses, 1);
   assert.equal(service.ready, true);
   assert.deepEqual(streams, [genesis, firstTip], 'Reconnect catches up from the saved cursor without a redundant full scan.');
 
   network.tip = { ...network.tip, hash: reorgTip, mediantime: 1700000002 };
   network.blocks = [{ height: 1, hash: reorgTip }, { height: 0, hash: genesis }];
   network.cursor = 'reorg-epoch';
+  const helperBeforeResync = service.engine.pool, constructionsBeforeResync = poolConstructions;
+  const startsBeforeResync = poolStarts, closesBeforeResync = poolCloses;
   await service.cycle();
   assert.equal(service.tip.hash, reorgTip);
   assert.equal(service.blocks.has(firstTip), false);
   assert.deepEqual(streams, [genesis, firstTip, genesis, reorgTip], 'Expired cursors discard the old snapshot and reload the active window oldest first.');
+  assert.strictEqual(service.engine.pool, helperBeforeResync, 'A catalog reset must preserve the same helper instance.');
+  assert.equal(poolConstructions, constructionsBeforeResync, 'A catalog reset must not construct another helper.');
+  assert.equal(poolStarts, startsBeforeResync, 'A catalog reset must not start another helper.');
+  assert.equal(poolCloses, closesBeforeResync, 'A catalog reset must preserve the live helper.');
   assert.equal(tlsAttempts, 0);
   assert.equal(requests.some(request => request.method === 'sendrawtransaction'), false);
 

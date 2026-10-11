@@ -3,11 +3,22 @@ ConnectCoin native claimer uses the following statically linked components:
 Mbed TLS 3.6.7, Copyright The Mbed TLS Contributors.
 Apache License 2.0; the full license is included as MbedTLS-LICENSE.
 The supplied sources are pinned by SHA-256 and modified by the adjacent
-ConnectCoin RSA-PSS and root-first X.509 compatibility adapters.
+ConnectCoin RSA-PSS, root-first X.509, reassembly and X25519 compatibility adapters.
+SHA compression dispatch also compiles the unchanged portable provider under
+private names as its fallback and offline differential reference.
+
+SHA-NI SHA-256 compression adapted from Bitcoin Core:
+Copyright (c) 2018-present The Bitcoin Core developers.
+MIT license; see Bitcoin-Core-COPYING.
+Based on SHA-Intrinsics code placed in the public domain by Jeffrey Walton,
+and code from Intel and Sean Gulley for the miTLS project. Original attribution
+is retained in vendor/bitcoin-core/sha256_x86_shani.cpp.
 
 Project Everest / HACL Curve25519 code bundled by Mbed TLS:
 Copyright 2016-2018 INRIA and Microsoft Corporation.
 Apache License 2.0 (MbedTLS-LICENSE).
+The pinned primitive accelerates both validated PSA X25519 public-key derivation
+and shared-secret multiplication; the other curve implementations are unchanged.
 
 p256-m bundled by Mbed TLS:
 Copyright The Mbed TLS Contributors. Author: Manuel Pegourie-Gonnard.

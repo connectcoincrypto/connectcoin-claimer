@@ -1,5 +1,6 @@
 // Copyright (c) 2026 The ConnectCoin developers. MIT license.
 #include <claimer/network.hpp>
+#include "p2c_tls_private.h"
 #ifdef _WIN32
 #include <winsock2.h>
 #else
@@ -72,6 +73,7 @@ void SocketFailureTests()
 void PolicyTests()
 {
     SocketFailureTests();
+    Require(claimer::SocketFlagsForTesting(false) && claimer::SocketFlagsForTesting(true), "Capture socket flags missing");
     for (const char* ip : {"8.8.8.8", "1.1.1.1", "9.9.9.9", "192.0.0.9", "192.0.0.10", "192.0.1.1",
                           "100.63.255.255", "100.128.0.0", "172.15.255.255", "172.32.0.0",
                           "2001:4860:4860::8888", "2606:4700:4700::1111", "2001:1::1", "2001:1::2",
@@ -111,6 +113,28 @@ int main(int argc, char** argv)
 {
     try {
         if (argc == 1) { PolicyTests(); std::cout << "network policy/cancellation tests passed\n"; return 0; }
+        if (argc == 4 && std::string(argv[1]) == "certificate-message") {
+            std::ifstream file(argv[2], std::ios::binary);
+            const claimer::Bytes message{std::istreambuf_iterator<char>(file), {}};
+            Require(file.good() || file.eof(), "Cannot read certificate fixture");
+            Require(message.size() >= 4 && message.size() <= 65540, "Certificate fixture size invalid");
+            const auto mask = std::stoull(argv[3]);
+            Require(mask <= 0xffffffff, "Invalid sent extension mask");
+            claimer::InitializeCrypto();
+            for (int abbreviated : {0, 1}) {
+                uint32_t received{};
+                int peer{};
+                const int status = connectcoin_p2c_test_certificate(message.data(), message.size(),
+                    abbreviated, static_cast<uint32_t>(mask), &received, &peer);
+                bool der_ok = status == 0;
+                if (der_ok) {
+                    try { claimer::ValidateCertificateMessage(message); }
+                    catch (const std::exception&) { der_ok = false; }
+                }
+                std::cout << status << ' ' << der_ok << ' ' << received << ' ' << peer << '\n';
+            }
+            return 0;
+        }
         // This entire executable links only the test-only loopback network
         // library. It is not shipped or reachable through production CLI.
         if (argc != 4 && argc != 5) throw std::runtime_error("fixture usage: <mode> <loopback-port> <timeout-ms> [test-root.pem]");
@@ -119,6 +143,11 @@ int main(int argc, char** argv)
         if (port < 1 || port > 65535 || timeout_ms < 1 || timeout_ms > 10000) throw std::runtime_error("Invalid fixture parameters");
         claimer::CaptureControl control;
         auto context = FixtureContext();
+        if (mode.starts_with("capture-mask-")) {
+            const auto mask = std::stoul(mode.substr(13));
+            Require(mask >= 1 && mask <= 7, "Invalid fixture signature mask");
+            context.signature_algorithms_mask = static_cast<uint8_t>(mask);
+        }
         std::string roots;
         if (argc == 5) {
             std::ifstream file(argv[4], std::ios::binary);
@@ -191,6 +220,21 @@ int main(int argc, char** argv)
             catch (const std::exception&) { rejected = true; }
             Require(rejected, "Truncated proof accepted");
         };
+        if (mode == "repeat") {
+            claimer::ClearCertificateCacheForTesting();
+            for (int index = 0; index < 2; ++index) {
+                claimer::CaptureControl own_control;
+                const auto captured = claimer::CapturePreparedForTesting(claimer::PreparedContext(context),
+                    {"127.0.0.1", AF_INET, static_cast<uint16_t>(port)}, own_control, {},
+                    std::chrono::milliseconds{timeout_ms});
+                authenticate(captured.Encoded());
+                std::cout << claimer::Hex(captured.Encoded()) << '\n';
+            }
+            const auto stats = claimer::CertificateCacheStatsForTesting();
+            Require(stats.misses == 1 && stats.metadata_builds == 1 && stats.hits >= 1,
+                    "Repeated exact certificate was reparsed by the owned cache");
+            return 0;
+        }
         if (mode == "parallel") {
             std::vector<std::future<claimer::Bytes>> jobs;
             for (int index = 0; index < 8; ++index) jobs.push_back(std::async(std::launch::async, [&] {

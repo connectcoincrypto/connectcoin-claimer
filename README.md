@@ -104,6 +104,12 @@ working directory. Source runs default to `./claimer.conf`.
 - Discovers up to 600 recent blocks with at most four parallel block reads;
   stages coherent snapshots and replays the bounty journal. Healthy polling
   reuses the cursor and block cache rather than redownloading every block.
+- A catalog resync keeps the same helper, validated captures, successful-work
+  budgets and verified proofs. New preparations and broadcasts wait until the
+  complete replacement snapshot and journal replay are published atomically;
+  a final pre-write check also fences broadcasts queued behind RPC quotas.
+  Known spent/reorganized outpoints are cancelled individually. Normal window
+  aging does not discard already-started captures or their verified winners.
 - Uses one RPC connection, polling every five seconds, with conservative client
   quotas: 48 ordinary calls/minute/method, eight calls/minute/block for bounty
   streams, and at most four submissions in flight. These are separate from the
@@ -118,6 +124,13 @@ uses a bounded ten-second window. `accepted` means the RPC acknowledged the
 transaction, **not** that it is confirmed in a block. Duplicate winning proofs
 for the same bounty are not submitted concurrently.
 
+During a catalog rebuild, `[resyncing]` distinguishes the submission barrier
+from a stopped helper. `Discovery reset:` reports a safe reset reason and RPC
+code, when available. `RPC failure:` reports the method, stage, failure source,
+safe error category/codes, and whether a request was written or its outcome is
+unknown. These diagnostic lines do not print RPC bodies or proof bytes. The
+five-second metrics line keeps the same field order and ten-second rate window.
+
 This light client relies on its configured RPC for chain state, availability
 and relay; validating a proof locally is not independent full-node validation.
 The service is plaintext, so use an endpoint/network you trust. Claims consume
@@ -125,20 +138,40 @@ bandwidth and CPU; a configured rate does not guarantee earnings.
 
 ## Shutdown, crash recovery and uncertain broadcasts
 
-The application writes a public `claimer.conf.state.json` journal before each
-broadcast. It contains only outpoints, transaction IDs, receiving addresses and
-statuses, never seeds, private keys or raw proof witnesses. Accepted outpoints
-remain reserved. The journal has explicit resource limits rather than silently
-discarding pending records.
+Before a broadcast, the application durably writes a version-2 public
+`claimer.conf.state.json` journal containing the outpoint, transaction ID,
+receiving address, status, **exact serialized claim transaction including its
+public proof witness**, and a SHA-256 digest of those bytes. It never contains
+seeds or private keys. Keep this file: it preserves winning proofs across lost
+RPC replies and restarts. Verified winners waiting at clean shutdown are also
+saved. The journal has explicit size/record limits and fails closed on storage
+errors rather than silently dropping records.
 
-If a connection is lost during submission, the transaction may already have
-been accepted. The claimer stops and records an uncertain result instead of
-blindly generating another claim. On startup, a `pending` or `unknown` record
-also requires operator review. Keep a backup of this file, check the transaction
-ID and outpoint through a trusted node/explorer, and only then resolve that
-record: mark it `accepted` if the transaction was accepted, or remove that
-specific record if you have established no broadcast remains and the bounty is
-available. Do not delete the entire journal to bypass a warning.
+A `pending` (saved without a recorded accepted outcome) or `unknown` (possibly
+sent without a conclusive reply) record reserves **only that outpoint**;
+unrelated claims can continue. Neither status proves that no transmission took
+place. Recovery first queries
+`gettransaction` for the saved ID and validates returned transaction identity,
+input, receiving output and proof binding. If it is absent from the index,
+absence is **not** treated as rejection: the client may retransmit only the
+**identical saved bytes**, after checking the digest, transaction ID, recipient
+and proof structure/binding. It never creates a competing replacement claim.
+The receiving node still applies its current full validation and fee policy.
+Reconciliation is bounded, uses the normal RPC quotas and retries with delay.
+
+Once acceptance is observed or acknowledged, the record becomes `accepted` and
+its transaction/proof bytes are removed; the compact outpoint/ID reservation
+remains. A later timeout, quota response or node rejection cannot release an
+outpoint whose earlier broadcast is still uncertain. Invalid saved data or
+malformed transaction identity still stops the service.
+
+Version-1 journals remain readable. A legacy unresolved record without saved
+transaction bytes can be recognized by an RPC lookup, but cannot be replayed
+if absent; only that outpoint remains quarantined for review. A saved claim for
+a different receiving address is also quarantined, never redirected. Keep a
+backup and check the transaction ID/outpoint through a trusted node before
+resolving such a record. Never delete the whole journal or switch configuration
+paths merely to bypass a reservation.
 
 A normal exit removes `claimer.conf.lock`. An interrupted process can leave the
 lock behind. Stop all instances and review any pending/unknown broadcasts before

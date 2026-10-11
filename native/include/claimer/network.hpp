@@ -64,6 +64,8 @@ CapturedProof CapturePrepared(const PreparedContext& context, const Endpoint& en
                               std::chrono::milliseconds timeout = std::chrono::seconds{10},
                               bool complete_handshake = false);
 #ifdef CLAIMER_NETWORK_TESTING
+// Inspect both atomic and portable socket-setup paths without connecting.
+bool SocketFlagsForTesting(bool portable);
 // Hermetic OS-error classification seam; never creates a socket or sends bytes.
 // The boolean distinguishes socket creation from connect/SO_ERROR failures.
 [[noreturn]] void ThrowSocketFailureForTesting(int error, bool creating);

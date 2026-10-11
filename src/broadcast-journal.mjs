@@ -1,14 +1,26 @@
 import { open, rename, unlink } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 
 const MAX_BYTES = 8 * 1024 * 1024;
 const MAX_RECORDS = 20000;
+export const MAX_REPLAY_HEX = 132000;
+export const transactionDigest = hex => createHash('sha256').update(Buffer.from(hex, 'hex')).digest('hex');
 const HASH = /^[0-9a-f]{64}$/;
 const OUTPOINT = /^[0-9a-f]{64}:(?:0|[1-9][0-9]{0,9})$/;
 const validOutpoint = value => typeof value === 'string' && OUTPOINT.test(value) && Number(value.slice(65)) <= 0xffffffff;
 
-/** Public outpoints and transaction IDs only. A pending write is durable before broadcast. */
+function replayFields(row) {
+  if (row.transactionHex === undefined && row.transactionHash === undefined) return {};
+  if (row.status === 'accepted' || typeof row.transactionHex !== 'string' || row.transactionHex.length < 20 ||
+      row.transactionHex.length > MAX_REPLAY_HEX || row.transactionHex.length % 2 || !/^[0-9a-f]+$/.test(row.transactionHex) ||
+      typeof row.transactionHash !== 'string' || !HASH.test(row.transactionHash) || transactionDigest(row.transactionHex) !== row.transactionHash) {
+    throw new Error('Invalid saved claim transaction bytes.');
+  }
+  return { transactionHex: row.transactionHex, transactionHash: row.transactionHash };
+}
+
+/** Public claim bytes are durable before broadcast; accepted records are compact. */
 export class BroadcastJournal {
   constructor(path) {
     this.path = path;
@@ -27,15 +39,17 @@ export class BroadcastJournal {
       const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
       if (bytesRead > MAX_BYTES) throw new Error('Claim broadcast state exceeds its size limit.');
       const data = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(buffer.subarray(0, bytesRead)));
-      if (!data || data.version !== 1 || Object.keys(data).some(key => !['version', 'records'].includes(key)) ||
+      if (!data || ![1, 2].includes(data.version) || Object.keys(data).some(key => !['version', 'records'].includes(key)) ||
           !Array.isArray(data.records) || data.records.length > MAX_RECORDS) throw new Error('Invalid claim broadcast state.');
       const records = new Map();
       for (const row of data.records) {
-        if (!row || Object.keys(row).some(key => !['outpoint', 'txid', 'receivingAddress', 'status', 'updatedAt'].includes(key)) ||
+        const allowed = ['outpoint', 'txid', 'receivingAddress', 'status', 'updatedAt', ...(data.version === 2 ? ['transactionHex', 'transactionHash'] : [])];
+        if (!row || Object.keys(row).some(key => !allowed.includes(key)) ||
             !validOutpoint(row.outpoint) || !HASH.test(row.txid) || records.has(row.outpoint) ||
             typeof row.receivingAddress !== 'string' || !/^[a-zA-Z0-9]{8,90}$/.test(row.receivingAddress) ||
             !['pending', 'accepted', 'unknown'].includes(row.status) ||
             !Number.isSafeInteger(row.updatedAt) || row.updatedAt < 0) throw new Error('Invalid claim broadcast record.');
+        replayFields(row);
         records.set(row.outpoint, Object.freeze({ ...row }));
       }
       this.records = records;
@@ -63,10 +77,21 @@ export class BroadcastJournal {
             typeof fields.receivingAddress !== 'string' || !/^[a-zA-Z0-9]{8,90}$/.test(fields.receivingAddress)) {
           throw new Error('Invalid broadcast record.');
         }
-        next.set(outpoint, Object.freeze({ outpoint, txid: fields.txid, receivingAddress: fields.receivingAddress,
+        const previous = next.get(outpoint);
+        if (previous && (previous.txid !== fields.txid || previous.receivingAddress !== fields.receivingAddress)) {
+          throw new Error('A reserved claim cannot be replaced by another transaction or recipient.');
+        }
+        const replay = fields.status === 'accepted' ? {} : replayFields({ ...fields,
+          transactionHex: fields.transactionHex ?? previous?.transactionHex,
+          transactionHash: fields.transactionHash ?? previous?.transactionHash });
+        if (previous?.transactionHash && replay.transactionHash && previous.transactionHash !== replay.transactionHash) {
+          throw new Error('A saved claim witness cannot be replaced.');
+        }
+        if (previous?.status === 'accepted' && fields.status !== 'accepted') throw new Error('An accepted claim cannot become pending.');
+        next.set(outpoint, Object.freeze({ outpoint, txid: fields.txid, receivingAddress: fields.receivingAddress, ...replay,
           status: fields.status, updatedAt: Date.now() }));
       }
-      const data = JSON.stringify({ version: 1, records: [...next.values()] }, null, 2) + '\n';
+      const data = JSON.stringify({ version: 2, records: [...next.values()] }, null, 2) + '\n';
       if (next.size > MAX_RECORDS || Buffer.byteLength(data) > MAX_BYTES) throw new Error('Claim broadcast state is full; review the saved state before continuing.');
       const temporary = join(dirname(this.path), `.claimer-state-${randomBytes(12).toString('hex')}.tmp`);
       let handle;

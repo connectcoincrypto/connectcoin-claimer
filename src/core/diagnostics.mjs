@@ -14,6 +14,8 @@ const EVENTS = new Set([
 const STAGES = new Set(['prepare', 'network', 'outputs', 'funding', 'signing', 'dns', 'proof', 'submit', 'refresh', 'discovery', 'connect', 'request', 'stream', 'lifecycle']);
 const REASONS = new Set(['stop', 'locked', 'suspend', 'clear', 'unavailable', 'window-exit', 'sibling-proof', 'fatal', 'other']);
 const DURATION_SCOPES = new Set(['stage', 'run']);
+const RPC_FAILURE_SOURCES = new Set(['pre-write', 'rpc-reply', 'request-timeout', 'stream-timeout',
+  'stream-deadline', 'stream-incomplete', 'socket-close', 'socket-write', 'protocol', 'client-close']);
 const PROCESS_SIGNALS = new Set([
   'SIGHUP', 'SIGINT', 'SIGQUIT', 'SIGILL', 'SIGTRAP', 'SIGABRT', 'SIGIOT', 'SIGBUS', 'SIGFPE',
   'SIGKILL', 'SIGUSR1', 'SIGSEGV', 'SIGUSR2', 'SIGPIPE', 'SIGALRM', 'SIGTERM', 'SIGSTKFLT',
@@ -150,13 +152,15 @@ function sanitize(details) {
   const reason = own(details, 'reason'), durationScope = own(details, 'durationScope');
   if (REASONS.has(reason)) clean.reason = reason;
   if (DURATION_SCOPES.has(durationScope)) clean.durationScope = durationScope;
+  const failureSource = own(details, 'failureSource');
+  if (RPC_FAILURE_SOURCES.has(failureSource)) clean.failureSource = failureSource;
   const signal = own(details, 'signal');
   if (PROCESS_SIGNALS.has(signal)) clean.signal = signal;
   for (const [key, [minimum, maximum]] of Object.entries(NUMBERS)) {
     const value = own(details, key);
     if (Number.isFinite(value) && value >= minimum && value <= maximum && (key === 'durationMs' || Number.isSafeInteger(value))) clean[key] = value;
   }
-  for (const key of ['enabled', 'paused', 'unknownOutcome', 'helperReady']) {
+  for (const key of ['enabled', 'paused', 'unknownOutcome', 'helperReady', 'sent', 'notSent']) {
     const value = own(details, key);
     if (typeof value === 'boolean') clean[key] = value;
   }

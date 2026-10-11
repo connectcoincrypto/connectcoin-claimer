@@ -149,8 +149,10 @@ int Generate() {
 }
 } // namespace
 int main(int argc, char** argv) {
-    // Every protocol frame is explicitly flushed by EmitFrame. Input does not
-    // need to synchronize stdout again for every byte of a bounded JSON line.
+    // The protocol exclusively uses C++ streams, with explicit frame flushes.
+    // Detaching cin's tie alone does not disable the C stdio per-byte locking.
+    // Configure buffering before any I/O; frame limits/flush semantics stay intact.
+    std::ios::sync_with_stdio(false);
     std::cin.tie(nullptr);
 #ifdef _WIN32
     _setmode(_fileno(stdin), _O_BINARY); _setmode(_fileno(stdout), _O_BINARY);

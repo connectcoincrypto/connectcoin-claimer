@@ -7,6 +7,7 @@ import { ensureConfig, readConfig } from './config.mjs';
 import { getClaimsHelper } from './core/claims.mjs';
 import { acquireLock } from './lock.mjs';
 import { ClaimerService } from './service.mjs';
+import { diagnosticError } from './core/diagnostics.mjs';
 
 const HELP = `ConnectCoin Claimer ${VERSION}
 Usage: claimer [--config PATH] [--check | --init]
@@ -43,6 +44,66 @@ export function parseArguments(args, { packaged = isSea(), cwd = process.cwd(), 
   return { mode, configPath: configPath ?? resolve(packaged ? dirname(executable) : cwd, 'claimer.conf') };
 }
 const safeText = value => String(value ?? '').replace(/[\x00-\x1f\x7f-\x9f]/g, ' ').slice(0, 1500);
+const RPC_METHODS = new Set(['getchaintip', 'getrecentblockhashes', 'getblockbounties', 'getaddressbalance',
+  'getaddresshistory', 'getaddressutxos', 'getaddresschanges', 'gettransaction', 'gettransactions',
+  'sendrawtransaction', 'getbountychanges', 'subscribebounties', 'subscribeaddress', 'subscribetip', 'unsubscribe']);
+const RPC_STAGES = new Set(['connect', 'request', 'stream']);
+const RPC_SOURCES = new Set(['pre-write', 'rpc-reply', 'request-timeout', 'stream-timeout', 'stream-deadline',
+  'stream-incomplete', 'socket-close', 'socket-write', 'protocol', 'client-close']);
+const ERROR_CATEGORIES = new Set(['unknown', 'cancelled', 'broadcast-unknown', 'dns', 'network', 'timeout',
+  'tls-timeout', 'quota', 'index-not-ready', 'snapshot-stale', 'data-unavailable', 'bounty-unavailable',
+  'node-rejected', 'helper-missing', 'helper-failed', 'helper-response', 'proof-failed', 'target-not-met',
+  'destination-blocked', 'invalid-response', 'resource-limit', 'wallet-locked', 'storage']);
+const BROADCAST_NOTES = Object.freeze({
+  accepted: '',
+  pending: 'saved for reconciliation; only this outpoint is reserved',
+  unknown: 'reply uncertain; saved for reconciliation; only this outpoint is reserved',
+  'recovered-accepted': 'accepted result recovered; saved transaction bytes compacted',
+  'reconciliation-pending': 'still reserved; identical saved transaction retained for another check',
+  'quarantined-legacy-no-bytes': 'legacy record has no saved proof; this outpoint needs review; other claims continue',
+  'quarantined-address-mismatch': 'saved receiving address differs; this outpoint needs review; other claims continue',
+});
+const booleanLabel = value => value === true ? 'yes' : value === false ? 'no' : 'unknown';
+const numericLabel = value => Number.isSafeInteger(value) && value >= 0 ? value : '?';
+function reasonLabel(reason) {
+  // Never echo arbitrary messages, causes, response bodies, or proof bytes.
+  const sanitized = diagnosticError(reason);
+  const category = ERROR_CATEGORIES.has(reason?.category) ? reason.category : sanitized.category;
+  const nodeCode = Number.isInteger(reason?.nodeCode) && reason.nodeCode >= -2147483648 && reason.nodeCode <= 2147483647
+    ? reason.nodeCode : sanitized.nodeCode;
+  return `category=${category}` + (sanitized.code === undefined ? '' : ` code=${sanitized.code}`) +
+    (nodeCode === undefined ? '' : ` node_code=${nodeCode}`);
+}
+
+export function formatServiceEvent(event, details = {}) {
+  if (event === 'discovery') return `Discovery: height ${numericLabel(details.height)}, ${numericLabel(details.available)} available bounties.`;
+  if (event === 'discovery-reset') {
+    const reason = ['initial', 'journal-reset', 'data-unavailable', 'cursor-invalid'].includes(details.reason) ? details.reason : 'journal-reset';
+    const code = [-32004, -32011].includes(details.code) ? ` (RPC ${details.code})` : '';
+    return `Discovery reset: ${reason}${code}; ` + (reason === 'initial' ? 'preparing a coherent catalog.'
+      : 'no helper restart requested; new preparations and broadcasts wait for a coherent catalog.');
+  }
+  if (event === 'rpc-diagnostic') {
+    return `RPC failure: method=${RPC_METHODS.has(details.method) ? details.method : 'unknown'} ` +
+      `stage=${RPC_STAGES.has(details.stage) ? details.stage : 'unknown'} source=${RPC_SOURCES.has(details.failureSource) ? details.failureSource : 'unknown'} ` +
+      `${reasonLabel(details.error)} sent=${booleanLabel(details.sent)} not_sent=${booleanLabel(details.notSent)} unknown_outcome=${booleanLabel(details.unknownOutcome)}.`;
+  }
+  if (event === 'broadcast') {
+    const status = typeof details.status === 'string' && Object.hasOwn(BROADCAST_NOTES, details.status) ? details.status : 'update';
+    const txid = typeof details.txid === 'string' && /^[0-9a-f]{64}$/.test(details.txid) ? details.txid : 'unavailable';
+    const note = BROADCAST_NOTES[status];
+    return `Claim ${status}: ${txid}` + (note ? ` | ${note}` : '') + (details.reason ? ` | ${reasonLabel(details.reason)}` : '');
+  }
+  return null;
+}
+
+export function formatMetricsLine(state) {
+  const metrics = state.metrics ?? {};
+  return `[${safeText(state.status ?? state.engine?.status ?? 'running')}] ` +
+    `${Number(metrics.connectionsPerSecond ?? 0).toFixed(1)} connections/s (last 10s) | active ${metrics.activeConnections ?? 0} | ` +
+    `started ${metrics.connectionsStarted ?? 0} | valid ${metrics.valid ?? 0} | failed ${metrics.invalid ?? 0} | ` +
+    `target reached ${metrics.targetReached ?? 0} | submitted ${state.claims?.completed ?? 0}`;
+}
 
 export async function main(args = process.argv.slice(2)) {
   const options = parseArguments(args);
@@ -78,20 +139,16 @@ export async function main(args = process.argv.slice(2)) {
       if (event === 'error') {
         console.error(`${details.fatal ? 'Stopped' : 'Waiting/retrying'}: ${safeText(details.message)}`);
         if (details.fatal) { exitCode = 1; queueMicrotask(() => { void stop().catch(error => console.error(safeText(error.message))); }); }
-      } else if (event === 'broadcast') console.log(`Claim ${safeText(details.status)}: ${safeText(details.txid)}`);
-      else if (event === 'discovery') console.log(`Discovery: height ${safeText(details.height)}, ${safeText(details.available)} available bounties.`);
+      } else {
+        const line = formatServiceEvent(event, details);
+        if (line) console.log(line);
+      }
     } });
     console.log(`ConnectCoin Claimer ${VERSION} | mainnet`);
     console.log(`Receiving address: ${config.receivingAddress}`);
     console.log(`Limits: ${config.connectionsPerSecond} starts/s, ${config.concurrency} simultaneous; minimum ${config.minExpectedReturn} connects/connection-second.`);
     console.log(`RPC: ${config.rpc.host}:${config.rpc.port}. Press Ctrl+C to stop.`);
-    const display = () => {
-      const state = service.snapshot(), metrics = state.metrics ?? {};
-      console.log(`[${safeText(state.status ?? state.engine?.status ?? 'running')}] ` +
-        `${Number(metrics.connectionsPerSecond ?? 0).toFixed(1)} connections/s (last 10s) | active ${metrics.activeConnections ?? 0} | ` +
-        `started ${metrics.connectionsStarted ?? 0} | valid ${metrics.valid ?? 0} | failed ${metrics.invalid ?? 0} | ` +
-        `target reached ${metrics.targetReached ?? 0} | submitted ${state.claims?.completed ?? 0}`);
-    };
+    const display = () => console.log(formatMetricsLine(service.snapshot()));
     timer = setInterval(display, 5000);
     try { await service.start(); }
     catch (error) { if (!stopping || error.name !== 'AbortError') throw error; }

@@ -410,7 +410,7 @@ test('diagnostics record RPC error metadata without request params or endpoint d
     const failures = events.filter(item => item.event === 'rpc.failed');
     assert.deepEqual(failures.map(item => item.details.method), params.map(([method]) => method));
     for (const { details } of failures) {
-      assert.deepEqual(Object.keys(details).sort(), ['durationMs', 'error', 'method', 'stage', 'unknownOutcome']);
+      assert.deepEqual(Object.keys(details).sort(), ['durationMs', 'error', 'failureSource', 'method', 'notSent', 'sent', 'stage', 'unknownOutcome']);
       assert.equal(details.stage, 'request');
       assert.equal(details.unknownOutcome, false);
       assert.ok(details.durationMs >= 0);

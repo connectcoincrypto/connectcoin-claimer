@@ -23,6 +23,7 @@ class FakeRpc extends EventEmitter {
   async request(method, params, options) {
     this.calls.push({ method, params });
     if (this.respond) return this.respond(method, params, options);
+    if (method === 'gettransaction' && params.txid === CLAIM) throw Object.assign(new Error('not found'), { code: -32004 });
     if (method === 'gettransaction') return { tip, transaction: { hex: 'funding-hex' } };
     if (method === 'sendrawtransaction') return { txid: CLAIM };
     throw new Error(`Unexpected fake method: ${method}`);
@@ -52,7 +53,8 @@ async function fixture(t, overrides = {}) {
     engineFactory: options => (engine = new FakeEngine(options)),
     discover: async () => ({ blocks: new Map([[BLOCK, [bounty]]]), cursor: 'cursor-one', tip }),
     prepare: ({ bounty: row, fee }) => ({ bounty: { ...row, target: row.connection_work_target, rootVersion: 1, mask: 7 }, txid: CLAIM, fee, payout: '9990000000' }),
-    attach: () => ({ txid: CLAIM, hex: 'claim-hex' }), transactionId: () => HASH,
+    attach: () => ({ txid: CLAIM, hex: 'ab'.repeat(50) }), transactionId: () => HASH,
+    validateSaved: row => row.transactionHex, validateObserved: () => {},
     setTimer: (callback, delay) => { const timer = { callback, delay, unref() {} }; timers.push(timer); return timer; },
     clearTimer: timer => { timer.cleared = true; }, emit: (event, details) => events.push({ event, details }), ...overrides });
   t.after(() => service.stop());
@@ -116,7 +118,7 @@ test('writes pending state durably before broadcasting and retains accepted outp
     const saved = JSON.parse(await readFile(statePath, 'utf8'));
     assert.equal(saved.records[0].status, 'pending');
     assert.equal(saved.records[0].txid, CLAIM);
-    assert.deepEqual(Object.keys(saved.records[0]).sort(), ['outpoint', 'receivingAddress', 'status', 'txid', 'updatedAt']);
+    assert.deepEqual(Object.keys(saved.records[0]).sort(), ['outpoint', 'receivingAddress', 'status', 'transactionHash', 'transactionHex', 'txid', 'updatedAt']);
     return { txid: CLAIM };
   };
   assert.deepEqual(await service.submit(prepared, 'proof'), { txid: CLAIM });
@@ -128,34 +130,36 @@ test('writes pending state durably before broadcasting and retains accepted outp
   assert.equal(fresh.engine.queue.size, 0);
 });
 
-test('uncertain broadcast stops all work and the next process refuses to connect before review', async t => {
+test('uncertain broadcast reserves only its outpoint and survives restart with exact bytes', async t => {
   const { service, rpc, statePath, timers } = await fixture(t);
   await service.start();
   const prepared = await service.prepare(bounty);
   rpc.respond = async () => { throw Object.assign(new Error('Connection lost after write.'), { unknownOutcome: true }); };
-  await assert.rejects(service.submit(prepared, 'proof'), error => error.unknownOutcome === true);
-  assert.equal(service.snapshot().status, 'review-required');
-  assert.equal(service.snapshot().running, false);
-  assert.equal(rpc.closed, true);
-  assert.equal(timers.at(-1).cleared, true);
+  await assert.rejects(service.submit(prepared, 'proof'), error => error.broadcastDeferred === true);
+  assert.equal(service.snapshot().status, 'running');
+  assert.equal(service.snapshot().running, true);
+  assert.equal(rpc.closed, false);
+  assert.equal(timers.at(-1).cleared, undefined);
   assert.equal(JSON.parse(await readFile(statePath, 'utf8')).records[0].status, 'unknown');
   const restarted = await fixture(t, { statePath });
-  await assert.rejects(restarted.service.start(), /previous claim broadcast needs review/);
-  assert.equal(restarted.rpc.connections, 0);
-  assert.equal(restarted.engine.starts, 0);
+  await restarted.service.start();
+  assert.equal(restarted.rpc.connections, 1);
+  assert.equal(restarted.engine.starts, 1);
+  assert.equal(restarted.engine.queue.size, 0);
+  assert.equal(restarted.service.journal.unresolved()[0].transactionHex, 'ab'.repeat(50));
 });
 
-test('cancellation during durable preflight removes the record without transmitting', async t => {
+test('cancellation during durable preflight keeps the verified bytes without transmitting', async t => {
   const controller = new AbortController();
   const { service, rpc } = await fixture(t);
   await service.start();
   const prepared = await service.prepare(bounty);
   const update = service.journal.update.bind(service.journal);
   service.journal.update = async (key, row) => { await update(key, row); if (row?.status === 'pending') controller.abort(); };
-  await assert.rejects(service.submit(prepared, 'proof', { signal: controller.signal }), { name: 'AbortError', notSent: true });
+  await assert.rejects(service.submit(prepared, 'proof', { signal: controller.signal }), { broadcastDeferred: true });
   assert.equal(rpc.calls.some(call => call.method === 'sendrawtransaction'), false);
-  assert.equal(service.journal.entries().length, 0);
-  assert.equal(service.reserved.size, 0);
+  assert.equal(service.journal.entries()[0].status, 'pending');
+  assert.equal(service.reserved.size, 1);
 });
 
 test('a definite node rejection releases the durable reservation; already-known remains uncertain', async t => {
@@ -167,8 +171,161 @@ test('a definite node rejection releases the durable reservation; already-known 
   assert.equal(service.journal.entries().length, 0);
   assert.equal(service.running, true);
   rpc.respond = async () => { throw Object.assign(new Error('Already known'), { code: -32020, data: { node_code: -27 } }); };
-  await assert.rejects(service.submit(prepared, 'proof'), error => error.unknownOutcome === true);
-  assert.equal(service.running, false);
+  await assert.rejects(service.submit(prepared, 'proof'), error => error.broadcastDeferred === true);
+  assert.equal(service.running, true);
+});
+
+async function uncertainFixture(t, overrides = {}) {
+  const result = await fixture(t, overrides);
+  await result.service.start();
+  const prepared = await result.service.prepare(bounty);
+  result.rpc.respond = async () => { throw Object.assign(new Error('Lost response'), { unknownOutcome: true }); };
+  await assert.rejects(result.service.submit(prepared, 'proof'), { broadcastDeferred: true });
+  return result;
+}
+
+test('lost response reconciles an indexed transaction without resending or completing twice', async t => {
+  const { service, rpc, engine } = await uncertainFixture(t);
+  let completed = 0;
+  engine.completeRecoveredClaim = (key, txid) => { assert.equal(key, `${HASH}:0`); assert.equal(txid, CLAIM); completed++; };
+  rpc.respond = async (method, params) => {
+    assert.equal(method, 'gettransaction'); assert.equal(params.txid, CLAIM);
+    return { tip, transaction: { hex: 'ab'.repeat(50) } };
+  };
+  await Promise.all([service.reconcileBroadcasts(), service.reconcileBroadcasts()]);
+  await service.reconcileBroadcasts();
+  assert.equal(completed, 1);
+  assert.equal(service.journal.unresolved().length, 0);
+  assert.equal(service.journal.entries()[0].transactionHex, undefined);
+  assert.equal(service.reserved.has(`${HASH}:0`), true);
+  assert.equal(rpc.calls.filter(row => row.method === 'sendrawtransaction').length, 1);
+});
+
+test('missing index replays exactly the saved public witness and only one request at a time', async t => {
+  const { service, rpc, engine } = await uncertainFixture(t);
+  const replay = Promise.withResolvers(), sending = Promise.withResolvers();
+  const original = service.journal.unresolved()[0]; let completed = 0;
+  engine.completeRecoveredClaim = () => completed++;
+  rpc.respond = async (method, params, options) => {
+    if (method === 'gettransaction') throw Object.assign(new Error('Not indexed'), { code: -32004 });
+    assert.equal(method, 'sendrawtransaction');
+    assert.equal(params.transaction_hex, original.transactionHex);
+    assert.equal(service.journal.unresolved()[0].status, 'unknown');
+    options.beforeSend(); sending.resolve(); return replay.promise;
+  };
+  const first = service.reconcileBroadcasts(); await sending.promise;
+  assert.equal(service.reconcileBroadcasts(), first);
+  replay.resolve({ txid: CLAIM }); await first;
+  assert.equal(completed, 1);
+  assert.equal(service.journal.entries()[0].status, 'accepted');
+  assert.equal(rpc.calls.filter(row => row.method === 'sendrawtransaction').length, 2);
+});
+
+for (const failure of [
+  { code: -32029, data: { retry_after_ms: 45000 } },
+  { code: -32002 }, { notSent: true }, { unknownOutcome: true },
+  ...[-25, -26, -27].map(node_code => ({ code: -32020, data: { node_code } })),
+]) test(`reconciliation preserves an uncertain reservation after ${JSON.stringify(failure)}`, async t => {
+  const { service, rpc } = await uncertainFixture(t);
+  const original = service.journal.unresolved()[0];
+  rpc.respond = async method => {
+    if (method === 'gettransaction') throw Object.assign(new Error('Not indexed'), { code: -32004 });
+    throw Object.assign(new Error('Retry failed'), failure);
+  };
+  await service.reconcileBroadcasts();
+  const pending = service.journal.unresolved()[0];
+  assert.equal(pending.transactionHex, original.transactionHex);
+  assert.equal(pending.transactionHash, original.transactionHash);
+  assert.equal(pending.txid, original.txid);
+  assert.equal(service.reserved.has(`${HASH}:0`), true);
+  assert.equal(service.running, true);
+  assert.ok(service.recoveryDue.get(`${HASH}:0`) > Date.now());
+});
+
+test('legacy unresolved record is isolated while other bounties run and can resolve by indexed receipt', async t => {
+  const { directory } = await fixture(t), statePath = join(directory, 'legacy.json');
+  await writeFile(statePath, JSON.stringify({ version: 1, records: [{ outpoint: `${HASH}:0`, txid: CLAIM,
+    receivingAddress: config.receivingAddress, status: 'unknown', updatedAt: 0 }] }));
+  const other = { ...bounty, vout: 1 };
+  const { service, rpc, engine } = await fixture(t, { statePath,
+    discover: async () => ({ blocks: new Map([[BLOCK, [bounty, other]]]), cursor: 'one', tip }) });
+  await service.start(); await service.reconcileBroadcasts();
+  assert.equal(service.running, true);
+  assert.equal(service.snapshot().reviewRequired, true);
+  assert.equal(engine.queue.size, 1);
+  assert.equal(engine.queue.has(`${HASH}:1`), true);
+  assert.equal(rpc.calls.some(row => row.method === 'sendrawtransaction'), false);
+  service.recoveryDue.clear();
+  rpc.respond = async () => ({ tip, transaction: { hex: 'ab'.repeat(50) } });
+  await service.reconcileBroadcasts();
+  assert.equal(service.journal.entries()[0].status, 'accepted');
+  assert.equal(service.snapshot().reviewRequired, false);
+});
+
+test('pending bytes recover after process restart without generating another claim', async t => {
+  const { service, statePath } = await fixture(t);
+  await service.start(); const prepared = await service.prepare(bounty);
+  const update = service.journal.update.bind(service.journal);
+  const signal = new AbortController();
+  service.journal.update = async (...args) => { await update(...args); signal.abort(); };
+  await assert.rejects(service.submit(prepared, 'proof', { signal: signal.signal }), { broadcastDeferred: true });
+  await service.stop();
+  const fresh = await fixture(t, { statePath, prepare: () => assert.fail('Must not recreate saved transaction') });
+  await fresh.service.start(); await fresh.service.reconcileBroadcasts();
+  assert.equal(fresh.service.journal.entries()[0].status, 'accepted');
+  assert.equal(fresh.rpc.calls.filter(row => row.method === 'sendrawtransaction').length, 1);
+});
+
+test('older quarantined entries cannot starve newly recoverable records', async t => {
+  const { service, rpc } = await uncertainFixture(t);
+  const template = service.journal.unresolved()[0];
+  for (let vout = 1; vout <= 7; vout++) {
+    await service.journal.update(`${HASH}:${vout}`, { ...template, status: 'unknown' });
+    service.reserved.add(`${HASH}:${vout}`);
+  }
+  for (let vout = 0; vout < 7; vout++) service.recoveryDue.set(`${HASH}:${vout}`, Date.now() - 1);
+  let selected;
+  service.reconcileOne = async row => { selected = row.outpoint; };
+  const previousCalls = rpc.calls.length;
+  await service.reconcileBroadcasts();
+  assert.equal(selected, `${HASH}:7`);
+  assert.equal(rpc.calls.length, previousCalls);
+});
+
+for (const action of ['stop', 'disconnect']) test(`node rejection arriving during ${action} cannot erase the saved proof`, async t => {
+  const { service, rpc, engine } = await fixture(t);
+  await service.start(); const prepared = await service.prepare(bounty);
+  engine.queue.get(`${HASH}:0`).prepared = prepared;
+  engine.pendingProofs.set(`${HASH}:0`, { proof: 'proof' });
+  const sending = Promise.withResolvers(), result = Promise.withResolvers();
+  rpc.respond = async () => { sending.resolve(); return result.promise; };
+  const submitted = service.submit(prepared, 'proof');
+  const rejected = assert.rejects(submitted, { broadcastDeferred: true });
+  await sending.promise;
+  engine.stop = engine.suspend = () => submitted.catch(() => {});
+  const draining = action === 'stop' ? service.stop() : (rpc.emit('disconnected'), service.suspending);
+  result.reject(Object.assign(new Error('Node rejected'), { code: -32020, data: { node_code: -26 } }));
+  await rejected; await draining;
+  assert.equal(service.journal.unresolved()[0].transactionHex, 'ab'.repeat(50));
+  assert.equal(service.reserved.has(`${HASH}:0`), true);
+});
+
+test('disconnect persistence barrier cannot be shortened by another suspend', async t => {
+  const { service, rpc, engine } = await fixture(t);
+  await service.start(); const prepared = await service.prepare(bounty);
+  engine.queue.get(`${HASH}:0`).prepared = prepared;
+  engine.pendingProofs.set(`${HASH}:0`, { proof: 'proof' });
+  const writing = Promise.withResolvers(), release = Promise.withResolvers();
+  const update = service.journal.update.bind(service.journal);
+  service.journal.update = async (...args) => { writing.resolve(); await release.promise; return update(...args); };
+  rpc.emit('disconnected'); await writing.promise;
+  const barrier = service.suspending;
+  await service.suspend(); assert.equal(service.suspending, barrier);
+  let finished = false; const cycle = service.cycle().then(() => { finished = true; });
+  await new Promise(resolve => setImmediate(resolve)); assert.equal(finished, false);
+  release.resolve(); await cycle;
+  assert.equal(service.journal.unresolved()[0].transactionHex, 'ab'.repeat(50));
+  assert.equal(engine.queue.size, 0);
 });
 
 test('disconnect suspends claims and invalidates old proposals until a coherent incremental catchup', async t => {
@@ -206,7 +363,7 @@ test('rate limits honor retry_after_ms and malformed network identity never retr
   assert.equal(invalid.timers.length, 0);
 });
 
-test('real engine discards old-epoch proposals and verified proofs before reconnect while preserving its work budget', async t => {
+test('real engine saves verified proofs before clearing old-epoch work on reconnect', async t => {
   const { service, rpc } = await fixture(t, {
     engineFactory: options => new ClaimsEngine(options),
     poolFactory: () => ({ pacesStarts: true, async start() {}, async close() {},
@@ -226,7 +383,7 @@ test('real engine discards old-epoch proposals and verified proofs before reconn
     assert.fail('Real engine did not prepare a claim at the requested epoch.');
   };
   await service.start();
-  const old = await preparedAtEpoch(0);
+  await preparedAtEpoch(0);
   engine.successCounts.set(key, 1n);
   const factor = engine.factors.get(key);
   engine.pendingProofs.set(key, { proof: '02ff', due: Infinity });
@@ -237,12 +394,17 @@ test('real engine discards old-epoch proposals and verified proofs before reconn
   assert.equal(engine.queue.size, 0);
   assert.equal(engine.successCounts.get(key), 1n);
   assert.equal(engine.factors.get(key), factor);
+  assert.equal(service.journal.unresolved()[0].transactionHex, 'ab'.repeat(50));
+  assert.equal(service.reserved.has(key), true);
   await service.cycle();
-  const fresh = await preparedAtEpoch(1);
-  assert.notEqual(fresh, old);
-  assert.equal(fresh.epoch, service.epoch);
-  assert.equal(rpc.calls.filter(call => call.method === 'gettransaction').length, 2);
+  assert.equal(engine.queue.size, 0);
+  assert.equal(engine.proposals.size, 0);
+  assert.equal(rpc.calls.filter(call => call.method === 'gettransaction').length, 1);
   assert.equal(rpc.calls.some(call => call.method === 'sendrawtransaction'), false);
+  await service.reconcileBroadcasts();
+  assert.equal(service.journal.entries()[0].status, 'accepted');
+  assert.equal(engine.state.completed, 1);
+  assert.equal(rpc.calls.filter(call => call.method === 'sendrawtransaction').length, 1);
 });
 
 test('stop while initial state is being loaded cannot restart the service afterward', async t => {

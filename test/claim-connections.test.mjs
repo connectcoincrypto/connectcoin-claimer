@@ -87,6 +87,10 @@ test('simultaneous fresh winners and queued proofs share the four-submission lim
   await until(() => sent.length >= 4);
   await tick(); await tick();
   assert.equal(active, 4); assert.equal(sent.length, 4);
+  for (const job of engine.queue.values()) engine.retire(job.bounty.txid, job.bounty.vout);
+  engine.retainCatalog([]);
+  assert.equal(engine.pendingProofs.size, 12, 'window exit must keep verified winners, including those awaiting an RPC slot');
+  assert.equal(engine.queue.size, 12);
   for (let batch = 0; batch < 3; batch++) {
     for (const release of releases.splice(0)) release();
     await until(() => engine.snapshot().completed === (batch + 1) * 4);
@@ -94,6 +98,90 @@ test('simultaneous fresh winners and queued proofs share the four-submission lim
   }
   assert.equal(maximum, 4); assert.equal(new Set(sent).size, 12);
   assert.equal(engine.pendingProofs.size, 0);
+});
+
+test('durably deferred broadcasts isolate their outpoint and recovery counts acceptance only once across resync', async t => {
+  const submitted = [], events = [], first = row(), second = row(2, 'other.example');
+  const { engine, attempts } = fixture(t, {
+    options: { connectionsPerSecond: 256, concurrency: 1 },
+    onDiagnostic: (event, details) => events.push({ event, details }),
+    submit: async prepared => {
+      submitted.push(key(prepared.bounty));
+      if (key(prepared.bounty) === key(first)) throw Object.assign(new Error('Saved for reconciliation.'),
+        { broadcastDeferred: true, unknownOutcome: true, txid: prepared.context.txid });
+      return prepared.context.txid;
+    },
+  });
+  engine.enqueue([first]); engine.start(); await until(() => attempts.length === 1);
+  attempts[0].finish({ captured: true, validationPassed: true, proof: '020100', verified: true });
+  await until(() => engine.deferredBroadcasts.has(key(first)) && !engine.hasActive(key(first)));
+  assert.equal(engine.enabled, true); assert.equal(engine.snapshot().completed, 0);
+  assert.equal(engine.pendingProofs.size, 0); assert.equal(engine.proposals.size, 0); assert.equal(engine.queue.size, 0);
+  assert.equal(events.some(item => item.event === 'claims.failed' || item.event === 'claim.succeeded'), false);
+  assert.equal(engine.enqueue([first, second]), 1);
+  await until(() => attempts.length === 2);
+  attempts[1].finish({ captured: true, validationPassed: true, proof: '020100', verified: true });
+  await until(() => engine.snapshot().completed === 1);
+  assert.deepEqual(submitted, [key(first), key(second)]);
+  await engine.suspend(); engine.clear({ preserveSelection: true });
+  assert.equal(engine.enqueue([first, second]), 0, 'neither deferred nor accepted claims may restart after catalog resync');
+  assert.equal(engine.completeRecoveredClaim(key(first), context(first).txid), true);
+  assert.equal(engine.completeRecoveredClaim(key(first), context(first).txid), false);
+  engine.clear({ preserveSelection: true });
+  assert.equal(engine.completeRecoveredClaim(key(first), context(first).txid), false);
+  assert.equal(engine.snapshot().completed, 2); assert.equal(engine.deferredBroadcasts.size, 0);
+  assert.equal(events.filter(item => item.event === 'claim.succeeded').length, 2);
+  assert.equal(engine.snapshot().lastClaim, context(first).txid);
+});
+
+test('recovery accepts a startup journal receipt without a live proof and rejects mismatched receipts', () => {
+  const engine = new ClaimsEngine({ isUnlocked: () => true, prepare: async () => {}, submit: async () => {} });
+  const bounty = row(), id = key(bounty), txid = context(bounty).txid;
+  for (const invalid of ['', `${bounty.txid}:01`, `${bounty.txid}:4294967296`, `${bounty.txid}:0:1`]) {
+    assert.throws(() => engine.completeRecoveredClaim(invalid, txid), /Invalid recovered/);
+  }
+  assert.throws(() => engine.completeRecoveredClaim(id, 'bad'), /Invalid recovered/);
+  engine.deferredBroadcasts.set(id, txid);
+  assert.throws(() => engine.completeRecoveredClaim(id, hash(9)), /Invalid recovered/);
+  assert.equal(engine.deferredBroadcasts.get(id), txid); assert.equal(engine.snapshot().completed, 0);
+  engine.deferredBroadcasts.clear();
+  assert.equal(engine.completeRecoveredClaim(id, txid), true);
+  assert.equal(engine.completeRecoveredClaim(id, txid), false);
+  assert.equal(engine.snapshot().completed, 1); assert.equal(engine.enqueue([bounty]), 0);
+});
+
+test('a deferred marker cannot mask helper failure or a transaction different from the verified proof', async t => {
+  for (const fields of [{ helperFatal: true, txid: context(row()).txid }, { txid: hash(999) }, { txid: undefined }]) {
+    const { engine, attempts } = fixture(t, { options: { connectionsPerSecond: 256, concurrency: 1 },
+      submit: async () => { throw Object.assign(new Error('Invalid deferred ownership.'), { broadcastDeferred: true, ...fields }); } });
+    engine.enqueue([row()]); engine.start(); await until(() => attempts.length === 1);
+    attempts[0].finish({ captured: true, validationPassed: true, proof: '020100', verified: true });
+    await until(() => !engine.enabled);
+    assert.equal(engine.snapshot().completed, 0); assert.equal(engine.deferredBroadcasts.size, 0);
+    await engine.stop();
+  }
+});
+
+test('retired verified proofs keep identical retries, while reorg invalidation still discards them', async t => {
+  const submitted = [], bounty = row();
+  const { engine, attempts } = fixture(t, { options: { connectionsPerSecond: 256, concurrency: 1 }, retryDelayMs: 300000,
+    submit: async (prepared, proof) => {
+      submitted.push({ prepared, proof });
+      throw Object.assign(new Error('Quota before sending.'), { code: -32029 });
+    } });
+  engine.enqueue([bounty]); engine.start(); await until(() => attempts.length === 1);
+  attempts[0].finish({ captured: true, validationPassed: true, proof: '020100', verified: true });
+  await until(() => submitted.length === 1 && !engine.hasActive(key(bounty)));
+  engine.retire(bounty.txid, bounty.vout); engine.retainCatalog([]);
+  assert.equal(engine.pendingProofs.size, 1); assert.equal(engine.queue.size, 1);
+  const pending = engine.pendingProofs.get(key(bounty)); pending.due = 0; engine.kick();
+  await until(() => submitted.length === 2 && !engine.hasActive(key(bounty)));
+  assert.equal(engine.pendingProofs.size, 1); assert.equal(attempts.length, 1);
+  assert.strictEqual(submitted[0].prepared, submitted[1].prepared); assert.equal(submitted[0].proof, submitted[1].proof);
+  engine.remove(bounty.txid, bounty.vout);
+  assert.equal(engine.pendingProofs.size, 0); assert.equal(engine.queue.size, 0);
+  engine.kick(); await tick();
+  assert.equal(submitted.length, 2); assert.equal(engine.snapshot().completed, 0);
 });
 
 test('one persistent pool runs multiple bounties concurrently with a single global slot bound', async t => {

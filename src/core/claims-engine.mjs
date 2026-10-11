@@ -68,7 +68,7 @@ export class ClaimsEngine {
     this.poolFactory = poolFactory ?? (generateProof ? () => injectedPool(generateProof) : ({ onFailure }) => new ConnectionPool({ resourcesPath, onDiagnostic, onFailure }));
     this.options = validateConnectionOptions(options);
     this.queue = new Map(); this.completed = new Set(); this.factors = new Map(); this.successCounts = new Map();
-    this.proposals = new Map(); this.pendingProofs = new Map(); this.submitting = new Set();
+    this.proposals = new Map(); this.pendingProofs = new Map(); this.submitting = new Set(); this.deferredBroadcasts = new Map();
     this.domainStats = new Map(); this.dns = new Map(); this.live = new Map(); this.connections = new Map();
     this.connectionPolicy = new ClaimConnectionPolicy();
     this.recoveryJobs = new Map();
@@ -172,7 +172,7 @@ export class ClaimsEngine {
     const tracked = Promise.resolve(promise).finally(() => {
       const count = this.live.get(key) - 1; if (count) this.live.set(key, count); else this.live.delete(key);
       this.tasks.delete(tracked);
-      if (job.retired && !this.hasActive(key) && this.queue.get(key) === job) { this.queue.delete(key); this.scheduler.remove(key); }
+      if (job.retired && !this.hasActive(key) && !this.pendingProofs.has(key) && this.queue.get(key) === job) { this.queue.delete(key); this.scheduler.remove(key); }
       this.notify(); this.kick();
     });
     this.tasks.add(tracked); return tracked;
@@ -247,7 +247,7 @@ export class ClaimsEngine {
     for (const bounty of bounties) {
       if (!validBounty(bounty)) continue;
       const key = keyOf(bounty);
-      if (seen.has(key) || this.completed.has(key) || this.hasActive(key)) continue;
+      if (seen.has(key) || this.completed.has(key) || this.deferredBroadcasts.has(key) || this.hasActive(key)) continue;
       seen.add(key);
       let factor = this.factors.get(key);
       if (factor === undefined) {
@@ -289,6 +289,11 @@ export class ClaimsEngine {
       keys.add(key); const job = this.queue.get(key) ?? [...this.connections.values()].find(item => keyOf(item.job.bounty) === key)?.job;
       if (job) { masks.add(`${job.bounty.domain}:${job.bounty.signature_algorithms_mask}`); domains.add(job.bounty.domain); }
     }
+    // A verified winner awaiting an RPC slot/backoff owns work even when its
+    // discovery window has aged out and no TLS task remains active.
+    for (const [key, job] of this.queue) if (!job.unavailable && this.pendingProofs.has(key)) {
+      keys.add(key); masks.add(`${job.bounty.domain}:${job.bounty.signature_algorithms_mask}`); domains.add(job.bounty.domain);
+    }
     for (const map of [this.factors, this.successCounts, this.proposals, this.pendingProofs]) for (const key of map.keys()) if (!keys.has(key)) map.delete(key);
     for (const key of this.domainStats.keys()) if (!masks.has(key)) this.domainStats.delete(key);
     for (const domain of this.dns.keys()) if (!domains.has(domain)) this.dns.delete(domain);
@@ -323,21 +328,20 @@ export class ClaimsEngine {
     const key = `${txid}:${vout}`, job = this.queue.get(key);
     if (!job || job.retired) return;
     job.retired = true; this.scheduler.remove(key);
-    if (!job.submitting) this.pendingProofs.delete(key);
     // Normal window exit does not cancel captures already on the wire.
     for (const request of this.connections.values()) if (request.job === job && !request.started) this.cancelOperation(request.controller, 'window-exit');
-    if (!this.hasActive(key)) this.queue.delete(key);
+    if (!this.hasActive(key) && !this.pendingProofs.has(key)) this.queue.delete(key);
     this.notify(); this.kick();
   }
   clear({ preserveSelection = false } = {}) {
     this.startIdle = true;
     for (const job of this.queue.values()) job.unavailable = true;
-    this.queue.clear(); this.completed.clear();
+    this.queue.clear();
     this.recoveryJobs.clear();
     this.waitingPrepare.clear(); this.waitingDns.clear();
     for (const controller of this.controllers) this.cancelOperation(controller, 'clear');
     this.scheduler.clear({ preserveSelection }); this.dirty = true;
-    if (!preserveSelection) { this.factors.clear(); this.successCounts.clear(); this.proposals.clear(); this.pendingProofs.clear(); this.domainStats.clear(); this.connectionPolicy.clear(); }
+    if (!preserveSelection) { this.completed.clear(); this.deferredBroadcasts.clear(); this.factors.clear(); this.successCounts.clear(); this.proposals.clear(); this.pendingProofs.clear(); this.domainStats.clear(); this.connectionPolicy.clear(); }
     // A catalog resync keeps both activity totals. A full context reset must
     // clear both together so the UI never compares counters from different periods.
     this.notify(preserveSelection ? {} : { completed: 0, attempts: 0 });
@@ -673,7 +677,7 @@ export class ClaimsEngine {
     let due = Infinity;
     for (const [key, pending] of this.pendingProofs) {
       const job = this.queue.get(key);
-      if (job && !job.retired && !job.unavailable && !job.submitting) due = Math.min(due, pending.due);
+      if (job && !job.unavailable && !job.submitting) due = Math.min(due, pending.due);
     }
     return due;
   }
@@ -700,7 +704,7 @@ export class ClaimsEngine {
     for (const [key, pending] of this.pendingProofs) {
       if (this.submitting.size >= 4) return;
       const job = this.queue.get(key);
-      if (!job || job.retired || job.unavailable || job.submitting || pending.due > Date.now()) continue;
+      if (!job || job.unavailable || job.submitting || pending.due > Date.now()) continue;
       const controller = new AbortController(); this.controllers.add(controller);
       const task = this.submitVerified(job, controller, generation).finally(() => this.controllers.delete(controller));
       void this.track(job, task);
@@ -717,25 +721,48 @@ export class ClaimsEngine {
     this.notify({ status: 'submitting' });
     try {
       const receipt = await this.submit(job.prepared, pending.proof, { signal: controller.signal });
-      this.completed.add(key); if (this.completed.size > this.maxQueue) this.completed.delete(this.completed.values().next().value);
-      this.queue.delete(key); this.proposals.delete(key); this.pendingProofs.delete(key);
-      this.finishOperation(operation, 'completed'); this.countDiagnostic('completed');
+      this.finishOperation(operation, 'completed');
       // durationMs measures this submit operation only, not preparation/capture
       // or queue time. Aggregated progress counts every success, even if sampled.
-      this.sampleDiagnostic('claim.succeeded', { stage: 'submit', claimId: job.diagnosticId, completed: this.state.completed + 1,
-        durationMs: Math.round(performance.now() - started), attempts: 1 });
-      this.notify({ status: this.enabled ? 'claimed' : 'off', completed: this.state.completed + 1,
-        ...(this.enabled && generation === this.generation ? { lastError: null } : {}),
-        lastClaim: typeof receipt === 'string' ? receipt : receipt?.txid ?? pending.context.txid });
+      this.recordCompletedClaim(key, typeof receipt === 'string' ? receipt : receipt?.txid ?? pending.context.txid,
+        { claimId: job.diagnosticId, durationMs: Math.round(performance.now() - started), attempts: 1 }, generation);
     } catch (error) {
       this.finishOperation(operation, error.name === 'AbortError' && !error.unknownOutcome ? 'cancelled' : 'failed');
+      if (error.broadcastDeferred === true && !error.helperFatal) {
+        // This is a trusted service-to-engine ownership transfer, not an RPC
+        // classification: the service has durably saved the exact signed bytes.
+        // Keep the outpoint blocked locally without treating it as accepted.
+        if (!/^[0-9a-f]{64}$/.test(error.txid) || error.txid !== pending.context.txid) {
+          this.fatal(Object.assign(new Error('Deferred claim transaction does not match its verified proof.'), { helperFatal: true })); return;
+        }
+        if (!this.completed.has(key)) this.deferredBroadcasts.set(key, error.txid);
+        this.queue.delete(key); this.scheduler.remove(key); this.proposals.delete(key); this.pendingProofs.delete(key);
+        this.notify(); return;
+      }
       if (error.unknownOutcome || error.helperFatal) { this.fatal(error); return; }
-      if (job.retired || job.unavailable) this.pendingProofs.delete(key);
+      if (job.unavailable) this.pendingProofs.delete(key);
       if (error.name !== 'AbortError') {
         this.jobError(job, error, 'submit', true, { durationMs: Math.round(performance.now() - started), attempts: 1 });
         pending.due = job.due; pending.failures = job.failures;
       }
     } finally { this.finishOperation(operation); job.submitting = false; job.submitController = null; this.submitting.delete(job); }
+  }
+  recordCompletedClaim(key, txid, details, generation = this.generation) {
+    this.queue.delete(key); this.scheduler.remove(key); this.proposals.delete(key); this.pendingProofs.delete(key); this.deferredBroadcasts.delete(key);
+    if (this.completed.has(key)) return false;
+    this.completed.add(key); if (this.completed.size > this.maxQueue) this.completed.delete(this.completed.values().next().value);
+    this.countDiagnostic('completed');
+    this.sampleDiagnostic('claim.succeeded', { stage: 'submit', completed: this.state.completed + 1, ...details });
+    this.notify({ status: this.enabled ? 'claimed' : 'off', completed: this.state.completed + 1,
+      ...(this.enabled && generation === this.generation ? { lastError: null } : {}), lastClaim: txid });
+    return true;
+  }
+  completeRecoveredClaim(key, txid) {
+    // Call only after the service has durably persisted its accepted receipt.
+    const match = typeof key === 'string' && /^([0-9a-f]{64}):(0|[1-9][0-9]{0,9})$/.exec(key);
+    if (!match || Number(match[2]) > 0xffffffff || typeof txid !== 'string' || !/^[0-9a-f]{64}$/.test(txid) ||
+        (this.deferredBroadcasts.has(key) && this.deferredBroadcasts.get(key) !== txid)) throw new Error('Invalid recovered claim receipt');
+    return this.recordCompletedClaim(key, txid, { durationMs: 0, attempts: 0 });
   }
   pauseWorker(signal) {
     if (signal.aborted) return Promise.resolve();

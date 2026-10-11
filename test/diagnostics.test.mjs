@@ -18,6 +18,22 @@ async function fixture(t) {
 }
 async function rows(file) { return (await readFile(file, 'utf8')).trim().split('\n').filter(Boolean).map(line => JSON.parse(line)); }
 
+test('RPC transmission diagnostics retain only boolean flags and allowlisted failure origins', async t => {
+  const log = new DiagnosticLog({ directory: await fixture(t) });
+  const sources = ['pre-write', 'rpc-reply', 'request-timeout', 'stream-timeout', 'stream-deadline',
+    'stream-incomplete', 'socket-close', 'socket-write', 'protocol', 'client-close'];
+  for (const failureSource of sources) log.record('rpc.failed', { method: 'sendrawtransaction',
+    sent: true, notSent: false, unknownOutcome: true, failureSource, transaction_hex: 'PRIVATE-CANARY', proof: 'PRIVATE-CANARY' });
+  log.record('rpc.failed', { sent: 'PRIVATE-CANARY', notSent: 1, failureSource: 'PRIVATE-CANARY',
+    error: new Error('PRIVATE-CANARY') });
+  await log.flush();
+  const stored = await rows(log.snapshot().file);
+  for (const [index, failureSource] of sources.entries()) assert.deepEqual(stored[index].details,
+    { method: 'sendrawtransaction', failureSource, unknownOutcome: true, sent: true, notSent: false });
+  assert.deepEqual(Object.keys(stored.at(-1).details), ['error']);
+  assert.equal(JSON.stringify(stored).includes('PRIVATE-CANARY'), false);
+});
+
 test('startup timing logs retain only safe numeric timing metadata', async t => {
   const log = new DiagnosticLog({ directory: await fixture(t) });
   const events = ['wallet.unlock_started', 'wallet.unlocked', 'wallet.snapshot_ready', 'wallet.render_ready'];

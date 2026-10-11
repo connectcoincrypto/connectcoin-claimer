@@ -150,6 +150,78 @@ def require(condition: bool, message: str):
         raise AssertionError(message)
 
 
+def certificate_parser_cases(binary: Path, directory: Path, cert_pem: bytes) -> int:
+    """Old TLS handler versus abbreviated+owned-DER-cache admission, offline.
+
+    Neither side here authenticates a proof. The live loopback cases below
+    exercise both full proof verifiers, including wrong name/time/mask/CV.
+    """
+    der = x509.load_pem_x509_certificate(cert_pem).public_bytes(serialization.Encoding.DER)
+    def u24(value):
+        return value.to_bytes(3, "big")
+    def ext(kind, data=b""):
+        return kind.to_bytes(2, "big") + len(data).to_bytes(2, "big") + data
+    def entry(certificate=der, extensions=b""):
+        return u24(len(certificate)) + certificate + len(extensions).to_bytes(2, "big") + extensions
+    def message(entries, *, length=None, context=0, trailing=b""):
+        body = bytes([context]) + u24(len(entries) if length is None else length) + entries + trailing
+        return b"\x0b" + u24(len(body)) + body
+    good = entry()
+    cases = [
+        ("leaf", message(good), 0, True, True),
+        ("eight-certs", message(good * 8), 0, True, True),
+        ("nine-certs", message(good * 9), 0, False, True),
+        ("empty-chain", message(b""), 0, False, True),
+        ("nonempty-request-context", message(good, context=1), 0, False, True),
+        ("trailing-message", message(good, trailing=b"x"), 0, False, True),
+        ("short-list", message(good, length=len(good) - 1), 0, False, True),
+        ("long-list", message(good, length=len(good) + 1), 0, False, True),
+        ("oversized-list", message(good, length=65536), 0, False, True),
+        ("empty-der", message(entry(b"")), 0, False, True),
+        ("under-128-der", message(entry(bytes(127))), 0, False, True),
+        ("invalid-der", message(entry(bytes(128))), 0, False, False),
+        ("invalid-der-prefix", message(entry(b"\x31" + der[1:])), 0, False, False),
+        ("oversized-der", message(u24(65536) + b"x"), 0, False, True),
+        ("over-p2c-der-limit", message(entry(bytes(16385))), 0, False, False),
+        ("missing-extension-length", message(good[:-2]), 0, False, True),
+        ("truncated-extension-block", message(good[:-2] + b"\x00\x01"), 0, False, True),
+        ("truncated-extension-payload", message(entry(extensions=b"\x00\x05\x00\x01")), 0xffffffff, False, True),
+        ("unknown-extension", message(entry(extensions=ext(0xfffe))), 0xffffffff, False, True),
+        ("duplicate-unknown-extension", message(entry(extensions=ext(0xfffe) * 2)), 0xffffffff, False, True),
+        ("forbidden-sni-extension", message(entry(extensions=ext(0))), 0xffffffff, False, True),
+        ("unsolicited-status", message(entry(extensions=ext(5))), 0, False, True),
+        ("duplicate-unsolicited-status", message(entry(extensions=ext(5) * 2)), 0, False, True),
+        ("unsolicited-sct", message(entry(extensions=ext(18))), 0, False, True),
+        ("offered-status", message(entry(extensions=ext(5))), 0xffffffff, True, True),
+        ("offered-sct", message(entry(extensions=ext(18))), 0xffffffff, True, True),
+        # Preserve the exact pinned handler's behavior: it checks allowed/sent
+        # masks but does not separately reject duplicates of offered extensions.
+        ("offered-duplicate-status", message(entry(extensions=ext(5) * 2)), 0xffffffff, True, True),
+        ("per-entry-mask-reset", message(entry(extensions=ext(5)) + good), 0xffffffff, True, True),
+    ]
+    for length in range(4):
+        body = bytes(length)
+        cases.append((f"short-body-{length}", b"\x0b" + u24(length) + body, 0, False, True))
+    for length in range(1, 4):
+        cases.append((f"short-extension-header-{length}", message(entry(extensions=bytes(length))), 0xffffffff, False, True))
+    path = directory / "certificate-message.bin"
+    for name, encoded, sent, expected, exact_status in cases:
+        path.write_bytes(encoded)
+        result = subprocess.run([str(binary), "certificate-message", str(path), str(sent)],
+                                capture_output=True, text=True, timeout=10)
+        require(result.returncode == 0, f"{name}: parser fixture failed: {result.stderr}")
+        rows = [[int(value) for value in line.split()] for line in result.stdout.splitlines()]
+        require(len(rows) == 2 and all(len(row) == 4 for row in rows), f"{name}: malformed differential result")
+        old, new = rows
+        require(bool(old[1]) == expected and bool(new[1]) == expected, f"{name}: old/new acceptance differs: {rows}")
+        if exact_status:
+            require(old[0] == new[0], f"{name}: TLS structural error changed: {rows}")
+        if expected:
+            require(old[2] == new[2], f"{name}: extension mask changed: {rows}")
+            require(old[3] == 1 and new[3] == 0, f"{name}: abbreviated TLS path reparsed DER: {rows}")
+    return len(cases)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", type=Path, required=True)
@@ -182,6 +254,7 @@ def main() -> None:
             return
         for rsa in (False, True):
             root_pem, cert_pem, key_pem = identity(rsa_leaf=rsa)
+            checks += certificate_parser_cases(binary, root, cert_pem)
             roots.write_bytes(root_pem)
             cert.write_bytes(cert_pem)
             key.write_bytes(key_pem)
@@ -189,8 +262,8 @@ def main() -> None:
             context.minimum_version = context.maximum_version = ssl.TLSVersion.TLSv1_3
             context.load_cert_chain(cert, key)
             context.num_tickets = 0
-            for mode in ("capture", "complete", "slow-start", "parallel"):
-                count = 8 if mode == "parallel" else 1
+            for mode in ("capture", "complete", "slow-start", "parallel", "repeat", f"capture-mask-{2 if rsa else 1}"):
+                count = 8 if mode == "parallel" else 2 if mode == "repeat" else 1
                 with Fixture(context, mode, count) as fixture:
                     result, elapsed = run(binary, mode, fixture, roots=roots)
                 require(result.returncode == 0, f"{mode} failed: {result.stderr}")
@@ -198,7 +271,8 @@ def main() -> None:
                 require(len(proofs) == count and fixture.accepted == count, "Capture count mismatch")
                 hellos = set()
                 for proof in proofs:
-                    envelope = ConnectionProof("example.com", "11" * 32, 0, "ff" * 32, 1, 7, 1800000000, proof)
+                    mask = int(mode.removeprefix("capture-mask-")) if mode.startswith("capture-mask-") else 7
+                    envelope = ConnectionProof("example.com", "11" * 32, 0, "ff" * 32, 1, mask, 1800000000, proof)
                     parsed = parse_proof(proof, envelope.domain, envelope.challenge)
                     verify_connection_proof(envelope, roots, enforce_root_pin=False)
                     # Challenge is fixed but fresh session/key-share randomness
@@ -222,6 +296,10 @@ def main() -> None:
                 if mode == "slow-start":
                     require(elapsed > 1.5, "Slow start fixture did not delay callback")
                 checks += 1
+            with Fixture(context, "capture") as fixture:
+                result, _ = run(binary, f"capture-mask-{1 if rsa else 2}", fixture, roots=roots)
+            require(result.returncode == 1, "Incompatible signature policy was accepted")
+            checks += 1
 
         for mode in ("cancel", "cancel-start", "reject-start"):
             with Fixture(None, "idle") as fixture:

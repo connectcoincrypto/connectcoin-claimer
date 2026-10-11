@@ -79,6 +79,26 @@ void NonBlocking(Socket s)
 }
 #endif
 
+Socket CreateCaptureSocket(int family, bool portable = false)
+{
+#if defined(__linux__) && defined(SOCK_NONBLOCK) && defined(SOCK_CLOEXEC)
+    if (!portable) {
+        const Socket fd = socket(family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, IPPROTO_TCP);
+        // Only an unsupported flag combination permits retry without flags.
+        // Resource, permission and address-family errors retain their scope.
+        if (fd != INVALID_FD || SocketError() != EINVAL) return fd;
+    }
+#else
+    (void)portable;
+#endif
+    const Socket fd = socket(family, SOCK_STREAM, IPPROTO_TCP);
+    if (fd != INVALID_FD) {
+        try { NonBlocking(fd); }
+        catch (...) { CloseSocket(fd); throw; }
+    }
+    return fd;
+}
+
 bool UnsupportedFamilyError(int error)
 {
 #ifdef _WIN32
@@ -313,14 +333,12 @@ public:
         std::lock_guard lock(control_.mutex_);
         if (control_.Cancelled()) throw CaptureCancelled();
         if (control_.socket_ != -1) throw std::runtime_error("Capture control already owns a socket");
-        fd_ = socket(family, SOCK_STREAM, IPPROTO_TCP);
+        fd_ = CreateCaptureSocket(family);
         if (fd_ == INVALID_FD) {
             const int error = SocketError();
             if (control_.Cancelled()) throw CaptureCancelled();
             ThrowSocketFailure(error, true);
         }
-        try { NonBlocking(fd_); }
-        catch (...) { CloseSocket(fd_); fd_ = INVALID_FD; throw; }
         control_.socket_ = static_cast<std::intptr_t>(fd_);
     }
     ~SocketLease()
@@ -484,11 +502,15 @@ static CapturedProof CaptureImpl(const PreparedContext& prepared, const Endpoint
         Check(control, deadline);
         const int state = connection.ssl.state;
         if (state == MBEDTLS_SSL_CLIENT_HELLO && connection.captured_hello) throw std::runtime_error("TLS HelloRetryRequest is unsupported");
-        // Normal capture stops before CV verification, preserving separate
-        // capture/validation timing and avoiding duplicate signature work.
-        result = state == MBEDTLS_SSL_CERTIFICATE_VERIFY && !complete_handshake
-            ? connectcoin_p2c_fetch_certificate_verify(&connection.ssl)
-            : mbedtls_ssl_handshake_step(&connection.ssl);
+        // Abbreviated capture retains upstream record/reassembly and Certificate
+        // envelope/extension checks, then parses DER only through the owned
+        // exact-message cache below. Complete handshakes keep the original path.
+        // CV authentication still belongs to the full proof verifier afterward.
+        if (!complete_handshake && state == MBEDTLS_SSL_SERVER_CERTIFICATE)
+            result = connectcoin_p2c_fetch_certificate(&connection.ssl);
+        else if (!complete_handshake && state == MBEDTLS_SSL_CERTIFICATE_VERIFY)
+            result = connectcoin_p2c_fetch_certificate_verify(&connection.ssl);
+        else result = mbedtls_ssl_handshake_step(&connection.ssl);
         Check(control, deadline);
         if (!connection.captured_hello && connection.sent_size >= 5) {
             const size_t length = size_t(connection.sent[3]) * 256 + connection.sent[4];
@@ -553,6 +575,23 @@ CapturedProof CapturePrepared(const PreparedContext& context, const Endpoint& en
     return CaptureImpl(context, endpoint, control, on_started, timeout, complete_handshake, false);
 }
 #ifdef CLAIMER_NETWORK_TESTING
+bool SocketFlagsForTesting(bool portable)
+{
+    InitializeSockets();
+    const Socket fd = CreateCaptureSocket(AF_INET, portable);
+    if (fd == INVALID_FD) throw std::runtime_error("Cannot create flag-test socket");
+#ifdef _WIN32
+    // Winsock has no F_GETFL query. The loopback fixtures cover nonblocking I/O.
+    const bool valid = true;
+#else
+    const int status = fcntl(fd, F_GETFL, 0), descriptor = fcntl(fd, F_GETFD, 0);
+    const bool valid = status >= 0 && descriptor >= 0 &&
+        (status & O_NONBLOCK) != 0 && (descriptor & FD_CLOEXEC) != 0;
+#endif
+    CloseSocket(fd);
+    return valid;
+}
+
 [[noreturn]] void ThrowSocketFailureForTesting(int error, bool creating)
 {
     ThrowSocketFailure(error, creating);

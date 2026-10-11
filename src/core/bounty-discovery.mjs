@@ -48,9 +48,9 @@ export async function readBountyBlock({ rpc, network, hash, height, check = () =
 export async function discoverBounties({ rpc, network, lookback = 600, previous = new Map(), cursor = null, check = () => {}, onInvalidate = () => {}, onWindow = () => {}, onReset = async () => {}, readBlock }) {
   if (!Number.isInteger(lookback) || lookback < 1 || lookback > 600) throw new Error('Invalid bounty lookback.');
   let cached = new Map(previous);
+  if (!cursor) { check(); await onReset({ reason: 'initial' }); check(); cached = new Map(); }
   for (let restart = 0; restart < 4; restart++) {
     check();
-    if (!cursor) { await onReset(); check(); cached = new Map(); }
     const staged = new Map(cached), dirty = new Set();
     const budget = { count: 0, limit: MAX_ROWS };
     for (const rows of staged.values()) { budget.count += rows.length; if (budget.count > MAX_ROWS) throw new Error('Recent bounty data exceeds the wallet resource limit.'); }
@@ -140,7 +140,9 @@ export async function discoverBounties({ rpc, network, lookback = 600, previous 
       throw new Error('The bounty window is changing too quickly. Retry discovery shortly.');
     } catch (error) {
       if (!resetError(error)) throw error;
-      check(); await onReset(); check(); cached = new Map(); cursor = null;
+      check(); await onReset({ reason: error.code === -32004 ? 'data-unavailable' : error.code === -32011 ? 'cursor-invalid' : 'journal-reset',
+        ...([-32004, -32011].includes(error.code) ? { code: error.code } : {}) });
+      check(); cached = new Map(); cursor = null;
     }
   }
   throw new Error('The bounty snapshot could not remain coherent; Automatic Claims was stopped.');
