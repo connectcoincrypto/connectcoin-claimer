@@ -59,6 +59,10 @@ Bytes Capture(const Context& context, const Endpoint& endpoint, CaptureControl& 
               const std::function<void()>& on_started = {},
               std::chrono::milliseconds timeout = std::chrono::seconds{10},
               bool complete_handshake = false);
+CapturedProof CapturePrepared(const PreparedContext& context, const Endpoint& endpoint, CaptureControl& control,
+                              const std::function<void()>& on_started = {},
+                              std::chrono::milliseconds timeout = std::chrono::seconds{10},
+                              bool complete_handshake = false);
 #ifdef CLAIMER_NETWORK_TESTING
 // Hermetic OS-error classification seam; never creates a socket or sends bytes.
 // The boolean distinguishes socket creation from connect/SO_ERROR failures.
@@ -69,5 +73,9 @@ Bytes CaptureForTesting(const Context& context, const Endpoint& endpoint, Captur
                         const std::function<void()>& on_started = {},
                         std::chrono::milliseconds timeout = std::chrono::seconds{10},
                         bool complete_handshake = false);
+CapturedProof CapturePreparedForTesting(const PreparedContext& context, const Endpoint& endpoint, CaptureControl& control,
+                                       const std::function<void()>& on_started = {},
+                                       std::chrono::milliseconds timeout = std::chrono::seconds{10},
+                                       bool complete_handshake = false);
 #endif
 } // namespace claimer

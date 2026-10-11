@@ -7,6 +7,14 @@ const HASH_SPACE = 2 ** 256;
 
 export const MAX_P2C_SUCCESSFUL_CONNECTIONS = (1n << 64n) - 1n;
 
+/** First forbidden capture count. Compute once per immutable work target;
+ * equality with 2/p remains eligible, and uint64 saturation always stops. */
+export function claimConnectionStopCount(target) {
+  if (typeof target !== 'string' || !/^[0-9a-f]{64}$/.test(target)) throw new Error('Invalid claim work target');
+  const firstExceeded = (1n << 257n) / (BigInt(`0x${target}`) + 1n) + 1n;
+  return firstExceeded < MAX_P2C_SUCCESSFUL_CONNECTIONS ? firstExceeded : MAX_P2C_SUCCESSFUL_CONNECTIONS;
+}
+
 /** Core's soft per-outpoint budget: only completed CertificateVerify captures
  * count. Equality with 2/p is still eligible; pending/failed TCP never reserves
  * budget. A saturated uint64 counter stops further starts, as in Core.

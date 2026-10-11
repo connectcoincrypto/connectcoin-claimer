@@ -43,6 +43,21 @@ int connectcoin_mbedtls_x509_crt_verify_root_first(
     const mbedtls_x509_crt_profile* profile, const char* cn, uint32_t* flags,
     connectcoin_mbedtls_x509_signature_observer observer, void* observer_context);
 
+/** Optional positive-only signature memoization. A hit must mean a previously
+ * successful signature verification for these EXACT child and parent DER bytes.
+ * This never caches path selection, names, dates, key restrictions or TLS CV.
+ * Callbacks must not throw, mutate inputs, or reenter verification. */
+typedef struct {
+    void* context;
+    int (*lookup)(void*, const mbedtls_x509_crt*, const mbedtls_x509_crt*);
+    void (*remember)(void*, const mbedtls_x509_crt*, const mbedtls_x509_crt*);
+} connectcoin_mbedtls_x509_signature_cache;
+int connectcoin_mbedtls_x509_crt_verify_root_first_cached(
+    mbedtls_x509_crt* crt, mbedtls_x509_crt* trust_ca,
+    const mbedtls_x509_crt_profile* profile, const char* cn, uint32_t* flags,
+    connectcoin_mbedtls_x509_signature_observer observer, void* observer_context,
+    const connectcoin_mbedtls_x509_signature_cache* cache);
+
 #ifdef __cplusplus
 }
 #endif

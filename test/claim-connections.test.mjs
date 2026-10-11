@@ -109,6 +109,28 @@ test('one persistent pool runs multiple bounties concurrently with a single glob
   assert.equal(engine.activeKeys().size, 0); assert.equal(fixtureData.closes, 1);
 });
 
+test('pull-state mode keeps socket counters and stop cancellation immediate without presentation callbacks', async t => {
+  let notifications = 0;
+  const { engine, attempts } = fixture(t, { stateNotifications: false, onState: () => notifications++,
+    transformPool: pool => ({ ...pool, pacesStarts: true }) });
+  const bounty = row(); engine.enqueue([bounty]); engine.start();
+  await until(() => attempts.length === 4);
+  assert.equal(engine.state.attempts, 4);
+  assert.equal(engine.snapshot().active, 4);
+  attempts[0].finish({ captured: true, validationPassed: true });
+  assert.equal(engine.successCounts.get(key(bounty)), 1n, 'capture count changes synchronously, not at presentation time');
+  await until(() => attempts.length === 5);
+  assert.equal(engine.state.attempts, 5);
+  assert.equal(engine.snapshot().active, 4);
+  await engine.stop();
+  assert.ok(attempts.slice(1).every(attempt => attempt.signal.aborted));
+  assert.equal(engine.snapshot().active, 0);
+  assert.equal(engine.snapshot().status, 'off');
+  assert.equal(engine.snapshot().attempts, 5);
+  assert.equal(engine.successCounts.get(key(bounty)), 1n);
+  assert.equal(notifications, 0);
+});
+
 test('connection starts are paced globally across domains instead of granting each domain its own rate', async t => {
   const { engine, attempts } = fixture(t, { options: { connectionsPerSecond: 10, concurrency: 4 } });
   engine.enqueue([row(1, 'alpha.example'), row(2, 'beta.example')]); engine.start();

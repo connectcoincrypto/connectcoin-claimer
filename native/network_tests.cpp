@@ -12,8 +12,12 @@
 #include <iostream>
 #include <string>
 #include <thread>
+#include <type_traits>
 
 namespace {
+static_assert(!std::is_default_constructible_v<claimer::CapturedProof>);
+static_assert(std::is_copy_constructible_v<claimer::CapturedProof>);
+static_assert(std::is_move_constructible_v<claimer::CapturedProof>);
 void Require(bool condition, const char* message)
 {
     if (!condition) throw std::runtime_error(message);
@@ -126,6 +130,36 @@ int main(int argc, char** argv)
             const std::span<const unsigned char> root_bytes{reinterpret_cast<const unsigned char*>(roots.data()), roots.size()};
             const auto good = claimer::VerifyProofForTesting(proof, context, root_bytes);
             Require(good.meets_target, "Fixture work target mismatch");
+            // Own bytes/context, then destroy/mutate all caller inputs. Copies
+            // and moves must keep every parsed span bound to the owned bytes.
+            auto owned = [&] {
+                auto caller_bytes = proof;
+                auto caller_context = context;
+                const claimer::PreparedContext prepared(caller_context);
+                const claimer::CapturedProof original(caller_bytes, prepared);
+                auto copy = original;
+                caller_bytes.assign(1, 0);
+                caller_context.domain = "invalid";
+                caller_context.validation_time = 1;
+                auto moved = std::move(copy);
+                bool moved_from_rejected{};
+                try { (void)copy.Encoded(); } catch (const std::exception&) { moved_from_rejected = true; }
+                Require(moved_from_rejected, "Moved-from captured proof remained usable");
+                return moved;
+            }();
+            const auto owned_result = claimer::VerifyCapturedForTesting(owned, root_bytes);
+            Require(owned.Encoded() == proof && owned_result.work_hash == good.work_hash &&
+                    owned_result.signature_scheme == good.signature_scheme, "Owned proof changed after caller destruction");
+            auto cross_thread = std::async(std::launch::async, [owned, roots] {
+                const std::span<const unsigned char> bytes{reinterpret_cast<const unsigned char*>(roots.data()), roots.size()};
+                return claimer::VerifyCapturedForTesting(owned, bytes);
+            });
+            Require(cross_thread.get().work_hash == good.work_hash, "Owned proof failed cross-thread verification");
+            auto invalid_owned = proof; invalid_owned.back() ^= 1;
+            const claimer::CapturedProof altered(invalid_owned, claimer::PreparedContext(context));
+            bool invalid_owned_rejected{};
+            try { claimer::VerifyCapturedForTesting(altered, root_bytes); } catch (const std::exception&) { invalid_owned_rejected = true; }
+            Require(invalid_owned_rejected, "Owned proof skipped dynamic CV verification");
             auto reject_context = [&](const claimer::Context& changed) {
                 bool failed{};
                 try { claimer::VerifyProofForTesting(proof, changed, root_bytes); }
@@ -161,8 +195,9 @@ int main(int argc, char** argv)
             std::vector<std::future<claimer::Bytes>> jobs;
             for (int index = 0; index < 8; ++index) jobs.push_back(std::async(std::launch::async, [&] {
                 claimer::CaptureControl own_control;
-                const auto proof = claimer::CaptureForTesting(context, {"127.0.0.1", AF_INET, static_cast<uint16_t>(port)},
+                const auto captured = claimer::CapturePreparedForTesting(claimer::PreparedContext(context), {"127.0.0.1", AF_INET, static_cast<uint16_t>(port)},
                     own_control, {}, std::chrono::milliseconds{timeout_ms});
+                const auto& proof = captured.Encoded();
                 authenticate(proof);
                 return proof;
             }));
@@ -191,8 +226,9 @@ int main(int argc, char** argv)
             if (mode == "reject-start") throw std::runtime_error("fixture start rejected");
         };
         try {
-            const auto proof = claimer::CaptureForTesting(context, {"127.0.0.1", AF_INET, static_cast<uint16_t>(port)},
+            const auto captured = claimer::CapturePreparedForTesting(claimer::PreparedContext(context), {"127.0.0.1", AF_INET, static_cast<uint16_t>(port)},
                 control, on_started, std::chrono::milliseconds{timeout_ms}, mode == "complete");
+            const auto& proof = captured.Encoded();
             const auto parsed = claimer::ParseProof(proof, context);
             Require(parsed.certificate_verify.size() >= 8, "Captured CV missing");
             Require(starts == 1, "Capture start count mismatch");

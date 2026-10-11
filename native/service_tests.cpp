@@ -1,10 +1,13 @@
 // Offline protocol/lifecycle regression tests. No DNS or sockets are used.
 #include <claimer/service.hpp>
+#include <mbedtls/bignum.h>
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <deque>
 #include <iostream>
 #include <mutex>
 #include <sstream>
@@ -50,15 +53,187 @@ struct Fixture {
     }
     void Ready() { service->Command(Resolve(1)); Check(Wait("resolved", 1)["ok"].isTrue(), "Fake resolution failed"); }
 };
+// A pipe-like stream whose producer deliberately stays open between frames.
+// A reader that tries to fill a block instead of stopping at newline deadlocks
+// the wait-for-response checks below (and the fixture times out).
+class InteractiveInput : public std::streambuf {
+    std::mutex mutex_;
+    std::condition_variable condition_;
+    std::deque<std::string> pending_;
+    std::string current_;
+    bool closed_{};
+protected:
+    int_type underflow() override {
+        if (gptr() < egptr()) return traits_type::to_int_type(*gptr());
+        std::unique_lock lock(mutex_);
+        condition_.wait(lock, [&] { return closed_ || !pending_.empty(); });
+        if (pending_.empty()) return traits_type::eof();
+        current_ = std::move(pending_.front()); pending_.pop_front();
+        setg(current_.data(), current_.data(), current_.data() + current_.size());
+        return traits_type::to_int_type(*gptr());
+    }
+public:
+    void Push(std::string value) {
+        Check(!value.empty(), "Interactive test writes nonempty chunks");
+        { std::lock_guard lock(mutex_); Check(!closed_, "Interactive test input already closed"); pending_.push_back(std::move(value)); }
+        condition_.notify_one();
+    }
+    void Close() { { std::lock_guard lock(mutex_); closed_ = true; } condition_.notify_all(); }
+};
+struct CloseInput {
+    InteractiveInput& input;
+    ~CloseInput() { input.Close(); }
+};
 void Parsing() {
     for (const auto& value : {"{\"a\":1,\"a\":2}\n", "{\"x\":{\"a\":1,\"a\":2}}\n", "{\"x\":NaN}\n", "{}", "[1,]\n"}) {
         Rejects([&] { std::istringstream input(value); ReadFrame(input); });
     }
     Rejects([] { std::istringstream input(std::string(16384, ' ') + "\n"); ReadFrame(input); });
     std::istringstream empty; Check(!ReadFrame(empty), "Clean EOF");
+    std::istringstream exact("{}\n{}\n");
+    Check(ReadFrame(exact, 3)->isObject() && ReadFrame(exact, 3)->isObject() && !ReadFrame(exact, 3), "Exact frame limit and adjacent frames");
+    Rejects([] { std::istringstream input("{}\n"); ReadFrame(input, 2); });
+    Rejects([] { std::istringstream input("\n"); ReadFrame(input, 0); });
+    Rejects([] { std::istringstream input; input.setstate(std::ios::badbit); ReadFrame(input); });
+    Rejects([] { std::istringstream input(std::string("{\"x\":\"a\0b\"}\n", 12)); ReadFrame(input); });
+    Rejects([] { std::istringstream input(std::string(65, '[') + "0" + std::string(65, ']') + "\n"); ReadFrame(input); });
     auto context = PublicContext(ContextFor()); Check(ParseContext(context).domain == "example.com", "Public context roundtrip");
     for (const auto& value : {"true", "1.0", "1e0", "-1", "9007199254740992"}) Rejects([&] { ProtocolInteger(Json(value), 1, (uint64_t{1} << 53) - 1); });
     for (const auto& value : {"LOCALHOST", "x.local", "x.internal", "x.localhost", "example.com.", "a..com"}) Rejects([&] { PublicDomain(UniValue(value)); });
+}
+void BufferedFrameBoundaries() {
+    // Size includes the delimiter, for both the regular and one-shot limits.
+    for (const size_t maximum : {size_t{3}, size_t{16}, size_t{16384}, size_t{160 * 1024}}) {
+        const std::string exact = "{}" + std::string(maximum - 3, ' ') + "\n";
+        std::istringstream stream(exact + "{}\n"); ProtocolFrameReader reader(stream);
+        Check(reader.Next(maximum)->isObject(), "Exact buffered frame limit accepted");
+        Check(reader.Next(3)->isObject() && !reader.Next(3), "No consumed successor bytes when changing frame limits");
+        Rejects([&] { std::istringstream input(" " + exact); ProtocolFrameReader(input).Next(maximum); });
+        Rejects([&] { std::istringstream input(exact.substr(0, exact.size() - 1)); ProtocolFrameReader(input).Next(maximum); });
+    }
+    Rejects([] { std::istringstream input("{}\n"); ProtocolFrameReader(input).Next(160 * 1024 + 1); });
+    std::istringstream crlf("{}\r\n{}\n"); ProtocolFrameReader reader(crlf);
+    Check(reader.Next(4)->isObject() && reader.Next(3)->isObject(), "CRLF and LF are both bounded delimiters");
+    std::string large = "{";
+    for (unsigned i = 0; i < 100; ++i) large += (i ? "," : "") + std::string("\"key") + std::to_string(i) + "\":0";
+    Check(Json(large + "}").size() == 100, "Large object unique keys accepted");
+    Rejects([&] { Json(large + ",\"key0\":1}"); });
+    Rejects([] { Json("{\"a\":1,\"\\u0061\":2}"); });
+    Rejects([] { Json("{\"items\":[{\"x\":1,\"x\":2}]}"); });
+    std::istringstream errors("{}\n"); ProtocolFrameReader error_reader(errors);
+    errors.setstate(std::ios::failbit); Rejects([&] { error_reader.Next(); });
+    errors.clear(); errors.setstate(std::ios::badbit | std::ios::eofbit); Rejects([&] { error_reader.Next(); });
+}
+void InteractiveFrameCancellation() {
+    ServiceDependencies deps;
+    deps.capture = [](const Context&, const Endpoint&, CaptureControl& control, const std::function<void()>& started) -> Bytes {
+        started(); while (!control.Cancelled()) std::this_thread::sleep_for(1ms); throw CaptureCancelled();
+    };
+    Fixture fixture(1, deps); fixture.Ready();
+    InteractiveInput buffer; std::istream stream(&buffer); std::exception_ptr failure;
+    std::jthread consumer([&] {
+        try { ProtocolFrameReader reader(stream); while (auto command = reader.Next()) fixture.service->Command(*command); }
+        catch (...) { failure = std::current_exception(); }
+    });
+    CloseInput close{buffer};
+    const auto attempt = Attempt(2).write();
+    buffer.Push(attempt.substr(0, attempt.size() / 2));
+    buffer.Push(attempt.substr(attempt.size() / 2) + "\n");
+    fixture.Wait("started", 2); // The pipe is still open, not a full 16 KiB.
+    buffer.Push(Cancel(2).write() + "\n");
+    const auto cancelled = fixture.Wait("attempt", 2);
+    Check(cancelled["cancelled"].isTrue() && cancelled["started"].isTrue() && cancelled["validationPassed"].isNull(),
+          "Interactive cancellation is processed without filling a block or waiting for EOF");
+    Check(cancelled["successfulConnections"].get_str() == "0", "Interactive cancellation cannot invent a capture");
+    buffer.Close(); consumer.join(); if (failure) std::rethrow_exception(failure);
+}
+void NativePreparedContextReuse() {
+    std::mutex mutex; std::condition_variable condition; std::vector<UniValue> frames;
+    UniValue options(UniValue::VOBJ); options.pushKV("connectionsPerSecond", 1000); options.pushKV("concurrency", 1);
+    // The real native admission path, but no resolve commands: every attempt
+    // ends at the missing-DNS guard, without making any network connection.
+    ClaimsService service(options, [&](const std::string& text) {
+        UniValue value; Check(value.read(text), "Native cache response JSON");
+        { std::lock_guard lock(mutex); frames.push_back(std::move(value)); } condition.notify_one();
+    });
+    uint64_t id = 0;
+    auto admit = [&](const Context& context) {
+        const auto request_id = ++id; service.Command(Attempt(request_id, context));
+        std::unique_lock lock(mutex);
+        const auto matches = [&](const UniValue& value) { return value["id"].getInt<uint64_t>() == request_id; };
+        Check(condition.wait_for(lock, 3s, [&] { return std::any_of(frames.begin(), frames.end(), matches); }), "Cached-context response timeout");
+        const auto& frame = *std::find_if(frames.begin(), frames.end(), matches);
+        Check(frame["context"].write() == PublicContext(context).write(), "Response retains each job's complete current context");
+        Check(frame["started"].isFalse() && frame["captured"].isFalse() && frame["validationPassed"].isNull(), "Cache test cannot open a socket or invent validation");
+    };
+    auto context = ContextFor(); admit(context); admit(context);
+    context.validation_time = 1; admit(context);
+    context.validation_time = 253402300799; admit(context);
+    context.domain = "other.example"; admit(context);
+    context.txid = std::string(64, 'b'); admit(context);
+    context.input_index = 0xffffffff; admit(context);
+    context.signature_algorithms_mask = 2; admit(context);
+    auto rejects_context = [&](Context changed) { Rejects([&] { service.Command(Attempt(id + 1, changed)); }); admit(context); };
+    auto changed = context; changed.domain = "not a domain"; rejects_context(changed);
+    changed = context; changed.txid = std::string(64, 'A'); rejects_context(changed);
+    changed = context; changed.txid.resize(63); rejects_context(changed);
+    changed = context; changed.connection_work_target = std::string(64, 'g'); rejects_context(changed);
+    changed = context; changed.connection_work_target = std::string(64, 'f'); rejects_context(changed); // Existing budget rule.
+    changed = context; changed.root_certificates_version = 2; rejects_context(changed);
+    changed = context; changed.signature_algorithms_mask = 0; rejects_context(changed);
+    changed = context; changed.validation_time = 0; rejects_context(changed);
+    changed = context; changed.validation_time = 253402300800; rejects_context(changed);
+    service.Close(); Check(!service.Failed(), "Malformed cache replacements never corrupt live service state");
+}
+struct Mpi {
+    mbedtls_mpi value;
+    Mpi() { mbedtls_mpi_init(&value); }
+    ~Mpi() { mbedtls_mpi_free(&value); }
+    Mpi(const Mpi&) = delete;
+    Mpi& operator=(const Mpi&) = delete;
+};
+bool OracleBudgetExhausted(const std::string& target, uint64_t successes) {
+    if (successes == UINT64_MAX) return true;
+    Mpi factor, count, product, limit;
+    std::array<unsigned char, 8> bytes{};
+    for (size_t i = 0; i < bytes.size(); ++i) bytes[7 - i] = static_cast<unsigned char>(successes >> (8 * i));
+    Check(mbedtls_mpi_read_string(&factor.value, 16, target.c_str()) == 0 &&
+          mbedtls_mpi_add_int(&factor.value, &factor.value, 1) == 0 &&
+          mbedtls_mpi_read_binary(&count.value, bytes.data(), bytes.size()) == 0 &&
+          mbedtls_mpi_mul_mpi(&product.value, &factor.value, &count.value) == 0 &&
+          mbedtls_mpi_lset(&limit.value, 1) == 0 &&
+          mbedtls_mpi_shift_l(&limit.value, 257) == 0, "Independent budget oracle setup");
+    return mbedtls_mpi_cmp_mpi(&product.value, &limit.value) > 0;
+}
+void PrecomputedBudgetBoundaries() {
+    // All powers of two exercise exact equality on every limb, including the
+    // 257-bit factor and budgets larger than the entire uint64 counter range.
+    for (size_t bit = 0; bit <= 256; ++bit) {
+        std::array<unsigned char, 32> bytes{};
+        for (size_t low = 0; low < bit; ++low) bytes[31 - low / 8] |= static_cast<unsigned char>(1u << (low % 8));
+        const auto target = Hex(bytes);
+        const auto stop = ConnectionBudgetStopCount(target);
+        const size_t quotient_bit = 257 - bit;
+        const auto expected = quotient_bit >= 64 ? UINT64_MAX : (uint64_t{1} << quotient_bit) + 1;
+        Check(stop == expected, "Precomputed power-of-two budget boundary");
+        Check(!OracleBudgetExhausted(target, stop - 1) && OracleBudgetExhausted(target, stop), "Exact boundary matches independent oracle");
+    }
+    uint64_t random = 0x912ab735c6418defULL;
+    auto next = [&] { random ^= random << 13; random ^= random >> 7; random ^= random << 17; return random; };
+    for (size_t example = 0; example < 512; ++example) {
+        std::array<unsigned char, 32> bytes{};
+        for (size_t i = example % 33; i < bytes.size(); ++i) bytes[i] = static_cast<unsigned char>(next());
+        const auto target = Hex(bytes);
+        const auto stop = ConnectionBudgetStopCount(target);
+        const std::array<uint64_t, 8> counts{0, 1, stop - 1, stop, stop == UINT64_MAX ? stop : stop + 1, UINT64_MAX - 1, UINT64_MAX, next()};
+        for (const auto count : counts) {
+            const bool oracle = OracleBudgetExhausted(target, count);
+            Check((count >= stop) == oracle, "Cached budget matches independent arbitrary-precision oracle");
+            Check(ConnectionBudgetExhausted(target, count) == oracle, "Original product comparator matches independent oracle");
+        }
+    }
+    for (const auto& target : {std::string(), std::string(63, '0'), std::string(66, '0'), std::string(64, 'A'), std::string(64, 'z')})
+        Rejects([&] { ConnectionBudgetStopCount(target); });
 }
 void BudgetAndPacing() {
     const std::string maximum(64, 'f'), zero(64, '0');
@@ -86,6 +261,29 @@ void SuccessfulAndMissedProof() {
     ServiceDependencies deps; deps.verify = [](const Bytes&, const Context&) { return Verification{std::string(64, 'f'), false, 0x0403}; };
     Fixture miss(1, deps); miss.Ready(); miss.service->Command(Attempt(2)); const auto value = miss.Wait("attempt", 2);
     Check(value["validationPassed"].isTrue() && value["proof"].isNull() && value["verified"].isFalse(), "Hash miss still fully validated");
+}
+void ConcurrentCaptureSnapshotsRemainImmutable() {
+    std::mutex gate;
+    std::condition_variable condition;
+    unsigned verifying = 0;
+    ServiceDependencies deps;
+    deps.verify = [&](const Bytes&, const Context&) {
+        std::unique_lock lock(gate);
+        ++verifying; condition.notify_all();
+        Check(condition.wait_for(lock, 3s, [&] { return verifying == 8; }), "All concurrent captures reach verification");
+        return Verification{std::string(64, 'f'), false, 0x0403};
+    };
+    Fixture fixture(8, deps); fixture.Ready();
+    for (uint64_t id = 2; id < 10; ++id) fixture.service->Command(Attempt(id));
+    std::vector<uint64_t> counts;
+    for (uint64_t id = 2; id < 10; ++id) {
+        const auto capture = fixture.Wait("capture", id), final = fixture.Wait("attempt", id);
+        Check(capture["successfulConnections"].get_str() == final["successfulConnections"].get_str(), "Concurrent terminal uses its own capture snapshot");
+        Check(final["validationPassed"].isTrue(), "All concurrent proofs verified");
+        counts.push_back(std::stoull(final["successfulConnections"].get_str()));
+    }
+    std::sort(counts.begin(), counts.end());
+    Check(counts == std::vector<uint64_t>{1, 2, 3, 4, 5, 6, 7, 8}, "Concurrent captures increment budget exactly once");
 }
 void FailuresAndDnsCache() {
     Fixture missing; missing.service->Command(Attempt(1)); const auto frame = missing.Wait("attempt", 1);
@@ -128,6 +326,52 @@ void BudgetAcrossRequestsAndIds() {
     Fixture saturated(1); saturated.Ready(); saturated.service->Command(Attempt(2, ContextFor(), "18446744073709551614"));
     Check(saturated.Wait("attempt", 2)["successfulConnections"].get_str() == "18446744073709551615", "Counter saturates exactly");
     saturated.service->Command(Attempt(3)); Check(saturated.Wait("attempt", 3)["blocked"].get_str() == "budget", "Saturation blocks next start");
+}
+void BudgetCountsInvalidCapturesAndMonotonicReports() {
+    ServiceDependencies deps;
+    deps.verify = [](const Bytes&, const Context&) -> Verification { throw std::runtime_error("Invalid proof"); };
+    Fixture fixture(1, deps); fixture.Ready();
+    auto context = ContextFor(); context.connection_work_target = std::string(64, 'f');
+    // Equality (2 captures) still permits one more TCP; a captured invalid proof
+    // also spends that slot. A stale controller report must not reopen it.
+    fixture.service->Command(Attempt(2, context, "2"));
+    const auto invalid = fixture.Wait("attempt", 2);
+    Check(invalid["started"].isTrue() && invalid["captured"].isTrue() && invalid["validationPassed"].isFalse(), "Invalid proof remains a conclusive captured attempt");
+    Check(invalid["successfulConnections"].get_str() == "3", "Invalid raw capture still spends exact budget");
+    fixture.service->Command(Attempt(3, context, "0"));
+    const auto stale = fixture.Wait("attempt", 3);
+    Check(stale["blocked"].get_str() == "budget" && stale["successfulConnections"].get_str() == "3" && stale["started"].isFalse(), "Stale count cannot undo cached budget exhaustion");
+    Check(fixture.captures == 1, "No socket after the cached budget is spent");
+
+    Fixture reported(1); reported.Ready();
+    reported.service->Command(Attempt(2, context, "3"));
+    const auto blocked = reported.Wait("attempt", 2);
+    Check(blocked["blocked"].get_str() == "budget" && !reported.captures, "Already exhausted imported budget does not start TCP");
+}
+void EndpointSelectionBoundAndRoundRobin() {
+    std::mutex mutex;
+    std::vector<std::string> seen;
+    ServiceDependencies deps;
+    deps.resolve = [](const std::string&) {
+        std::vector<Endpoint> endpoints;
+        for (size_t i = 1; i <= 40; ++i) endpoints.push_back({"8.8.8." + std::to_string(i), 2, 443});
+        return endpoints;
+    };
+    // An inconclusive cancellation does not change the EMA, leaving equal
+    // credits so the fixed-size selection storage can be checked exactly.
+    deps.capture = [&](const Context&, const Endpoint& endpoint, CaptureControl&, const std::function<void()>&) -> Bytes {
+        { std::lock_guard lock(mutex); seen.push_back(endpoint.ip); }
+        throw CaptureCancelled();
+    };
+    Fixture fixture(1, deps); fixture.Ready();
+    for (uint64_t id = 2; id < 66; ++id) {
+        fixture.service->Command(Attempt(id));
+        const auto value = fixture.Wait("attempt", id);
+        Check(value["started"].isFalse() && value["validationPassed"].isNull(), "Selection-only fixture spends no counter");
+    }
+    std::lock_guard lock(mutex);
+    Check(seen.size() == 64, "All bounded selections completed");
+    for (size_t i = 0; i < seen.size(); ++i) Check(seen[i] == "8.8.8." + std::to_string(i % 32 + 1), "First 32 endpoints retain exact equal-weight round robin");
 }
 void OutputFailureStopsBeforeTcp() {
     std::atomic<int> tcp{};
@@ -245,6 +489,6 @@ void QueuedEndpointRecheckedAndCancellationDoesNotExclude() {
 }
 } // namespace
 int main() {
-    try { Parsing(); BudgetAndPacing(); SuccessfulAndMissedProof(); FailuresAndDnsCache(); CancelQueuedAndActive(); CancelWhileVerifying(); BudgetAcrossRequestsAndIds(); OutputFailureStopsBeforeTcp(); UnreachableEndpointIsExcludedAcrossMasksAndDomains(); UnsupportedFamilyAndTimedRecovery(); RouteRecoveryAndOrdinaryFailures(); QueuedEndpointRecheckedAndCancellationDoesNotExclude(); std::cout << "12 offline service test groups passed\n"; return 0; }
+    try { Parsing(); BufferedFrameBoundaries(); InteractiveFrameCancellation(); NativePreparedContextReuse(); BudgetAndPacing(); PrecomputedBudgetBoundaries(); SuccessfulAndMissedProof(); ConcurrentCaptureSnapshotsRemainImmutable(); FailuresAndDnsCache(); CancelQueuedAndActive(); CancelWhileVerifying(); BudgetAcrossRequestsAndIds(); BudgetCountsInvalidCapturesAndMonotonicReports(); EndpointSelectionBoundAndRoundRobin(); OutputFailureStopsBeforeTcp(); UnreachableEndpointIsExcludedAcrossMasksAndDomains(); UnsupportedFamilyAndTimedRecovery(); RouteRecoveryAndOrdinaryFailures(); QueuedEndpointRecheckedAndCancellationDoesNotExclude(); std::cout << "19 offline service test groups passed\n"; return 0; }
     catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }

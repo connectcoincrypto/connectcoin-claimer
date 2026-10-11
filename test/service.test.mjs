@@ -59,6 +59,34 @@ async function fixture(t, overrides = {}) {
   return { service, rpc, engine, events, timers, statePath, directory };
 }
 
+test('headless service pulls real engine snapshots only on demand and keeps fatal state immediately visible', async t => {
+  const { service } = await fixture(t, { engineFactory: options => new ClaimsEngine(options) });
+  const engine = service.engine;
+  assert.equal(engine.stateNotifications, false);
+  let snapshots = 0, notifications = 0;
+  const snapshot = engine.snapshot.bind(engine);
+  engine.snapshot = () => { snapshots++; return snapshot(); };
+  engine.onState = () => notifications++;
+  for (let attempts = 1; attempts <= 1000; attempts++) engine.notify({ attempts });
+  assert.equal(snapshots, 0); assert.equal(notifications, 0);
+  assert.equal(service.snapshot().claims.attempts, 1000);
+  assert.equal(snapshots, 1);
+  engine.beginDiagnosticRun();
+  engine.fatal(new Error('test failure'));
+  assert.equal(service.snapshot().status, 'failed');
+  assert.equal(service.snapshot().claims.status, 'off');
+  assert.equal(service.snapshot().claims.lastError, 'test failure');
+  assert.equal(service.running, false);
+});
+
+test('custom engines keep their push-state contract even if they have an unrelated snapshot method', async t => {
+  const { service, engine } = await fixture(t);
+  assert.equal(engine.options.stateNotifications, false);
+  engine.snapshot = () => { assert.fail('An engine that did not opt into pull mode must not be queried'); };
+  engine.options.onState({ completed: 7, attempts: 12 });
+  assert.deepEqual(service.snapshot().claims, { completed: 7, attempts: 12 });
+});
+
 test('reuses the processed discovery cursor and validates parent transaction before preparing a public-address claim', async t => {
   const calls = [];
   const { service, rpc, engine } = await fixture(t, { discover: async options => {

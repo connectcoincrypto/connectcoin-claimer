@@ -149,6 +149,9 @@ int Generate() {
 }
 } // namespace
 int main(int argc, char** argv) {
+    // Every protocol frame is explicitly flushed by EmitFrame. Input does not
+    // need to synchronize stdout again for every byte of a bounded JSON line.
+    std::cin.tie(nullptr);
 #ifdef _WIN32
     _setmode(_fileno(stdin), _O_BINARY); _setmode(_fileno(stdout), _O_BINARY);
 #else

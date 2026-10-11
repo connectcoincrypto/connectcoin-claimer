@@ -2,6 +2,7 @@
 // TLS transcript capture adapted from ConnectCoin Core wallet/p2c_tls.cpp.
 #define MBEDTLS_ALLOW_PRIVATE_ACCESS
 #include <claimer/network.hpp>
+#include <optional>
 #include "p2c_tls_private.h"
 #include <mbedtls/error.h>
 #include <mbedtls/ssl.h>
@@ -437,18 +438,18 @@ std::vector<Endpoint> ResolveEndpoints(const std::string& domain, uint16_t port)
     return result;
 }
 
-static Bytes CaptureImpl(const Context& context, const Endpoint& endpoint, CaptureControl& control,
+static CapturedProof CaptureImpl(const PreparedContext& prepared, const Endpoint& endpoint, CaptureControl& control,
                          const std::function<void()>& on_started, std::chrono::milliseconds timeout,
                          bool complete_handshake, bool loopback_fixture)
 {
-    ValidateContext(context);
+    const auto& context = prepared.Get();
     if (timeout <= std::chrono::milliseconds::zero()) throw std::runtime_error("Invalid TLS timeout");
     timeout = std::min(timeout, std::chrono::milliseconds{10000});
     if (control.Cancelled()) throw CaptureCancelled();
     InitializeSockets();
     const Address address = SocketAddress(endpoint, loopback_fixture);
     InitializeCrypto();
-    const Hash challenge = ClaimChallenge(context);
+    const Hash& challenge = prepared.Challenge();
     SocketLease socket(control, endpoint.family);
     const auto deadline = socket.Connect(address, on_started, timeout);
     Connection connection(challenge, socket.Get(), control, deadline);
@@ -476,6 +477,7 @@ static Bytes CaptureImpl(const Context& context, const Endpoint& endpoint, Captu
     if (result != 0) throw std::runtime_error(TlsError(result));
     mbedtls_ssl_set_bio(&connection.ssl, &connection, Connection::Send, Connection::Receive, nullptr);
     Bytes proof{2};
+    std::optional<CapturedProof> captured_proof;
     unsigned captured{};
     bool captured_verify{false};
     for (;;) {
@@ -517,9 +519,9 @@ static Bytes CaptureImpl(const Context& context, const Endpoint& endpoint, Captu
             if (expected == 15) {
                 // Structural checks and signature-mask enforcement only. Full
                 // certificate/CV authentication is the caller's responsibility.
-                ParseProof(proof, context);
+                captured_proof.emplace(std::move(proof), prepared);
                 captured_verify = true;
-                if (!complete_handshake) return proof;
+                if (!complete_handshake) return std::move(*captured_proof);
             }
         }
         if (connection.ssl.state == MBEDTLS_SSL_HANDSHAKE_OVER) {
@@ -535,13 +537,18 @@ static Bytes CaptureImpl(const Context& context, const Endpoint& endpoint, Captu
                 try { Wait(socket.Get(), false, control, close_deadline); }
                 catch (const CaptureTimeout&) { break; }
             } while (Clock::now() < close_deadline);
-            return proof;
+            return std::move(*captured_proof);
         }
     }
 }
 
 Bytes Capture(const Context& context, const Endpoint& endpoint, CaptureControl& control,
               const std::function<void()>& on_started, std::chrono::milliseconds timeout, bool complete_handshake)
+{
+    return CapturePrepared(PreparedContext(context), endpoint, control, on_started, timeout, complete_handshake).Encoded();
+}
+CapturedProof CapturePrepared(const PreparedContext& context, const Endpoint& endpoint, CaptureControl& control,
+                              const std::function<void()>& on_started, std::chrono::milliseconds timeout, bool complete_handshake)
 {
     return CaptureImpl(context, endpoint, control, on_started, timeout, complete_handshake, false);
 }
@@ -553,6 +560,11 @@ Bytes Capture(const Context& context, const Endpoint& endpoint, CaptureControl& 
 
 Bytes CaptureForTesting(const Context& context, const Endpoint& endpoint, CaptureControl& control,
                         const std::function<void()>& on_started, std::chrono::milliseconds timeout, bool complete_handshake)
+{
+    return CapturePreparedForTesting(PreparedContext(context), endpoint, control, on_started, timeout, complete_handshake).Encoded();
+}
+CapturedProof CapturePreparedForTesting(const PreparedContext& context, const Endpoint& endpoint, CaptureControl& control,
+                                       const std::function<void()>& on_started, std::chrono::milliseconds timeout, bool complete_handshake)
 {
     return CaptureImpl(context, endpoint, control, on_started, timeout, complete_handshake, true);
 }

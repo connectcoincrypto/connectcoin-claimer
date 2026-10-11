@@ -35,16 +35,24 @@ static int connectcoin_x509_parent_matches(const mbedtls_x509_crt* child,
 
 static int connectcoin_x509_check_signature(
     mbedtls_x509_crt* child, mbedtls_x509_crt* parent,
-    connectcoin_mbedtls_x509_signature_observer observer, void* observer_context)
+    connectcoin_mbedtls_x509_signature_observer observer, void* observer_context,
+    const connectcoin_mbedtls_x509_signature_cache* cache)
 {
+    int result;
     if (observer != NULL) observer(observer_context, child, parent);
-    return x509_crt_check_signature(child, parent, NULL);
+    if (cache != NULL && cache->lookup != NULL && cache->remember != NULL &&
+        cache->lookup(cache->context, child, parent) == 1) return 0;
+    result = x509_crt_check_signature(child, parent, NULL);
+    if (result == 0 && cache != NULL && cache->lookup != NULL && cache->remember != NULL)
+        cache->remember(cache->context, child, parent);
+    return result;
 }
 
-int connectcoin_mbedtls_x509_crt_verify_root_first(
+int connectcoin_mbedtls_x509_crt_verify_root_first_cached(
     mbedtls_x509_crt* crt, mbedtls_x509_crt* trust_ca,
     const mbedtls_x509_crt_profile* profile, const char* cn, uint32_t* flags,
-    connectcoin_mbedtls_x509_signature_observer observer, void* observer_context)
+    connectcoin_mbedtls_x509_signature_observer observer, void* observer_context,
+    const connectcoin_mbedtls_x509_signature_cache* cache)
 {
     mbedtls_x509_crt* chain[MBEDTLS_X509_MAX_VERIFY_CHAIN_SIZE];
     mbedtls_x509_crt* child;
@@ -107,7 +115,7 @@ int connectcoin_mbedtls_x509_crt_verify_root_first(
         for (parent = trust_ca; parent != NULL; parent = parent->next) {
             if (!connectcoin_x509_parent_matches(child, parent, 1, length - 1, self_count))
                 continue;
-            if (connectcoin_x509_check_signature(child, parent, observer, observer_context) != 0)
+            if (connectcoin_x509_check_signature(child, parent, observer, observer_context, cache) != 0)
                 continue;
             parent_is_trusted = 1;
             break;
@@ -146,10 +154,19 @@ int connectcoin_mbedtls_x509_crt_verify_root_first(
      * length >= 2 here; trusted end entities already returned above.
      */
     for (i = length - 2; i > 0; --i) {
-        if (connectcoin_x509_check_signature(chain[i - 1], chain[i], observer, observer_context) != 0) {
+        if (connectcoin_x509_check_signature(chain[i - 1], chain[i], observer, observer_context, cache) != 0) {
             *flags |= MBEDTLS_X509_BADCERT_NOT_TRUSTED;
             return MBEDTLS_ERR_X509_CERT_VERIFY_FAILED;
         }
     }
     return 0;
+}
+
+int connectcoin_mbedtls_x509_crt_verify_root_first(
+    mbedtls_x509_crt* crt, mbedtls_x509_crt* trust_ca,
+    const mbedtls_x509_crt_profile* profile, const char* cn, uint32_t* flags,
+    connectcoin_mbedtls_x509_signature_observer observer, void* observer_context)
+{
+    return connectcoin_mbedtls_x509_crt_verify_root_first_cached(
+        crt, trust_ca, profile, cn, flags, observer, observer_context, NULL);
 }

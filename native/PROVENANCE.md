@@ -15,9 +15,30 @@ adapted from MIT-licensed ConnectCoin Core at commit
   notices retained in every imported file).
 
 The transport and service adapters replace Core's node-specific dependencies.
-Worker-local certificate/root parsing state avoids a shared verification lock;
-it is not a cache of successful authentication. Every proof still undergoes
-context, certificate path, domain, validity, key-policy and signature checks.
+Worker-local certificate/root parsing state avoids a shared verification lock.
+The single-message certificate parsing cache also owns immutable metadata tied
+to its exact DER: all supplied RSA exponents are checked before publication,
+leaf KU/EKU is decoded once, and all supplied validity dates are converted to
+Unix bounds once. Each proof still checks its new block-median validation time
+against every supplied certificate's bounds and enforces the leaf usage result.
+Invalid date encodings and denied usage remain failures; this is not a cache of
+whether a certificate is valid at a previous time, domain or trust anchor.
+A separate positive-only signature cache owns exact child and parent DER bytes,
+with at most eight entries and 65,536 DER bytes per worker (FIFO eviction).
+Only successful static certificate-signature mathematics is memoized, never a
+path, hostname, trust decision, validity interval, key policy or TLS
+CertificateVerify. Parent selection and its diagnostic observer run on every
+attempt, and failed signatures are never stored. Every proof still undergoes
+context, certificate path, domain, validity, key-policy and dynamic CV checks.
+Prepared contexts own validated inputs and precompute only public challenge and
+target bytes. Reuse requires exact equality of domain, claim transaction ID,
+input index, target, root version and signature mask, never bounty ID alone.
+A new validation time is independently range-checked and retained for every
+attempt; no cached context supplies a stale certificate-validation time.
+Moved-from contexts cannot be reused. Captured proofs own immutable
+bytes/context/parsed spans so the ordinary service can reuse one parse and its
+hashes through authentication.
+No ephemeral key, TLS nonce, shared secret or CV result is reused.
 The existing Python helper remains in `helpers/` as a differential reference,
 not a runtime dependency or automatic fallback.
 

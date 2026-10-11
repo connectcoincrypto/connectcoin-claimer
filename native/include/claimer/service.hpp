@@ -18,6 +18,15 @@ struct ServiceDependencies {
     // real socket pacing so offline tests can exercise recovery without sleeps.
     std::function<double()> reachability_time;
 };
+// Retains only a bounded reusable line buffer; getline stops at the delimiter,
+// never waits for a full block and never consumes the next protocol frame.
+class ProtocolFrameReader {
+    std::istream& input_;
+    std::vector<char> buffer_;
+public:
+    explicit ProtocolFrameReader(std::istream& input) : input_(input) {}
+    std::optional<UniValue> Next(size_t maximum = 16384);
+};
 std::optional<UniValue> ReadFrame(std::istream& input, size_t maximum = 16384);
 void ExactKeys(const UniValue&, std::initializer_list<std::string_view>);
 uint64_t ProtocolInteger(const UniValue&, uint64_t minimum, uint64_t maximum);
@@ -26,6 +35,9 @@ Context ParseContext(const UniValue&);
 UniValue PublicContext(const Context&);
 UniValue ReadyFrame();
 bool ConnectionBudgetExhausted(std::string_view target, uint64_t successes);
+// First success count that forbids another start. UINT64_MAX remains the
+// saturation stop even when the mathematical budget is larger than uint64_t.
+uint64_t ConnectionBudgetStopCount(std::string_view target);
 double AdvanceConnectionDeadline(double previous, double now, uint32_t rate, bool idle);
 class ClaimsService {
 public:

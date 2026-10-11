@@ -39,6 +39,7 @@ export class ClaimerService {
       minExpectedReturn: config.minExpectedReturn,
       options: { connectionsPerSecond: config.connectionsPerSecond, concurrency: config.concurrency },
       poolFactory: options => this.metrics.wrap(poolFactory ? poolFactory(options) : new ConnectionPool({ basePath, ...options })),
+      stateNotifications: false,
       onState: state => { this.claimState = state; },
       onDiagnostic: (event, details) => {
         if (event === 'claims.failed') this.fail(details.error ?? new Error('The claims engine stopped unexpectedly.'));
@@ -51,10 +52,14 @@ export class ClaimerService {
   report(event, details) { try { Promise.resolve(this.emit(event, details)).catch(() => {}); } catch { /* UI cannot affect claims. */ } }
   publish() { this.report('state', this.snapshot()); }
   snapshot() {
+    // Only engines explicitly advertising pull mode use this path. Injected
+    // engines that ignore the option retain the existing onState contract.
+    const claims = this.engine.stateNotifications === false && typeof this.engine.snapshot === 'function'
+      ? this.engine.snapshot() : this.claimState;
     return { status: this.status, running: this.running, ready: this.ready, height: this.tip?.height ?? null,
       available: [...this.outpoints.values()].filter(row => row.status === 'available' && !this.reserved.has(bountyKey(row))).length,
       reserved: this.reserved.size, lastError: this.lastError, reviewRequired: Boolean(this.fatalError?.unknownOutcome),
-      claims: { ...(this.claimState ?? {}) }, metrics: this.metrics.snapshot() };
+      claims: { ...(claims ?? {}) }, metrics: this.metrics.snapshot() };
   }
 
   async start() {

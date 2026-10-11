@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <deque>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -451,8 +452,7 @@ std::span<const unsigned char> AsBytes(std::string_view s) {
     return {reinterpret_cast<const unsigned char*>(s.data()), s.size()};
 }
 Hash Digest(std::span<const unsigned char> value) { Sha256 h; h.Add(value); return h.Finish(); }
-Sha256& Tag(Sha256& hash, std::string_view tag) {
-    const auto prefix = Digest(AsBytes(tag));
+Sha256& Tag(Sha256& hash, const Hash& prefix) {
     hash.Add(prefix); hash.Add(prefix); return hash;
 }
 void MutexInit(mbedtls_threading_mutex_t* mutex) {
@@ -541,15 +541,20 @@ bool X509TimeToUnix(const mbedtls_x509_time& time, int64_t& result)
     return true;
 }
 
-bool CheckSuppliedCertificateTimes(const mbedtls_x509_crt& chain, int64_t validation_time, std::string& error)
+struct CertificateMetadata {
+    struct Validity { int64_t from{}, to{}; };
+    std::array<Validity, MAX_P2C_CERTIFICATES> times{};
+    size_t count{};
+    bool dates_valid{true}, leaf_usage_valid{};
+};
+bool CheckSuppliedCertificateTimes(const CertificateMetadata& metadata, int64_t validation_time, std::string& error)
 {
     if (validation_time <= 0) return SetError(error, "P2C certificate validation time is unavailable");
-    for (const mbedtls_x509_crt* certificate{&chain}; certificate != nullptr; certificate = certificate->next) {
-        int64_t valid_from{0};
-        int64_t valid_to{0};
-        if (!X509TimeToUnix(certificate->valid_from, valid_from) ||
-            !X509TimeToUnix(certificate->valid_to, valid_to) ||
-            validation_time < valid_from || validation_time > valid_to) {
+    if (!metadata.dates_valid) return SetError(error, "P2C certificate is not valid at block median time");
+    // The supplied time is NEVER memoized. Check all supplied entries, including
+    // unused path candidates, against their immutable decoded date bounds.
+    for (size_t index = 0; index < metadata.count; ++index) {
+        if (validation_time < metadata.times[index].from || validation_time > metadata.times[index].to) {
             return SetError(error, "P2C certificate is not valid at block median time");
         }
     }
@@ -565,6 +570,37 @@ bool CheckLeafUsage(const mbedtls_x509_crt& leaf, std::string& error)
     }
     return true;
 }
+
+CertificateMetadata ReadCertificateMetadata(const mbedtls_x509_crt& chain) {
+    std::string error;
+    // Positive construction proves the immutable RSA-exponent policy once for
+    // ALL supplied DER. No cache entry is published when this check fails.
+    if (!CheckPublicKeys(chain, error)) Fail(error);
+    CertificateMetadata metadata;
+    metadata.leaf_usage_valid = CheckLeafUsage(chain, error);
+    for (auto* certificate = &chain; certificate; certificate = certificate->next) {
+        if (metadata.count == metadata.times.size()) Fail("Too many certificate metadata entries");
+        auto& bounds = metadata.times[metadata.count++];
+        const bool from_ok = X509TimeToUnix(certificate->valid_from, bounds.from);
+        const bool to_ok = X509TimeToUnix(certificate->valid_to, bounds.to);
+        metadata.dates_valid = metadata.dates_valid && from_ok && to_ok;
+    }
+    return metadata;
+}
+struct CachedCertificateChain {
+    const std::unique_ptr<CertificateChain> parsed;
+    const CertificateMetadata metadata;
+    explicit CachedCertificateChain(std::unique_ptr<CertificateChain> chain)
+        : parsed(std::move(chain)), metadata(ReadCertificateMetadata(parsed->value)) {}
+};
+struct CertificateCache {
+    Bytes message;
+    std::unique_ptr<CachedCertificateChain> parsed;
+#ifdef CLAIMER_CRYPTO_TESTING
+    CertificateCacheStats stats;
+#endif
+};
+CertificateCache& Certificates() { thread_local CertificateCache cache; return cache; }
 
 
 const mbedtls_x509_crt& Roots() {
@@ -591,23 +627,81 @@ std::vector<std::span<const unsigned char>> CertificateViews(std::span<const uns
         !reader.Empty() || !ParseCertificate(body, parsed, error)) Fail(error.empty() ? "Trailing certificate data" : error);
     return parsed.certificate_chain;
 }
-CertificateChain& CachedChain(std::span<const unsigned char> message) {
-    struct Cache { Bytes message; std::unique_ptr<CertificateChain> parsed; };
-    // A bounded DER-parsing cache, not a validity cache. Times, path, usage,
-    // hostname, signature algorithm and CertificateVerify are rechecked below.
-    thread_local Cache cache;
+const CachedCertificateChain& CachedChain(std::span<const unsigned char> message) {
+    // One exact message per worker, bounded by the wire certificate limit.
+    // Static metadata belongs to this owned DER, never a prior trust decision.
+    auto& cache = Certificates();
     if (!cache.parsed || !std::ranges::equal(cache.message, message)) {
+#ifdef CLAIMER_CRYPTO_TESTING
+        ++cache.stats.misses;
+#endif
         const auto views = CertificateViews(message);
         auto candidate = std::make_unique<CertificateChain>();
         for (auto der : views) {
             if (mbedtls_x509_crt_parse_der(&candidate->value, der.data(), der.size()) != 0) Fail("Invalid DER certificate");
         }
-        std::string error;
-        if (!CheckPublicKeys(candidate->value, error)) Fail(error);
+        auto validated = std::make_unique<CachedCertificateChain>(std::move(candidate));
         cache.message.assign(message.begin(), message.end());
-        cache.parsed = std::move(candidate);
+        cache.parsed = std::move(validated);
+#ifdef CLAIMER_CRYPTO_TESTING
+        ++cache.stats.metadata_builds;
+#endif
+    } else {
+#ifdef CLAIMER_CRYPTO_TESTING
+        ++cache.stats.hits;
+#endif
     }
     return *cache.parsed;
+}
+class SignatureCache {
+    struct Entry { Bytes child, parent; };
+    std::deque<Entry> entries_;
+    size_t bytes_{};
+public:
+    static constexpr size_t MAX_ENTRIES{8}, MAX_BYTES{65536};
+#ifdef CLAIMER_CRYPTO_TESTING
+    size_t hits{}, misses{};
+#endif
+    bool Contains(const mbedtls_x509_crt& child, const mbedtls_x509_crt& parent) noexcept {
+        const std::span<const unsigned char> child_der{child.raw.p, child.raw.len};
+        const std::span<const unsigned char> parent_der{parent.raw.p, parent.raw.len};
+        const bool found = std::ranges::any_of(entries_, [&](const Entry& entry) {
+            return std::ranges::equal(entry.child, child_der) && std::ranges::equal(entry.parent, parent_der);
+        });
+#ifdef CLAIMER_CRYPTO_TESTING
+        if (found) ++hits; else ++misses;
+#endif
+        return found;
+    }
+    void Remember(const mbedtls_x509_crt& child, const mbedtls_x509_crt& parent) noexcept {
+        // Exact owned DER, not hashes or pointer identities. Never retain
+        // oversized input or negative results. Memory bound is per worker.
+        if (child.raw.len == 0 || parent.raw.len == 0 || child.raw.len > MAX_P2C_CERTIFICATE_SIZE ||
+            parent.raw.len > MAX_P2C_CERTIFICATE_SIZE) return;
+        const size_t size = child.raw.len + parent.raw.len;
+        if (size > MAX_BYTES) return;
+        try {
+            while (!entries_.empty() && (entries_.size() >= MAX_ENTRIES || bytes_ + size > MAX_BYTES)) {
+                bytes_ -= entries_.front().child.size() + entries_.front().parent.size();
+                entries_.pop_front();
+            }
+            Entry candidate{Bytes(child.raw.p, child.raw.p + child.raw.len), Bytes(parent.raw.p, parent.raw.p + parent.raw.len)};
+            entries_.push_back(std::move(candidate));
+            bytes_ += size;
+        } catch (...) { /* Memoization failure never changes verification. */ }
+    }
+#ifdef CLAIMER_CRYPTO_TESTING
+    SignatureCacheStats Stats() const { return {hits, misses, entries_.size(), bytes_}; }
+#endif
+};
+SignatureCache& Signatures() { thread_local SignatureCache cache; return cache; }
+int SignatureLookup(void*, const mbedtls_x509_crt* child, const mbedtls_x509_crt* parent) noexcept {
+    try { return Signatures().Contains(*child, *parent) ? 1 : 0; }
+    catch (...) { return 0; }
+}
+void SignatureRemember(void*, const mbedtls_x509_crt* child, const mbedtls_x509_crt* parent) noexcept {
+    try { Signatures().Remember(*child, *parent); }
+    catch (...) { /* No exceptions may cross the C callback boundary. */ }
 }
 bool SchemeAllowed(uint8_t mask, uint16_t scheme) {
     return (scheme == 0x0403 && (mask & 1)) || (scheme == 0x0804 && (mask & 2)) || (scheme == 0x0809 && (mask & 4));
@@ -706,29 +800,74 @@ bool IsCanonicalDomain(std::string_view domain) {
     }
     return true;
 }
-void ValidateContext(const Context& context) {
+static void ValidateContextTime(int64_t time) {
+    if (time <= 0 || time > 253402300799LL) Fail("Invalid certificate validation time");
+}
+static void ValidateContextFields(const Context& context) {
     if (!IsCanonicalDomain(context.domain) || context.domain.find('.') == std::string::npos ||
         context.domain.ends_with(".localhost") || context.domain.ends_with(".local") || context.domain.ends_with(".internal"))
         Fail("Context requires a canonical public DNS name");
     if (context.txid.size() != 64 || context.connection_work_target.size() != 64) Fail("Context hash must have 64 hex digits");
-    (void)Unhex(context.txid); (void)Unhex(context.connection_work_target);
     if (context.root_certificates_version != 1) Fail("Unsupported root certificate version");
     if (context.signature_algorithms_mask == 0 || context.signature_algorithms_mask > 7) Fail("Invalid signature mask");
-    if (context.validation_time <= 0 || context.validation_time > 253402300799LL) Fail("Invalid certificate validation time");
+    ValidateContextTime(context.validation_time);
 }
-Hash ClaimChallenge(const Context& context) {
-    ValidateContext(context);
-    auto txid = Unhex(context.txid);
+void ValidateContext(const Context& context) {
+    ValidateContextFields(context);
+    (void)Unhex(context.txid); (void)Unhex(context.connection_work_target);
+}
+PreparedContext::PreparedContext(const Context& context) : context_(context) {
+    ValidateContextFields(context_);
+    auto txid = Unhex(context_.txid);
+    const auto target = Unhex(context_.connection_work_target);
+    std::ranges::copy(target, target_.begin());
     std::reverse(txid.begin(), txid.end());
     std::array<unsigned char, 4> index{};
-    for (unsigned i = 0; i < 4; ++i) index[i] = static_cast<unsigned char>(context.input_index >> (8*i));
+    for (unsigned i = 0; i < 4; ++i) index[i] = static_cast<unsigned char>(context_.input_index >> (8*i));
+    static const Hash claim_tag = Digest(AsBytes("ConnectCoin/P2C/claim/v1"));
     Sha256 hash;
-    Tag(hash, "ConnectCoin/P2C/claim/v1").Add(txid);
+    Tag(hash, claim_tag).Add(txid);
     hash.Add(index);
-    return hash.Finish();
+    challenge_ = hash.Finish();
 }
-ParsedProof ParseProof(std::span<const unsigned char> encoded, const Context& context) {
-    ValidateContext(context);
+PreparedContext::PreparedContext(PreparedContext&& other) noexcept
+    : context_(std::move(other.context_)), challenge_(other.challenge_), target_(other.target_),
+      valid_(std::exchange(other.valid_, false)) {}
+PreparedContext& PreparedContext::operator=(PreparedContext&& other) noexcept {
+    if (this != &other) {
+        context_ = std::move(other.context_);
+        challenge_ = other.challenge_; target_ = other.target_;
+        valid_ = std::exchange(other.valid_, false);
+    }
+    return *this;
+}
+PreparedContext& PreparedContext::operator=(const PreparedContext& other) {
+    if (this != &other) {
+        PreparedContext replacement(other);
+        *this = std::move(replacement);
+    }
+    return *this;
+}
+void PreparedContext::RequireValid() const { if (!valid_) Fail("Moved-from prepared context"); }
+const Context& PreparedContext::Get() const { RequireValid(); return context_; }
+const Hash& PreparedContext::Challenge() const { RequireValid(); return challenge_; }
+const Hash& PreparedContext::Target() const { RequireValid(); return target_; }
+bool PreparedContext::MatchesStaticContext(const Context& context) const noexcept {
+    return valid_ && context_.domain == context.domain && context_.txid == context.txid &&
+        context_.input_index == context.input_index && context_.connection_work_target == context.connection_work_target &&
+        context_.root_certificates_version == context.root_certificates_version &&
+        context_.signature_algorithms_mask == context.signature_algorithms_mask;
+}
+PreparedContext PreparedContext::WithValidationTime(int64_t time) const {
+    RequireValid();
+    ValidateContextTime(time);
+    PreparedContext result(*this);
+    result.context_.validation_time = time;
+    return result;
+}
+Hash ClaimChallenge(const Context& context) { return PreparedContext(context).Challenge(); }
+static ParsedProof ParsePreparedProof(std::span<const unsigned char> encoded, const PreparedContext& prepared) {
+    const auto& context = prepared.Get();
     if (encoded.empty() || encoded.size() > MAX_P2C_PROOF_SIZE) Fail("Invalid P2C proof size");
     ByteReader proof(encoded);
     uint8_t version{};
@@ -743,11 +882,12 @@ ParsedProof ParseProof(std::span<const unsigned char> encoded, const Context& co
         !ReadHandshake(proof, 15, MAX_CERTIFICATE_VERIFY_SIZE, parsed.certificate_verify, cv, error)) Fail(error);
     if (!proof.Empty()) Fail("Trailing bytes after CertificateVerify");
     ClientHelloState client;
-    if (!ParseClientHello(ch, context.domain, ClaimChallenge(context), client, error) ||
+    if (!ParseClientHello(ch, context.domain, prepared.Challenge(), client, error) ||
         !ParseServerHello(sh, client, error) || !ParseEncryptedExtensions(ee, error) ||
         !ParseCertificate(cert, parsed, error) || !ParseCertificateVerify(cv, client, parsed, error)) Fail(error);
     Sha256 transcript, work;
-    Tag(work, "ConnectCoin/P2C/work/v2");
+    static const Hash work_tag = Digest(AsBytes("ConnectCoin/P2C/work/v2"));
+    Tag(work, work_tag);
     for (auto message : {parsed.client_hello, parsed.server_hello, parsed.encrypted_extensions, parsed.certificate}) {
         transcript.Add(message); work.Add(message);
     }
@@ -755,44 +895,84 @@ ParsedProof ParseProof(std::span<const unsigned char> encoded, const Context& co
     parsed.connection_work_hash = work.Finish();
     return parsed;
 }
+ParsedProof ParseProof(std::span<const unsigned char> encoded, const Context& context) {
+    return ParsePreparedProof(encoded, PreparedContext(context));
+}
+struct CapturedProof::Storage {
+    const Bytes encoded;
+    const PreparedContext context;
+    const ParsedProof parsed;
+    Storage(Bytes bytes, const PreparedContext& prepared)
+        : encoded(std::move(bytes)), context(prepared), parsed(ParsePreparedProof(encoded, context)) {}
+};
+CapturedProof::CapturedProof(Bytes encoded, const PreparedContext& context)
+    : storage_(std::make_shared<const Storage>(std::move(encoded), context)) {}
+const Bytes& CapturedProof::Encoded() const {
+    if (!storage_) Fail("Moved-from captured proof");
+    return storage_->encoded;
+}
 void ValidateCertificateMessage(std::span<const unsigned char> message) {
     InitializeCrypto();
     (void)CachedChain(message);
 }
 namespace {
-Verification VerifyWithRoots(std::span<const unsigned char> encoded, const Context& context, const mbedtls_x509_crt& roots) {
+Verification VerifyWithRoots(const ParsedProof& parsed, const PreparedContext& prepared, const mbedtls_x509_crt& roots) {
     InitializeCrypto();
-    const auto parsed = ParseProof(encoded, context);
-    auto& chain = CachedChain(parsed.certificate).value;
+    const auto& context = prepared.Get();
+    const auto& cached = CachedChain(parsed.certificate);
+    auto& chain = cached.parsed->value;
     std::string error;
-    if (!CheckPublicKeys(chain, error) || !CheckSuppliedCertificateTimes(chain, context.validation_time, error) ||
-        !CheckLeafUsage(chain, error)) Fail(error);
+#ifdef CLAIMER_CRYPTO_TESTING
+    ++Certificates().stats.time_checks;
+#endif
+    if (!CheckSuppliedCertificateTimes(cached.metadata, context.validation_time, error)) Fail(error);
+    if (!cached.metadata.leaf_usage_valid) Fail("P2C leaf certificate is not authorized for TLS server signatures");
     if (!SchemeAllowed(context.signature_algorithms_mask, parsed.certificate_verify_scheme)) Fail("Signature scheme is not allowed by bounty");
     uint32_t flags{};
-    if (connectcoin_mbedtls_x509_crt_verify_root_first(&chain, const_cast<mbedtls_x509_crt*>(&roots),
-            &mbedtls_x509_crt_profile_default, context.domain.c_str(), &flags, nullptr, nullptr) != 0 || flags != 0)
+    const connectcoin_mbedtls_x509_signature_cache cache{nullptr, SignatureLookup, SignatureRemember};
+    if (connectcoin_mbedtls_x509_crt_verify_root_first_cached(&chain, const_cast<mbedtls_x509_crt*>(&roots),
+            &mbedtls_x509_crt_profile_default, context.domain.c_str(), &flags, nullptr, nullptr, &cache) != 0 || flags != 0)
         Fail("Certificate path or DNS name validation failed");
     VerifySignature(chain, parsed);
     auto hash = parsed.connection_work_hash;
     std::reverse(hash.begin(), hash.end());
-    const auto target = Unhex(context.connection_work_target);
+    const auto& target = prepared.Target();
     const bool meets = !std::lexicographical_compare(target.begin(), target.end(), hash.begin(), hash.end());
     return {Hex(hash), meets, parsed.certificate_verify_scheme};
 }
 } // namespace
 Verification VerifyProof(std::span<const unsigned char> encoded, const Context& context) {
+    const PreparedContext prepared(context);
+    const auto parsed = ParsePreparedProof(encoded, prepared);
     InitializeCrypto();
-    return VerifyWithRoots(encoded, context, Roots());
+    return VerifyWithRoots(parsed, prepared, Roots());
+}
+Verification VerifyCaptured(const CapturedProof& proof) {
+    if (!proof.storage_) Fail("Moved-from captured proof");
+    InitializeCrypto();
+    return VerifyWithRoots(proof.storage_->parsed, proof.storage_->context, Roots());
 }
 #ifdef CLAIMER_CRYPTO_TESTING
-Verification VerifyProofForTesting(std::span<const unsigned char> encoded, const Context& context, std::span<const unsigned char> roots_pem) {
+SignatureCacheStats SignatureCacheStatsForTesting() { return Signatures().Stats(); }
+void ClearSignatureCacheForTesting() { Signatures() = SignatureCache{}; }
+CertificateCacheStats CertificateCacheStatsForTesting() { return Certificates().stats; }
+void ClearCertificateCacheForTesting() { Certificates() = CertificateCache{}; }
+static Verification VerifyParsedForTesting(const ParsedProof& parsed, const PreparedContext& prepared, std::span<const unsigned char> roots_pem) {
     InitializeCrypto();
     CertificateChain roots;
     Bytes pem(roots_pem.begin(), roots_pem.end());
     pem.push_back(0);
     std::string error;
     if (mbedtls_x509_crt_parse(&roots.value, pem.data(), pem.size()) != 0 || !CheckPublicKeys(roots.value, error)) Fail("Invalid test roots");
-    return VerifyWithRoots(encoded, context, roots.value);
+    return VerifyWithRoots(parsed, prepared, roots.value);
+}
+Verification VerifyProofForTesting(std::span<const unsigned char> encoded, const Context& context, std::span<const unsigned char> roots_pem) {
+    const PreparedContext prepared(context);
+    return VerifyParsedForTesting(ParsePreparedProof(encoded, prepared), prepared, roots_pem);
+}
+Verification VerifyCapturedForTesting(const CapturedProof& proof, std::span<const unsigned char> roots_pem) {
+    if (!proof.storage_) Fail("Moved-from captured proof");
+    return VerifyParsedForTesting(proof.storage_->parsed, proof.storage_->context, roots_pem);
 }
 #endif
 } // namespace claimer

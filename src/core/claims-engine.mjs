@@ -6,7 +6,7 @@ import { ClaimScheduler } from './claim-scheduler.mjs';
 import { ClaimConnectionPolicy, MAX_RECOVERY_POLICIES } from './claim-connection-policy.mjs';
 import { diagnosticError } from './diagnostics.mjs';
 import { claimPriority, selectionPriority, domainPriority, isWorthAttempting, compareClaimPriority, P2CDomainStats, validateAttemptStats, validateMinExpectedReturn, MIN_EXPECTED_RETURN,
-  PRIORITY_FACTOR_SCALE, PRIORITY_FACTOR_MAX, isP2CClaimConnectionLimitExceeded, MAX_P2C_SUCCESSFUL_CONNECTIONS } from './claim-priority.mjs';
+  PRIORITY_FACTOR_SCALE, PRIORITY_FACTOR_MAX, claimConnectionStopCount, MAX_P2C_SUCCESSFUL_CONNECTIONS } from './claim-priority.mjs';
 
 const keyOf = bounty => `${bounty.txid}:${bounty.vout}`;
 const policyOf = job => `${job.bounty.domain}:${job.bounty.signature_algorithms_mask}`;
@@ -55,11 +55,15 @@ function injectedPool(generateProof) {
 
 /** One persistent worker pool, with bounded Core-style connection assignments. */
 export class ClaimsEngine {
-  constructor({ prepare, submit, isUnlocked, poolFactory, generateProof, resourcesPath, onState = () => {}, onDiagnostic = () => {},
+  constructor({ prepare, submit, isUnlocked, poolFactory, generateProof, resourcesPath, onState = () => {}, onDiagnostic = () => {}, stateNotifications = true,
     options = {}, retryDelayMs = 30000, maxQueue = 20000, randomIndex = randomInt, getNetReward = bounty => BigInt(bounty.amount), getValidationTime, minExpectedReturn = MIN_EXPECTED_RETURN } = {}) {
     if (![prepare, submit, isUnlocked, onState, randomIndex, getNetReward].every(fn => typeof fn === 'function')) throw new Error('Claim callbacks are required');
+    if (typeof stateNotifications !== 'boolean') throw new Error('State notifications must be a boolean');
     if (!Number.isInteger(maxQueue) || maxQueue < 1 || maxQueue > 20000 || !Number.isInteger(retryDelayMs) || retryDelayMs < 1 || retryDelayMs > 300000) throw new Error('Invalid claim queue limits');
     Object.assign(this, { prepare, submit, isUnlocked, onState, onDiagnostic, randomIndex, getNetReward, getValidationTime, maxQueue, retryDelayMs });
+    // Push remains the public default. A headless consumer can explicitly opt
+    // into pull snapshots without allocating discarded views for every socket.
+    Object.defineProperty(this, 'stateNotifications', { value: stateNotifications, enumerable: true });
     this.minExpectedReturn = validateMinExpectedReturn(minExpectedReturn);
     this.poolFactory = poolFactory ?? (generateProof ? () => injectedPool(generateProof) : ({ onFailure }) => new ConnectionPool({ resourcesPath, onDiagnostic, onFailure }));
     this.options = validateConnectionOptions(options);
@@ -150,10 +154,18 @@ export class ClaimsEngine {
   notify(patch = {}) {
     // Severity belongs to the warning, not the scheduler's current status.
     // A retry can become waiting/submitting without turning into a fatal alert.
-    if (Object.hasOwn(patch, 'lastError')) patch = { lastErrorCategory: null, lastErrorDiagnostic: false, lastErrorTransient: false, ...patch };
-    if (patch.lastError === null) patch = { ...patch, lastErrorCategory: null, lastErrorDiagnostic: false, lastErrorTransient: false };
-    this.state = { ...this.state, ...patch };
-    try { this.onState(this.snapshot()); } catch { /* Presentation cannot stop workers. */ }
+    const state = this.stateNotifications ? { ...this.state } : this.state;
+    if (Object.hasOwn(patch, 'lastError')) {
+      state.lastErrorCategory = null; state.lastErrorDiagnostic = false; state.lastErrorTransient = false;
+    }
+    Object.assign(state, patch);
+    if (patch.lastError === null) {
+      state.lastErrorCategory = null; state.lastErrorDiagnostic = false; state.lastErrorTransient = false;
+    }
+    this.state = state;
+    if (this.stateNotifications) {
+      try { this.onState(this.snapshot()); } catch { /* Presentation cannot stop workers. */ }
+    }
   }
   track(job, promise) {
     const key = keyOf(job.bounty); this.live.set(key, (this.live.get(key) ?? 0) + 1);
@@ -176,7 +188,16 @@ export class ClaimsEngine {
   updatePriority(job) {
     const net = job.prepared?.payout !== undefined ? BigInt(job.prepared.payout) : this.getNetReward(job.bounty);
     job.rawPriority = claimPriority(job.bounty.connection_work_target, net); job.priority = selectionPriority(job.rawPriority, job.factor);
-    job.budgetExceeded = isP2CClaimConnectionLimitExceeded(job.bounty.connection_work_target, this.successCounts.get(keyOf(job.bounty)) ?? 0n);
+    job.budgetExceeded = this.connectionBudgetExceeded(job, this.successCounts.get(keyOf(job.bounty)) ?? 0n);
+  }
+  connectionBudgetExceeded(job, successes) {
+    const target = job.bounty.connection_work_target;
+    if (job.budgetTarget !== target || job.connectionStopCount === undefined) {
+      job.connectionStopCount = claimConnectionStopCount(target); job.budgetTarget = target;
+    }
+    if (typeof successes === 'number' && Number.isSafeInteger(successes)) successes = BigInt(successes);
+    if (typeof successes !== 'bigint' || successes < 0n) throw new Error('Invalid successful connection count');
+    return successes >= job.connectionStopCount;
   }
   connectionRate(job, cache) {
     const key = `${job.bounty.domain}:${job.bounty.signature_algorithms_mask}`;
@@ -517,8 +538,9 @@ export class ClaimsEngine {
       const observed = observation.successfulConnections === undefined
         ? (count < MAX_P2C_SUCCESSFUL_CONNECTIONS ? count + 1n : count)
         : BigInt(observation.successfulConnections);
-      this.successCounts.set(key, observed > count ? observed : count);
-      job.budgetExceeded = isP2CClaimConnectionLimitExceeded(job.bounty.connection_work_target, this.successCounts.get(key));
+      const successfulConnections = observed > count ? observed : count;
+      this.successCounts.set(key, successfulConnections);
+      job.budgetExceeded = this.connectionBudgetExceeded(job, successfulConnections);
       if (job.budgetExceeded) this.scheduler.remove(key); // Keep already-running attempts alive.
     }
   }
