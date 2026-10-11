@@ -122,6 +122,19 @@ test('proof runner appends the required RSA policy after source-helper arguments
   assert.deepEqual(args, ['-I', 'claims_bridge.py'], 'do not mutate shared helper arguments');
 });
 
+test('one-shot native runtime rejects a legacy helper without retrying it', async () => {
+  let calls = 0;
+  const fixture = fakeSpawn(child => {
+    calls++;
+    child.stdout.write('{"type":"error","message":"unknown helper arguments"}\n');
+    child.emit('close', 1);
+  });
+  const runner = createProofRunner({ ...fixture, helper: { command: 'old-packaged-helper', native: true } });
+  await assert.rejects(runner(context()), /npm run build:claims/);
+  assert.deepEqual(fixture.capture.args, ['--require-rsa-exponent-64', '--require-native-mbedtls']);
+  assert.equal(calls, 1);
+});
+
 test('proof runner rejects legacy helper flag errors with rebuild guidance and no fallback', async () => {
   let calls = 0;
   let progress = 0;

@@ -1,0 +1,464 @@
+// Copyright (c) 2026 The ConnectCoin developers. MIT license.
+#include <claimer/service.hpp>
+#include <mbedtls/version.h>
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <charconv>
+#include <chrono>
+#include <cmath>
+#include <condition_variable>
+#include <deque>
+#include <exception>
+#include <limits>
+#include <map>
+#include <mutex>
+#include <set>
+#include <thread>
+#include <unordered_map>
+
+namespace claimer {
+namespace {
+using Clock = std::chrono::steady_clock;
+constexpr uint64_t MAX_ID = (uint64_t{1} << 53) - 1;
+constexpr uint64_t MAX_CONNECTION_LIMIT = 2147483647;
+constexpr size_t MAX_DNS = 4096, MAX_BUDGETS = 1024;
+double Now() { return std::chrono::duration<double>(Clock::now().time_since_epoch()).count(); }
+void Require(bool value, const char* message) { if (!value) throw std::invalid_argument(message); }
+void UniqueKeys(const UniValue& value, unsigned depth = 0) {
+    Require(depth <= 64, "JSON nesting limit exceeded");
+    if (value.isObject()) {
+        std::set<std::string> seen;
+        for (const auto& key : value.getKeys()) Require(seen.insert(key).second, "Duplicate JSON field");
+    }
+    if (value.isObject() || value.isArray()) for (const auto& child : value.getValues()) UniqueKeys(child, depth + 1);
+}
+uint64_t Decimal(const std::string& text, uint64_t maximum) {
+    Require(!text.empty() && text.size() <= 20 && (text.size() == 1 || text[0] != '0'), "Invalid protocol decimal");
+    uint64_t value{};
+    const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
+    Require(error == std::errc{} && end == text.data() + text.size() && value <= maximum, "Invalid protocol decimal");
+    return value;
+}
+struct BudgetExhausted : std::exception {};
+struct OutputFailure : std::runtime_error { OutputFailure() : std::runtime_error("Helper output failed") {} };
+struct Score {
+    double connections{0.1}, seconds{0.02}, credit{};
+    double Rate() const {
+        if (seconds == 0) return std::numeric_limits<double>::max();
+        return std::clamp(connections / seconds, std::numeric_limits<double>::denorm_min(), std::numeric_limits<double>::max());
+    }
+};
+struct Budget { std::string target; uint64_t successes{}, users{}, touched{}; };
+struct DnsEntry {
+    struct Item { Endpoint endpoint; std::map<uint8_t, std::shared_ptr<Score>> scores; };
+    std::vector<Item> endpoints;
+    std::map<uint8_t, size_t> next;
+    double expires{};
+    uint64_t touched{};
+};
+struct Job {
+    uint64_t id{};
+    bool attempt{}, running{}, started{}, captured{};
+    Context context;
+    std::string domain, bounty;
+    CaptureControl control;
+    double seconds{}, started_at{};
+    std::optional<uint64_t> successes;
+};
+} // namespace
+
+std::optional<UniValue> ReadFrame(std::istream& input, size_t maximum) {
+    std::string line;
+    while (line.size() <= maximum) {
+        const int next = input.get();
+        if (next == std::char_traits<char>::eof()) {
+            if (line.empty() && input.eof()) return std::nullopt;
+            throw std::invalid_argument("Incomplete protocol frame");
+        }
+        line.push_back(static_cast<char>(next));
+        if (next == '\n') break;
+    }
+    Require(line.size() <= maximum && line.back() == '\n', "Protocol frame exceeds size limit");
+    UniValue value;
+    Require(value.read(line), "Invalid protocol JSON");
+    UniqueKeys(value);
+    return value;
+}
+void ExactKeys(const UniValue& value, std::initializer_list<std::string_view> expected) {
+    Require(value.isObject() && value.size() == expected.size(), "Invalid protocol command fields");
+    for (const auto key : expected) Require(value.exists(std::string(key)), "Invalid protocol command fields");
+}
+uint64_t ProtocolInteger(const UniValue& value, uint64_t minimum, uint64_t maximum) {
+    Require(value.isNum(), "Invalid protocol integer");
+    const auto result = value.getInt<uint64_t>();
+    Require(result >= minimum && result <= maximum, "Invalid protocol integer");
+    return result;
+}
+std::string PublicDomain(const UniValue& value) {
+    Require(value.isStr(), "Public DNS domain required");
+    const auto domain = value.get_str();
+    Require(IsCanonicalDomain(domain) && domain.find('.') != std::string::npos && !domain.ends_with(".localhost") && !domain.ends_with(".local") && !domain.ends_with(".internal"), "Public DNS domain required");
+    return domain;
+}
+Context ParseContext(const UniValue& value) {
+    ExactKeys(value, {"domain", "txid", "input_index", "connection_work_target", "root_certificates_version", "signature_algorithms_mask", "validation_time"});
+    Context result;
+    result.domain = PublicDomain(value["domain"]);
+    result.txid = value["txid"].get_str();
+    result.input_index = static_cast<uint32_t>(ProtocolInteger(value["input_index"], 0, 0xffffffff));
+    result.connection_work_target = value["connection_work_target"].get_str();
+    result.root_certificates_version = static_cast<uint32_t>(ProtocolInteger(value["root_certificates_version"], 1, 1));
+    result.signature_algorithms_mask = static_cast<uint8_t>(ProtocolInteger(value["signature_algorithms_mask"], 1, 7));
+    result.validation_time = static_cast<int64_t>(ProtocolInteger(value["validation_time"], 1, 253402300799));
+    ValidateContext(result);
+    return result;
+}
+UniValue PublicContext(const Context& context) {
+    UniValue result(UniValue::VOBJ);
+    result.pushKV("domain", context.domain); result.pushKV("txid", context.txid);
+    result.pushKV("input_index", context.input_index); result.pushKV("connection_work_target", context.connection_work_target);
+    result.pushKV("root_certificates_version", context.root_certificates_version);
+    result.pushKV("signature_algorithms_mask", static_cast<unsigned>(context.signature_algorithms_mask));
+    result.pushKV("validation_time", context.validation_time);
+    return result;
+}
+UniValue ReadyFrame() {
+    UniValue result(UniValue::VOBJ), security(UniValue::VOBJ);
+    security.pushKV("provider", "mbedtls"); security.pushKV("mbedtlsVersion", MBEDTLS_VERSION_STRING); security.pushKV("rsaPublicExponentMaxBits", 64);
+    result.pushKV("type", "ready"); result.pushKV("protocol", 4); result.pushKV("roots", 1); result.pushKV("security", security);
+    return result;
+}
+bool ConnectionBudgetExhausted(std::string_view target, uint64_t successes) {
+    if (successes == UINT64_MAX) return true;
+    const auto bytes = Unhex(target);
+    Require(bytes.size() == 32, "Invalid connection target");
+    std::array<uint32_t, 9> factor{};
+    for (size_t i = 0; i < bytes.size(); ++i) factor[i / 4] |= uint32_t(bytes[31 - i]) << ((i % 4) * 8);
+    uint64_t carry = 1;
+    for (auto& word : factor) { carry += word; word = static_cast<uint32_t>(carry); carry >>= 32; }
+    const std::array<uint32_t, 2> multiplier{static_cast<uint32_t>(successes), static_cast<uint32_t>(successes >> 32)};
+    std::array<uint32_t, 11> product{};
+    for (size_t i = 0; i < factor.size(); ++i) {
+        carry = 0;
+        for (size_t j = 0; j < multiplier.size(); ++j) {
+            const uint64_t part = uint64_t(factor[i]) * multiplier[j] + product[i + j] + carry;
+            product[i + j] = static_cast<uint32_t>(part); carry = part >> 32;
+        }
+        for (size_t k = i + 2; carry && k < product.size(); ++k) {
+            carry += product[k]; product[k] = static_cast<uint32_t>(carry); carry >>= 32;
+        }
+    }
+    // Compare the full product with 2^257; equality is permitted.
+    for (size_t i = product.size(); i-- > 0;) {
+        const uint32_t limit = i == 8 ? 2 : 0;
+        if (product[i] != limit) return product[i] > limit;
+    }
+    return false;
+}
+double AdvanceConnectionDeadline(double previous, double now, uint32_t rate, bool idle) {
+    if (idle) previous = std::max(previous, now);
+    return std::max(previous + 1.0 / rate, now - 1.0);
+}
+
+struct ClaimsService::Impl {
+    Emit output;
+    ServiceDependencies deps;
+    uint32_t rate{}, concurrency{};
+    size_t pending_limit{};
+    std::mutex mutex, output_mutex;
+    std::timed_mutex connection_mutex;
+    std::condition_variable tls_condition, dns_condition;
+    std::unordered_map<uint64_t, std::shared_ptr<Job>> jobs;
+    std::deque<std::shared_ptr<Job>> tls_pending, dns_pending;
+    std::unordered_map<std::string, Budget> budgets;
+    std::unordered_map<std::string, DnsEntry> dns;
+    std::vector<std::thread> workers;
+    size_t tls_workers{}, dns_workers{}, active_tls{}, active_dns{};
+    uint64_t last_id{}, touched{};
+    double next_connection{};
+    bool idle{true}, closed{};
+    std::atomic<bool> failed{};
+
+    Impl(const UniValue& options, Emit emit, ServiceDependencies dependencies) : output(std::move(emit)), deps(std::move(dependencies)) {
+        ExactKeys(options, {"connectionsPerSecond", "concurrency"});
+        rate = static_cast<uint32_t>(ProtocolInteger(options["connectionsPerSecond"], 1, MAX_CONNECTION_LIMIT));
+        concurrency = static_cast<uint32_t>(ProtocolInteger(options["concurrency"], 1, MAX_CONNECTION_LIMIT));
+        pending_limit = std::max<size_t>(512, static_cast<size_t>(concurrency) + 2);
+        if (!deps.resolve) deps.resolve = [](const std::string& domain) { return ResolveEndpoints(domain); };
+        if (!deps.capture) deps.capture = [](const Context& context, const Endpoint& endpoint, CaptureControl& control, const std::function<void()>& started) { return Capture(context, endpoint, control, started); };
+        if (!deps.verify) deps.verify = [](const Bytes& proof, const Context& context) { return VerifyProof(proof, context); };
+    }
+    void EmitFrame(const UniValue& value) {
+        const auto text = value.write();
+        Require(text.size() <= 160 * 1024, "Helper response exceeds 160 KiB");
+        std::lock_guard lock(output_mutex);
+        try { output(text); } catch (...) { throw OutputFailure(); }
+    }
+    UniValue Fields(const std::shared_ptr<Job>& job) {
+        uint64_t count;
+        { std::lock_guard lock(mutex); count = job->successes.value_or(budgets.at(job->bounty).successes); }
+        UniValue fields(UniValue::VOBJ);
+        fields.pushKV("id", job->id); fields.pushKV("context", PublicContext(job->context));
+        fields.pushKV("started", job->started); fields.pushKV("captured", job->captured);
+        fields.pushKV("seconds", job->seconds); fields.pushKV("cancelled", job->control.Cancelled());
+        fields.pushKV("successfulConnections", std::to_string(count));
+        return fields;
+    }
+    void BeforeStartLocked(const std::shared_ptr<Job>& job) {
+        if (closed || job->control.Cancelled()) throw CaptureCancelled();
+        const auto& budget = budgets.at(job->bounty);
+        if (ConnectionBudgetExhausted(budget.target, budget.successes)) throw BudgetExhausted();
+    }
+    void BeforeStart(const std::shared_ptr<Job>& job) { std::lock_guard lock(mutex); BeforeStartLocked(job); }
+    void Connecting(const std::shared_ptr<Job>& job) {
+        std::unique_lock turn(connection_mutex, std::defer_lock);
+        while (!turn.try_lock_for(std::chrono::milliseconds(10))) BeforeStart(job);
+        for (;;) {
+            double delay;
+            { std::lock_guard lock(mutex); BeforeStartLocked(job); delay = next_connection - Now(); }
+            if (delay <= 0) break;
+            std::this_thread::sleep_for(std::chrono::duration<double>(std::min(delay, 0.010)));
+        }
+        { std::lock_guard lock(mutex); BeforeStartLocked(job); job->started = true; job->started_at = Now(); }
+        UniValue frame(UniValue::VOBJ); frame.pushKV("type", "started"); frame.pushKV("id", job->id); EmitFrame(frame);
+        { std::lock_guard lock(mutex);
+            if (closed || job->control.Cancelled()) throw CaptureCancelled();
+            const auto now = Now(); next_connection = AdvanceConnectionDeadline(next_connection, now, rate, idle);
+            idle = false; job->started_at = now;
+        }
+    }
+    std::pair<Endpoint, std::shared_ptr<Score>> SelectEndpoint(const std::shared_ptr<Job>& job) {
+        std::lock_guard lock(mutex);
+        const auto found = dns.find(job->domain);
+        Require(found != dns.end() && found->second.expires > Now() && !found->second.endpoints.empty(), "Public DNS resolution required");
+        auto& cached = found->second;
+        const auto mask = job->context.signature_algorithms_mask;
+        std::vector<std::shared_ptr<Score>> scores; std::vector<double> rates;
+        for (auto& item : cached.endpoints) {
+            auto& score = item.scores[mask]; if (!score) score = std::make_shared<Score>();
+            scores.push_back(score); rates.push_back(score->Rate());
+        }
+        const auto maximum = *std::max_element(rates.begin(), rates.end());
+        double total = 0; for (auto& value : rates) { value /= maximum; total += value; }
+        const auto count = scores.size();
+        for (size_t i = 0; i < count; ++i) scores[i]->credit += 0.01 / count + 0.99 * rates[i] / total;
+        const size_t cursor = cached.next[mask] % count;
+        size_t selected = cursor;
+        for (size_t offset = 1; offset < count; ++offset) {
+            const auto candidate = (cursor + offset) % count;
+            if (scores[candidate]->credit > scores[selected]->credit) selected = candidate;
+        }
+        scores[selected]->credit -= 1; cached.next[mask] = (selected + 1) % count; cached.touched = ++touched;
+        return {cached.endpoints[selected].endpoint, scores[selected]};
+    }
+    void Resolve(const std::shared_ptr<Job>& job) {
+        bool ok = false, cached = false;
+        if (!job->control.Cancelled()) {
+            { std::lock_guard lock(mutex);
+                const auto found = dns.find(job->domain);
+                if (found != dns.end() && found->second.expires > Now()) {
+                    cached = true; ok = !found->second.endpoints.empty(); found->second.touched = ++touched;
+                }
+            }
+            if (!cached) {
+                std::vector<Endpoint> endpoints;
+                try { endpoints = deps.resolve(job->domain); if (endpoints.size() > 32) endpoints.resize(32); } catch (...) {}
+                std::lock_guard lock(mutex);
+                DnsEntry next;
+                const auto previous = dns.find(job->domain);
+                if (previous != dns.end()) next.next = previous->second.next;
+                for (const auto& endpoint : endpoints) {
+                    DnsEntry::Item item{endpoint, {}};
+                    if (previous != dns.end()) for (const auto& old : previous->second.endpoints) if (old.endpoint == endpoint) { item.scores = old.scores; break; }
+                    next.endpoints.push_back(std::move(item));
+                }
+                ok = !endpoints.empty(); next.expires = Now() + (ok ? 60.0 : 2.0); next.touched = ++touched;
+                dns[job->domain] = std::move(next);
+                if (dns.size() > MAX_DNS) {
+                    const auto oldest = std::min_element(dns.begin(), dns.end(), [](const auto& a, const auto& b) { return a.second.touched < b.second.touched; });
+                    dns.erase(oldest);
+                }
+            }
+        }
+        const bool cancelled = job->control.Cancelled();
+        UniValue frame(UniValue::VOBJ); frame.pushKV("type", "resolved"); frame.pushKV("id", job->id); frame.pushKV("ok", ok && !cancelled);
+        if (!ok || cancelled) frame.pushKV("message", cancelled ? "Resolution cancelled" : "Public DNS resolution failed");
+        EmitFrame(frame);
+    }
+    void Attempt(const std::shared_ptr<Job>& job) {
+        Bytes captured;
+        std::optional<std::string> proof;
+        std::optional<bool> validated;
+        bool validating = false, blocked = false;
+        std::string message;
+        std::shared_ptr<Score> score;
+        try {
+            if (job->control.Cancelled()) throw CaptureCancelled();
+            const auto selected = SelectEndpoint(job); score = selected.second;
+            BeforeStart(job);
+            std::exception_ptr capture_error;
+            try { captured = deps.capture(job->context, selected.first, job->control, [&] { Connecting(job); }); job->captured = true; }
+            catch (const OutputFailure&) { throw; }
+            catch (const CaptureCancelled&) { capture_error = std::current_exception(); }
+            catch (...) { if (job->started && !job->control.Cancelled()) validated = false; capture_error = std::current_exception(); }
+            if (job->started) {
+                const auto elapsed = Now() - job->started_at;
+                { std::lock_guard lock(mutex);
+                    job->seconds = std::nearbyint(std::max(0.0, elapsed) * 1000000.0) / 1000000.0;
+                    auto& budget = budgets.at(job->bounty);
+                    if (job->captured && budget.successes != UINT64_MAX) ++budget.successes;
+                    job->successes = budget.successes;
+                }
+                auto frame = Fields(job); frame.pushKV("type", "capture"); EmitFrame(frame);
+            }
+            if (capture_error) std::rethrow_exception(capture_error);
+            if (!job->control.Cancelled()) {
+                validating = true;
+                const auto verified = deps.verify(captured, job->context);
+                validated = true;
+                if (verified.meets_target && !job->control.Cancelled()) proof = Hex(captured);
+            }
+        } catch (const OutputFailure&) { throw; }
+        catch (const BudgetExhausted&) { blocked = true; }
+        catch (const CaptureCancelled&) { message = "TLS capture cancelled"; }
+        catch (const CaptureTimeout&) { if (validating && !validated) validated = false; message = job->started ? "TLS connection timed out" : "Public DNS resolution is required"; }
+        catch (...) { if (validating && !validated) validated = false; message = job->started ? "TLS capture or proof validation failed" : "Public DNS resolution is required"; }
+        auto frame = Fields(job);
+        if (frame["cancelled"].get_bool()) proof.reset();
+        if (score && validated && std::isfinite(job->seconds) && job->seconds >= 0) {
+            std::lock_guard lock(mutex);
+            score->connections = 0.999 * score->connections + 0.001 * (*validated ? 1 : 0);
+            score->seconds = 0.999 * score->seconds + 0.001 * job->seconds;
+        }
+        frame.pushKV("type", "attempt"); frame.pushKV("proof", proof ? UniValue(*proof) : UniValue()); frame.pushKV("verified", proof.has_value());
+        frame.pushKV("validationPassed", validated ? UniValue(*validated) : UniValue());
+        if (!message.empty()) frame.pushKV("message", message);
+        if (blocked) frame.pushKV("blocked", "budget");
+        EmitFrame(frame);
+    }
+    void Fatal() noexcept {
+        if (!failed.exchange(true)) {
+            try { UniValue error(UniValue::VOBJ); error.pushKV("type", "error"); error.pushKV("message", "Claims helper worker failed"); EmitFrame(error); } catch (...) {}
+        }
+        std::vector<std::shared_ptr<Job>> cancel;
+        { std::lock_guard lock(mutex); closed = true; for (const auto& [id, job] : jobs) cancel.push_back(job); tls_condition.notify_all(); dns_condition.notify_all(); }
+        for (const auto& job : cancel) job->control.Cancel();
+    }
+    void Worker(bool attempts) noexcept {
+        for (;;) {
+            std::shared_ptr<Job> job;
+            { std::unique_lock lock(mutex);
+                auto& pending = attempts ? tls_pending : dns_pending;
+                auto& available = attempts ? tls_condition : dns_condition;
+                available.wait(lock, [&] { return closed || !pending.empty(); });
+                if (closed) return;
+                job = pending.front(); pending.pop_front(); job->running = true;
+                if (attempts) ++active_tls; else ++active_dns;
+            }
+            try { if (attempts) Attempt(job); else Resolve(job); }
+            catch (...) { Fatal(); }
+            { std::lock_guard lock(mutex);
+                jobs.erase(job->id);
+                if (attempts) { --active_tls; --budgets.at(job->bounty).users; } else --active_dns;
+            }
+        }
+    }
+    void Cancel(const std::shared_ptr<Job>& job) {
+        // Publish cancellation without holding the scheduler lock: the capture
+        // may currently hold its socket mutex while calling the start gate.
+        job->control.Cancel();
+        bool queued = false;
+        { std::lock_guard lock(mutex);
+            const auto found = jobs.find(job->id);
+            queued = found != jobs.end() && found->second == job && !job->running;
+            if (queued) { std::erase(job->attempt ? tls_pending : dns_pending, job); jobs.erase(found); }
+        }
+        if (!queued) return;
+        if (job->attempt) {
+            auto frame = Fields(job); frame.pushKV("type", "attempt"); frame.pushKV("proof", UniValue()); frame.pushKV("verified", false);
+            frame.pushKV("validationPassed", UniValue()); frame.pushKV("message", "TLS capture cancelled");
+            try { EmitFrame(frame); } catch (...) { std::lock_guard lock(mutex); --budgets.at(job->bounty).users; throw; }
+            std::lock_guard lock(mutex); --budgets.at(job->bounty).users;
+        } else { UniValue frame(UniValue::VOBJ); frame.pushKV("type", "resolved"); frame.pushKV("id", job->id); frame.pushKV("ok", false); frame.pushKV("message", "Resolution cancelled"); EmitFrame(frame); }
+    }
+    void Command(const UniValue& command) {
+        Require(command.isObject() && command["type"].isStr(), "Invalid protocol command");
+        const auto kind = command["type"].get_str();
+        if (kind == "cancel") {
+            ExactKeys(command, {"type", "id"}); const auto id = ProtocolInteger(command["id"], 1, MAX_ID);
+            std::shared_ptr<Job> job;
+            { std::lock_guard lock(mutex); if (const auto found = jobs.find(id); found != jobs.end()) job = found->second; }
+            if (job) Cancel(job);
+            return;
+        }
+        Require(kind == "resolve" || kind == "attempt", "Unknown protocol command");
+        if (kind == "resolve") ExactKeys(command, {"type", "id", "domain"});
+        else ExactKeys(command, {"type", "id", "context", "bountyId", "successfulConnections"});
+        auto job = std::make_shared<Job>(); job->id = ProtocolInteger(command["id"], 1, MAX_ID); job->attempt = kind == "attempt";
+        uint64_t successes = 0;
+        if (!job->attempt) job->domain = PublicDomain(command["domain"]);
+        else {
+            job->context = ParseContext(command["context"]); job->domain = job->context.domain;
+            job->bounty = command["bountyId"].get_str();
+            Require(job->bounty.size() >= 66 && job->bounty.size() <= 75 && job->bounty[64] == ':', "Invalid bounty outpoint");
+            const auto hash = Unhex(std::string_view(job->bounty).substr(0, 64)); Require(hash.size() == 32, "Invalid bounty outpoint");
+            Decimal(job->bounty.substr(65), 0xffffffff);
+            successes = Decimal(command["successfulConnections"].get_str(), UINT64_MAX);
+        }
+        std::unique_lock lock(mutex);
+        Require(!closed, "Helper is shutting down"); Require(job->id > last_id, "Request IDs must increase");
+        Require(jobs.size() < pending_limit, "Helper pending request limit exceeded");
+        if (job->attempt) {
+            auto found = budgets.find(job->bounty);
+            if (found == budgets.end()) {
+                if (budgets.size() >= MAX_BUDGETS) {
+                    auto oldest = budgets.end();
+                    for (auto item = budgets.begin(); item != budgets.end(); ++item) if (!item->second.users && (oldest == budgets.end() || item->second.touched < oldest->second.touched)) oldest = item;
+                    Require(oldest != budgets.end(), "Helper budget cache is full"); budgets.erase(oldest);
+                }
+                found = budgets.emplace(job->bounty, Budget{job->context.connection_work_target, successes, 0, 0}).first;
+            }
+            auto& budget = found->second;
+            Require(budget.target == job->context.connection_work_target, "Bounty target changed within helper session");
+            budget.successes = std::max(budget.successes, successes); ++budget.users; budget.touched = ++touched;
+            if (std::none_of(jobs.begin(), jobs.end(), [](const auto& item) { return item.second->attempt && !item.second->control.Cancelled(); })) idle = true;
+        }
+        auto& pending = job->attempt ? tls_pending : dns_pending;
+        last_id = job->id; jobs.emplace(job->id, job); pending.push_back(job);
+        const size_t demand = pending.size() + (job->attempt ? active_tls : active_dns);
+        auto& count = job->attempt ? tls_workers : dns_workers;
+        const size_t limit = job->attempt ? concurrency : 2;
+        try {
+            if (count < limit && count < demand) { workers.emplace_back([this, attempts = job->attempt] { Worker(attempts); }); ++count; }
+        } catch (...) { lock.unlock(); Fatal(); throw std::runtime_error("Claims helper could not create a connection worker"); }
+        (job->attempt ? tls_condition : dns_condition).notify_one();
+    }
+    void Close() {
+        std::vector<std::shared_ptr<Job>> cancel;
+        { std::lock_guard lock(mutex); closed = true; for (const auto& [id, job] : jobs) cancel.push_back(job); tls_condition.notify_all(); dns_condition.notify_all(); }
+        for (const auto& job : cancel) { try { Cancel(job); } catch (...) { failed = true; } }
+        for (auto& worker : workers) if (worker.joinable()) worker.join();
+    }
+};
+
+ClaimsService::ClaimsService(const UniValue& options, Emit emit, ServiceDependencies deps) : impl_(std::make_unique<Impl>(options, std::move(emit), std::move(deps))) {}
+ClaimsService::~ClaimsService() { impl_->Close(); }
+void ClaimsService::Command(const UniValue& command) { impl_->Command(command); }
+void ClaimsService::Close() { impl_->Close(); }
+bool ClaimsService::Failed() const { return impl_->failed.load(); }
+int RunService(std::istream& input, Emit emit) {
+    const auto start = ReadFrame(input); Require(start.has_value(), "Protocol 4 start command required");
+    ExactKeys(*start, {"type", "protocol", "options"});
+    Require((*start)["type"].isStr() && (*start)["type"].get_str() == "start" && ProtocolInteger((*start)["protocol"], 4, 4) == 4, "Protocol 4 start command required");
+    InitializeCrypto();
+    ClaimsService service((*start)["options"], emit);
+    emit(ReadyFrame().write());
+    while (const auto command = ReadFrame(input)) {
+        if ((*command)["type"].isStr() && (*command)["type"].get_str() == "shutdown") { ExactKeys(*command, {"type"}); break; }
+        service.Command(*command);
+    }
+    service.Close();
+    return service.Failed() ? 1 : 0;
+}
+} // namespace claimer

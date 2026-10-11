@@ -12,6 +12,7 @@
     "test": "node --test --test-timeout=60000 test/*.test.mjs",
     "setup:claims": "node scripts/setup-claims.mjs",
     "build:claims": "node scripts/setup-claims.mjs --build",
+    "setup:python-reference": "node scripts/setup-python-reference.mjs",
     "build": "node scripts/build.mjs",
     "test:package": "node scripts/test-package.mjs"
   },

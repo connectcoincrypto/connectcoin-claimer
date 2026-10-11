@@ -9,6 +9,9 @@ import postject from 'postject';
 import { packageTarget } from './package-target.mjs';
 import { signMacOSFrameworks, verifyMacOSPackage } from './macos-package.mjs';
 import { packageEntries } from './package-files.mjs';
+import { validateNativeHelperSecurity } from './helper-security.mjs';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const windows = process.platform === 'win32';
@@ -23,11 +26,15 @@ if (nodeMajor !== 24 || nodeMinor < 19) throw new Error('Build with Node.js 24.1
 const pkg = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'));
 if (!/^\d+\.\d+\.\d+(?:-[a-zA-Z0-9.-]+)?$/.test(pkg.version)) throw new Error('Invalid package version.');
 const packageName = `connectcoin-claimer-${pkg.version}-${platform}-${process.arch}`;
-const dist = join(root, 'dist');
+// A separate output directory lets developers preserve a running extracted
+// package (including its configuration and journal) when testing a new build.
+const dist = process.env.CLAIMER_OUTPUT_DIR ? resolve(process.env.CLAIMER_OUTPUT_DIR) : join(root, 'dist');
 const destination = join(dist, packageName);
-const helperSource = join(root, 'helpers', 'bin', 'connectwallet-claims');
+const helperSource = join(root, 'helpers', 'native-bin', 'connectwallet-claims');
 try { await access(join(helperSource, helperName)); }
 catch { throw new Error('The native claims helper is missing. Run npm run build:claims first.'); }
+validateNativeHelperSecurity((await promisify(execFile)(join(helperSource, helperName), ['--self-test'],
+  { timeout: 30000, windowsHide: true, maxBuffer: 65536 })).stdout);
 
 function run(command, commandArgs, options = {}) {
   return new Promise((accept, reject) => {
@@ -130,20 +137,22 @@ try {
   if (macos) await run('/usr/bin/codesign', ['--force', '--sign', '-', executable]);
   // macOS framework aliases are part of the signed bundle layout. Preserve
   // their relative targets, then validate every link before archiving.
-  await cp(helperSource, join(stage, 'helpers', 'bin', 'connectwallet-claims'), {
-    recursive: true, dereference: !macos, ...(macos ? { verbatimSymlinks: true } : {}),
-  });
+  const helperDestination = join(stage, 'helpers', 'bin', 'connectwallet-claims');
+  await mkdir(helperDestination, { recursive: true });
+  await copyFile(join(helperSource, helperName), join(helperDestination, helperName));
+  await cp(join(helperSource, 'licenses'), join(helperDestination, 'licenses'), { recursive: true });
+  if (!windows) await chmod(join(helperDestination, helperName), 0o755);
   for (const name of ['README.md', 'LICENSE', 'THIRD_PARTY_NOTICES.md', 'PROVENANCE.md']) {
     await copyFile(join(root, name), join(stage, name));
   }
-  for (const name of ['helpers/PROVENANCE.md', 'helpers/p2c_roots_v1.pem', 'helpers/vendor/LICENSE.connectcoin-p2c-tools']) {
+  for (const name of ['native/PROVENANCE.md', 'helpers/p2c_roots_v1.pem', 'helpers/vendor/LICENSE.connectcoin-p2c-tools']) {
     await mkdir(dirname(join(stage, name)), { recursive: true });
     await copyFile(join(root, name), join(stage, name));
   }
   await writeLicenses(stage, result.metafile);
   if (macos) {
-    // PyInstaller signs individual cached binaries before assembling onedir
-    // frameworks. Seal the complete framework resources in their final layout.
+    await run('/usr/bin/codesign', ['--force', '--sign', '-', join(stage, 'helpers', 'bin', 'connectwallet-claims', helperName)]);
+    // Also retain the complete relocatability audit for any bundled frameworks.
     await signMacOSFrameworks(stage);
     await verifyMacOSPackage(stage);
   }

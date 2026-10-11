@@ -59,10 +59,10 @@ function report(callback, event, details) {
 /** Resources must be outside ASAR. An absent helper is explicit, never silently downloaded. */
 export function getClaimsHelper({ basePath = BASE, resourcesPath } = {}) {
   const executable = process.platform === 'win32' ? 'connectwallet-claims.exe' : 'connectwallet-claims';
-  const candidates = [resourcesPath && resolve(resourcesPath, 'claims-helper', executable), resolve(basePath, 'helpers/bin/connectwallet-claims', executable)].filter(Boolean);
-  for (const command of candidates) if (existsSync(command)) return { command, args: [], packaged: true };
-  const command = resolve(basePath, '.claims-venv', process.platform === 'win32' ? 'Scripts/python.exe' : 'bin/python');
-  if (existsSync(command)) return { command, args: ['-I', resolve(basePath, 'helpers/claims_bridge.py')], packaged: false };
+  const candidates = [resourcesPath && resolve(resourcesPath, 'claims-helper', executable), resolve(basePath, 'helpers/native-bin/connectwallet-claims', executable), resolve(basePath, 'helpers/bin/connectwallet-claims', executable)].filter(Boolean);
+  for (const command of candidates) if (existsSync(command)) return { command, args: [], packaged: true, native: true };
+  // The Python implementation remains an explicitly selected test reference,
+  // never an automatic fallback to the old performance characteristics.
   return null;
 }
 
@@ -137,7 +137,7 @@ export function createProofRunner({ helper, basePath = BASE, resourcesPath, spaw
         // or any application-private environment into the network-facing helper.
         // Older helpers reject this unknown suffix before reading input or
         // opening sockets; never retry without the required RSA policy.
-        child = spawnProcess(runtime.command, [...(runtime.args ?? []), '--require-rsa-exponent-64'], { shell: false, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'], env: { ...environment, PYTHONNOUSERSITE: '1', PYTHONUNBUFFERED: '1' } });
+        child = spawnProcess(runtime.command, [...(runtime.args ?? []), '--require-rsa-exponent-64', ...(runtime.native ? ['--require-native-mbedtls'] : [])], { shell: false, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'], env: { ...environment, PYTHONNOUSERSITE: '1', PYTHONUNBUFFERED: '1' } });
         child.once('error', (error) => finish(new Error(`Claims helper could not start: ${error.message}`)));
         child.stdout.on('data', (chunk) => {
           if (failure || settled) return;

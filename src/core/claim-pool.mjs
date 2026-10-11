@@ -34,6 +34,7 @@ export class ConnectionPool {
     this.options = validateConnectionOptions(options);
     const runtime = this.helper ?? getClaimsHelper({ basePath: this.basePath, resourcesPath: this.resourcesPath });
     if (!runtime) throw new Error('Automatic Claims helper is not installed. Run npm run build:claims.');
+    this.requireNative = runtime.native === true;
     this.ready = new Promise((resolve, reject) => { this.readyResolve = resolve; this.readyReject = reject; });
     this.closed = new Promise(resolve => { this.closedResolve = resolve; });
     this.startedAt = performance.now();
@@ -124,7 +125,8 @@ export class ConnectionPool {
   receive(message) {
     if (!message || typeof message !== 'object' || Array.isArray(message)) throw new Error('Malformed claims helper response');
     if (message.type === 'ready') {
-      if (this.started || message.protocol !== 4 || message.roots !== 1 || message.security?.rsaPublicExponentMaxBits !== 64) {
+      if (this.started || message.protocol !== 4 || message.roots !== 1 || message.security?.rsaPublicExponentMaxBits !== 64 ||
+          (this.requireNative && (message.security?.provider !== 'mbedtls' || message.security?.mbedtlsVersion !== '3.6.7'))) {
         throw new Error('Incompatible claims helper: validated observations require protocol 4 and a 64-bit RSA public-exponent limit. Update the app or run npm run build:claims.');
       }
       this.started = true; clearTimeout(this.startTimer);

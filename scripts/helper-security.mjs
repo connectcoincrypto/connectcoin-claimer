@@ -19,3 +19,14 @@ export function validateHelperSecurity(output, expectedVersion) {
   }
   return report.security;
 }
+
+export function validateNativeHelperSecurity(output) {
+  let report;
+  try { report = JSON.parse(output); } catch { /* Reject malformed/extra output. */ }
+  if (report?.type !== 'ready' || report.protocol !== 4 || report.roots !== 1 ||
+      report.security?.provider !== 'mbedtls' || report.security?.mbedtlsVersion !== '3.6.7' ||
+      report.security?.rsaPublicExponentMaxBits !== 64) {
+    throw new Error('Expected the pinned C++/Mbed TLS protocol-4 helper. Run npm run build:claims.');
+  }
+  return report.security;
+}

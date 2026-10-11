@@ -44,6 +44,21 @@ function observation(command, overrides = {}) {
   // Test captures are valid unless explicitly overridden by a validation test.
   return { ...value, validationPassed: value.started && !value.cancelled ? value.captured : null, ...overrides };
 }
+
+test('auto-selected native helpers reject stale Python metadata before any requests', async t => {
+  const { pool, commands } = fixture(t, () => {}, { helper: { command: 'native-helper', args: [], native: true } });
+  await assert.rejects(pool.start({}), /Incompatible claims helper/);
+  assert.deepEqual(commands.map(command => command.type), ['start']);
+});
+
+test('explicit native helper accepts only the pinned Mbed TLS provider', async t => {
+  const { pool, children } = fixture(t, () => {}, { autoReady: false, helper: { command: 'native-helper', args: [], native: true } });
+  const ready = pool.start({});
+  children[0].send({ type: 'ready', protocol: 4, roots: 1,
+    security: { provider: 'mbedtls', mbedtlsVersion: '3.6.7', rsaPublicExponentMaxBits: 64 } });
+  await ready;
+  assert.equal(pool.started, true);
+});
 function complete(command, child, overrides = {}) {
   const value = observation(command, overrides);
   child.send({ type: 'started', id: command.id });

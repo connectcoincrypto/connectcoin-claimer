@@ -1,0 +1,20 @@
+ConnectCoin native claimer uses the following statically linked components:
+
+Mbed TLS 3.6.7, Copyright The Mbed TLS Contributors.
+Apache License 2.0; the full license is included as MbedTLS-LICENSE.
+The supplied sources are pinned by SHA-256 and modified by the adjacent
+ConnectCoin RSA-PSS and root-first X.509 compatibility adapters.
+
+Project Everest / HACL Curve25519 code bundled by Mbed TLS:
+Copyright 2016-2018 INRIA and Microsoft Corporation.
+Apache License 2.0 (MbedTLS-LICENSE).
+
+p256-m bundled by Mbed TLS:
+Copyright The Mbed TLS Contributors. Author: Manuel Pegourie-Gonnard.
+Used under the Apache License 2.0 option (MbedTLS-LICENSE).
+
+UniValue, Copyright 2014 BitPay Inc., Copyright 2015 Bitcoin Core Developers.
+MIT license; see UniValue-COPYING.
+
+ConnectCoin Core parser and cryptographic policy adapters:
+Copyright 2026 The ConnectCoin developers. MIT license; see CORE-LICENSE.

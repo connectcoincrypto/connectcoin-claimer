@@ -27,5 +27,8 @@ Local adaptations:
 The helper executable keeps its internal `connectwallet-claims` name so the
 existing build, isolation, root verification and protocol tests remain aligned.
 Its historical helper documentation refers to the original desktop integration.
+The current runtime helper is C++; see `native/PROVENANCE.md` for the Core
+revision, pinned Mbed TLS source and validation adaptations. Python sources are
+retained only for differential testing, not selected automatically at runtime.
 See `helpers/PROVENANCE.md` for the underlying P2C Tools commit and security
 patches. No other repository is modified by this project.

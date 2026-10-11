@@ -11,6 +11,7 @@ import { CONFIG_TEMPLATE } from '../src/config.mjs';
 import { packageTarget } from './package-target.mjs';
 import { verifyMacOSPackage } from './macos-package.mjs';
 import { packageEntries } from './package-files.mjs';
+import { validateNativeHelperSecurity } from './helper-security.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const windows = process.platform === 'win32';
@@ -107,7 +108,9 @@ try {
   assert.match(await run(executable, ['--help']), /--config/);
   assert.deepEqual(await filesBelow(portable), pristineFiles, '--help/--version must not create any files.');
   const helper = join(portable, helperPath);
-  await run(helper, ['--self-test']);
+  validateNativeHelperSecurity(await run(helper, ['--self-test']));
+  assert.ok(!pristineFiles.some(path => /(?:^|\/)(?:python[^/]*|_internal|\.claims-venv)(?:\/|$)|\.py[co]?$/i.test(path)),
+    'Native packages must not accidentally ship a Python runtime or helper sources.');
   const pool = new ConnectionPool({
     basePath: portable,
     spawnProcess(command, args, options) {

@@ -43,6 +43,7 @@ jobs:
           architecture: ${{ matrix.arch }}
           cache: npm
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        # Test/reference implementation only; not shipped in native packages.
         id: python
         with:
           python-version: '3.13'
@@ -61,13 +62,11 @@ jobs:
         run: |
           echo "MACOSX_DEPLOYMENT_TARGET=15.0" >> "$GITHUB_ENV"
           xcrun --find clang
-          if [[ "${{ matrix.arch }}" == "x64" ]]; then
-            brew list openssl@3 >/dev/null 2>&1 || brew install openssl@3
-            test -f "$(brew --prefix openssl@3)/lib/libssl.a"
-            test -f "$(brew --prefix openssl@3)/lib/libcrypto.a"
-            rustc --version
-            cargo --version
-          fi
+          cmake --version
+      - name: Test historical Python reference
+        run: npm run setup:python-reference
+        env:
+          PYTHON: ${{ steps.python.outputs.python-path }}
       - name: Build and verify the standalone claims helper
         run: npm run build:claims
         env:

@@ -139,14 +139,14 @@ these protections risks duplicate work.
 
 ## Build from source
 
-Requires Node.js **24.19.0 or newer within Node 24**, Python **3.11+**, and the
-native build architecture. Unix archive builds require `zip` and `unzip`.
+Requires Node.js **24.19.0 or newer within Node 24**, CMake **3.22+**, and a
+C++20 compiler for the native build architecture. Unix archive builds require
+`zip` and `unzip`.
 Packaging targets: Windows x64, Linux x64, macOS arm64 and macOS x64. Each CI
 job extracts and tests its native ZIP before uploading it, including executable
-permissions. macOS builds also require Xcode command-line tools. Intel macOS
-builds require Rust/Cargo and static OpenSSL 3 libraries (e.g. Homebrew
-`openssl@3`) to build the pinned cryptography provider without a conflicting
-dynamic OpenSSL dependency. Those are build tools, not end-user requirements.
+permissions. Windows builds require Visual Studio C++ build tools; Linux uses
+GCC or Clang; macOS uses Xcode command-line tools. Python, Rust and a system
+OpenSSL development package are not needed for the C++ helper.
 The packaged Mach-O files are checked for native architecture, valid code
 signatures and library references limited to the package or system libraries.
 
@@ -158,9 +158,13 @@ npm run build -- --archive
 npm run test:package
 ```
 
-`build:claims` installs pinned dependencies in a repository-local `.claims-venv`,
-runs the Python/loopback tests, and builds the native helper. Set `PYTHON` to an
-explicit Python executable if needed. It does not alter global Python packages.
+`build:claims` fetches SHA-256-pinned Mbed TLS sources, builds the C++ helper and
+runs its offline CTest suite before installing it in `helpers/native-bin/`.
+The network/validation workers have no Python interpreter or GIL. The existing
+JavaScript controller retains RPC, priorities, transaction construction and
+the durable submission journal. Set `CLAIMER_BUILD_JOBS` to limit build load.
+`npm run setup:python-reference` separately prepares the historical Python
+implementation for differential tests; normal execution never falls back to it.
 `build` bundles the JS into a Node single executable application (SEA), includes
 the helper and all of its runtime libraries, dependency licenses, and produces
 `dist/` portable ZIP archives with SHA-256 manifests and archive checksums. No
@@ -179,5 +183,6 @@ it **does not publish GitHub Releases automatically**.
 
 MIT licensed. See [PROVENANCE.md](PROVENANCE.md),
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) and
+[native/PROVENANCE.md](native/PROVENANCE.md) and the historical
 [helpers/PROVENANCE.md](helpers/PROVENANCE.md) for pinned upstream sources,
 the root-bundle pin and retained license notices.

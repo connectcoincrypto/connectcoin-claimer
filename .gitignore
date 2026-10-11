@@ -1,6 +1,9 @@
 node_modules/
 .claims-venv/
 helpers/bin/
+helpers/native-bin/
+native/build/
+native/build-*/
 tmp/
 dist/
 __pycache__/

@@ -10,11 +10,14 @@ dependency, and `@scure/base` (MIT). Portable builds include the complete Node.j
 runtime and its dependency license notices. Build tools esbuild and postject
 are used to create the executable; their packages are development dependencies.
 
-The Python helper bundles CPython, cryptography, OpenSSL, cffi and their required
-runtime components. `helpers/collect_licenses.py` collects original licenses and
-an SBOM from the installed, pinned runtime/build dependencies. Portable builds
-include these under the helper's `_internal/licenses/dependencies` directory,
-plus JavaScript and Node licenses under `licenses/`.
+The C++ helper includes MIT-licensed Core adapters and UniValue, plus statically
+linked Mbed TLS 3.6.7 (Apache-2.0 and its retained third-party notices). Native
+dependency licenses are shipped beside the helper under `licenses/`; JavaScript
+and Node licenses are in the package's top-level `licenses/` directory. See
+`native/PROVENANCE.md` for source revisions and archive hashes.
+
+The historical Python helper is retained as test-reference source only. Its
+CPython/cryptography/OpenSSL/cffi dependencies are not part of native packages.
 
 `helpers/p2c_roots_v1.pem` is an immutable Mozilla-derived ConnectCoin consensus
 root bundle. Its original attribution is retained in the file header. It is not
