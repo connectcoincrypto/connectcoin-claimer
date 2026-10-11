@@ -337,7 +337,14 @@ bool IsPublicIp(std::string_view ip)
     if (ip.empty() || ip.size() >= INET6_ADDRSTRLEN || ip.find('\0') != std::string_view::npos || ip.find('%') != std::string_view::npos) return false;
     const std::string text(ip);
     std::array<unsigned char, 16> address{};
-    if (inet_pton(AF_INET, text.c_str(), address.data()) == 1) return PublicV4(address.data());
+    if (inet_pton(AF_INET, text.c_str(), address.data()) == 1) {
+        // Darwin accepts leading-zero IPv4 octets that Python/Linux reject.
+        // Require canonical dotted decimal rather than inheriting OS syntax.
+        std::array<char, INET_ADDRSTRLEN> canonical{};
+        if (!inet_ntop(AF_INET, address.data(), canonical.data(), canonical.size()) ||
+            ip != canonical.data()) return false;
+        return PublicV4(address.data());
+    }
     if (inet_pton(AF_INET6, text.c_str(), address.data()) == 1) return PublicV6(address.data());
     return false;
 }
