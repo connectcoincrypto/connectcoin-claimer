@@ -15,6 +15,7 @@ const MAX_COUNTER = (1n << 64n) - 1n;
 const ATTEMPT_MESSAGES = new Set([
   'TLS capture cancelled', 'TLS connection timed out',
   'TLS capture or proof validation failed', 'Public DNS resolution is required',
+  'Local network endpoint is temporarily unavailable', 'Local IP family is unsupported', 'Local network route is unavailable',
 ]);
 function counter(value) {
   if (typeof value !== 'string' || !/^(0|[1-9][0-9]{0,19})$/.test(value) || BigInt(value) > MAX_COUNTER) throw new Error('Invalid helper connection counter');

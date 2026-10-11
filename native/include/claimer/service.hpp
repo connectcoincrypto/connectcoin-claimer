@@ -14,6 +14,9 @@ struct ServiceDependencies {
     std::function<std::vector<Endpoint>(const std::string&)> resolve;
     std::function<Bytes(const Context&, const Endpoint&, CaptureControl&, const std::function<void()>&)> capture;
     std::function<Verification(const Bytes&, const Context&)> verify;
+    // Monotonic time for temporary local reachability exclusions. Separate from
+    // real socket pacing so offline tests can exercise recovery without sleeps.
+    std::function<double()> reachability_time;
 };
 std::optional<UniValue> ReadFrame(std::istream& input, size_t maximum = 16384);
 void ExactKeys(const UniValue&, std::initializer_list<std::string_view>);

@@ -78,6 +78,42 @@ void NonBlocking(Socket s)
 }
 #endif
 
+bool UnsupportedFamilyError(int error)
+{
+#ifdef _WIN32
+    return error == WSAEAFNOSUPPORT || error == WSAEPFNOSUPPORT ||
+           error == WSAEPROTONOSUPPORT || error == WSAESOCKTNOSUPPORT;
+#else
+    return error == EAFNOSUPPORT || error == EPROTONOSUPPORT
+#ifdef EPFNOSUPPORT
+        || error == EPFNOSUPPORT
+#endif
+#ifdef ESOCKTNOSUPPORT
+        || error == ESOCKTNOSUPPORT
+#endif
+        ;
+#endif
+}
+
+bool UnavailableRouteError(int error)
+{
+#ifdef _WIN32
+    return error == WSAENETUNREACH || error == WSAEHOSTUNREACH || error == WSAENETDOWN;
+#else
+    return error == ENETUNREACH || error == EHOSTUNREACH || error == ENETDOWN;
+#endif
+}
+
+[[noreturn]] void ThrowSocketFailure(int error, bool creating)
+{
+    if (creating && UnsupportedFamilyError(error)) throw LocalEndpointUnavailable(true);
+    if (!creating && UnavailableRouteError(error)) throw LocalEndpointUnavailable(false);
+    // Refusal, reset, timeout, permission and resource exhaustion remain ordinary
+    // failures. EADDRNOTAVAIL can mean ephemeral-port exhaustion on an unbound
+    // TCP socket, not an unusable destination. No route result disables a family.
+    throw std::runtime_error(creating ? "Cannot create capture socket" : "TCP connection failed");
+}
+
 void Check(const CaptureControl& control, Clock::time_point deadline)
 {
     if (control.Cancelled()) throw CaptureCancelled();
@@ -277,7 +313,11 @@ public:
         if (control_.Cancelled()) throw CaptureCancelled();
         if (control_.socket_ != -1) throw std::runtime_error("Capture control already owns a socket");
         fd_ = socket(family, SOCK_STREAM, IPPROTO_TCP);
-        if (fd_ == INVALID_FD) throw std::runtime_error("Cannot create capture socket");
+        if (fd_ == INVALID_FD) {
+            const int error = SocketError();
+            if (control_.Cancelled()) throw CaptureCancelled();
+            ThrowSocketFailure(error, true);
+        }
         try { NonBlocking(fd_); }
         catch (...) { CloseSocket(fd_); fd_ = INVALID_FD; throw; }
         control_.socket_ = static_cast<std::intptr_t>(fd_);
@@ -302,19 +342,27 @@ public:
             if (control_.Cancelled()) throw CaptureCancelled();
             deadline = Clock::now() + timeout;
             result = connect(fd_, reinterpret_cast<const sockaddr*>(&address.value), address.size);
-            if (result != 0 && !RetryError(SocketError())) throw std::runtime_error("TCP connection failed");
+            if (result != 0) {
+                const int error = SocketError();
+                if (control_.Cancelled()) throw CaptureCancelled();
+                if (!RetryError(error)) ThrowSocketFailure(error, false);
+            }
         }
         if (result != 0) {
             Wait(fd_, false, control_, deadline);
             int error{};
 #ifdef _WIN32
             int length = sizeof(error);
-            if (getsockopt(fd_, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&error), &length) != 0 || error != 0)
+            const int status = getsockopt(fd_, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&error), &length);
 #else
             socklen_t length = sizeof(error);
-            if (getsockopt(fd_, SOL_SOCKET, SO_ERROR, &error, &length) != 0 || error != 0)
+            const int status = getsockopt(fd_, SOL_SOCKET, SO_ERROR, &error, &length);
 #endif
-                throw std::runtime_error("TCP connection failed");
+            Check(control_, deadline);
+            // Only classify a successfully read SO_ERROR value, never a failure
+            // of getsockopt itself or a stale thread-local errno/WSA error.
+            if (status != 0) throw std::runtime_error("Cannot inspect TCP connection result");
+            if (error != 0) ThrowSocketFailure(error, false);
         }
         Check(control_, deadline);
         return deadline;
@@ -358,6 +406,11 @@ std::vector<Endpoint> ResolveEndpoints(const std::string& domain, uint16_t port)
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_protocol = IPPROTO_TCP;
     hints.ai_flags = AI_NUMERICSERV;
+#ifdef AI_ADDRCONFIG
+    // This reduces unusable families on hosts without a configured address. It
+    // is not route/reachability proof: e.g. link-local IPv6 may still yield AAAA.
+    hints.ai_flags |= AI_ADDRCONFIG;
+#endif
     addrinfo* raw{};
     if (getaddrinfo(domain.c_str(), "443", &hints, &raw) != 0) throw std::runtime_error("DNS resolution failed");
     std::unique_ptr<addrinfo, decltype(&freeaddrinfo)> addresses(raw, freeaddrinfo);
@@ -493,6 +546,11 @@ Bytes Capture(const Context& context, const Endpoint& endpoint, CaptureControl& 
     return CaptureImpl(context, endpoint, control, on_started, timeout, complete_handshake, false);
 }
 #ifdef CLAIMER_NETWORK_TESTING
+[[noreturn]] void ThrowSocketFailureForTesting(int error, bool creating)
+{
+    ThrowSocketFailure(error, creating);
+}
+
 Bytes CaptureForTesting(const Context& context, const Endpoint& endpoint, CaptureControl& control,
                         const std::function<void()>& on_started, std::chrono::milliseconds timeout, bool complete_handshake)
 {

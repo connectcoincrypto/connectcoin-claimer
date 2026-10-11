@@ -23,6 +23,8 @@ using Clock = std::chrono::steady_clock;
 constexpr uint64_t MAX_ID = (uint64_t{1} << 53) - 1;
 constexpr uint64_t MAX_CONNECTION_LIMIT = 2147483647;
 constexpr size_t MAX_DNS = 4096, MAX_BUDGETS = 1024;
+constexpr size_t MAX_UNREACHABLE_ENDPOINTS = 4096;
+constexpr double REACHABILITY_RECHECK_SECONDS = 60;
 double Now() { return std::chrono::duration<double>(Clock::now().time_since_epoch()).count(); }
 void Require(bool value, const char* message) { if (!value) throw std::invalid_argument(message); }
 void UniqueKeys(const UniValue& value, unsigned depth = 0) {
@@ -41,6 +43,7 @@ uint64_t Decimal(const std::string& text, uint64_t maximum) {
     return value;
 }
 struct BudgetExhausted : std::exception {};
+struct EndpointExcluded : std::exception {};
 struct OutputFailure : std::runtime_error { OutputFailure() : std::runtime_error("Helper output failed") {} };
 struct Score {
     double connections{0.1}, seconds{0.02}, credit{};
@@ -61,6 +64,7 @@ struct Job {
     uint64_t id{};
     bool attempt{}, running{}, started{}, captured{};
     Context context;
+    std::optional<Endpoint> endpoint;
     std::string domain, bounty;
     CaptureControl control;
     double seconds{}, started_at{};
@@ -173,6 +177,8 @@ struct ClaimsService::Impl {
     std::deque<std::shared_ptr<Job>> tls_pending, dns_pending;
     std::unordered_map<std::string, Budget> budgets;
     std::unordered_map<std::string, DnsEntry> dns;
+    std::unordered_map<std::string, double> unavailable_endpoints;
+    std::unordered_map<int, double> unavailable_families;
     std::vector<std::thread> workers;
     size_t tls_workers{}, dns_workers{}, active_tls{}, active_dns{};
     uint64_t last_id{}, touched{};
@@ -188,6 +194,7 @@ struct ClaimsService::Impl {
         if (!deps.resolve) deps.resolve = [](const std::string& domain) { return ResolveEndpoints(domain); };
         if (!deps.capture) deps.capture = [](const Context& context, const Endpoint& endpoint, CaptureControl& control, const std::function<void()>& started) { return Capture(context, endpoint, control, started); };
         if (!deps.verify) deps.verify = [](const Bytes& proof, const Context& context) { return VerifyProof(proof, context); };
+        if (!deps.reachability_time) deps.reachability_time = Now;
     }
     void EmitFrame(const UniValue& value) {
         const auto text = value.write();
@@ -205,8 +212,43 @@ struct ClaimsService::Impl {
         fields.pushKV("successfulConnections", std::to_string(count));
         return fields;
     }
+    bool EndpointAvailableLocked(const Endpoint& endpoint) {
+        const double now = deps.reachability_time();
+        const auto family = unavailable_families.find(endpoint.family);
+        if (family != unavailable_families.end() && family->second > now) return false;
+        const auto address = unavailable_endpoints.find(endpoint.Key());
+        return address == unavailable_endpoints.end() || address->second <= now;
+    }
+    bool HasEndpointLocked(const DnsEntry& entry) {
+        return std::any_of(entry.endpoints.begin(), entry.endpoints.end(),
+                           [&](const auto& item) { return EndpointAvailableLocked(item.endpoint); });
+    }
+    void ExcludeEndpointLocked(const Endpoint& endpoint, bool family_unsupported) {
+        const double now = deps.reachability_time();
+        if (family_unsupported) {
+            // Production resolves only AF_INET/AF_INET6. Still bound injected or
+            // future families rather than allowing an unbounded negative cache.
+            if (!unavailable_families.contains(endpoint.family) && unavailable_families.size() >= 2) {
+                const auto oldest = std::min_element(unavailable_families.begin(), unavailable_families.end(),
+                    [](const auto& a, const auto& b) { return a.second < b.second; });
+                unavailable_families.erase(oldest);
+            }
+            unavailable_families[endpoint.family] = now + REACHABILITY_RECHECK_SECONDS;
+        } else {
+            if (!unavailable_endpoints.contains(endpoint.Key()) && unavailable_endpoints.size() >= MAX_UNREACHABLE_ENDPOINTS) {
+                const auto oldest = std::min_element(unavailable_endpoints.begin(), unavailable_endpoints.end(),
+                    [](const auto& a, const auto& b) { return a.second < b.second; });
+                unavailable_endpoints.erase(oldest);
+            }
+            unavailable_endpoints[endpoint.Key()] = now + REACHABILITY_RECHECK_SECONDS;
+        }
+    }
     void BeforeStartLocked(const std::shared_ptr<Job>& job) {
         if (closed || job->control.Cancelled()) throw CaptureCancelled();
+        // A different worker may have discovered an impossible route after
+        // this job selected its address. Do not spend a TCP turn or extend the
+        // exclusion deadline merely because a queued job observes the cache.
+        if (job->endpoint && !EndpointAvailableLocked(*job->endpoint)) throw EndpointExcluded();
         const auto& budget = budgets.at(job->bounty);
         if (ConnectionBudgetExhausted(budget.target, budget.successes)) throw BudgetExhausted();
     }
@@ -235,10 +277,15 @@ struct ClaimsService::Impl {
         auto& cached = found->second;
         const auto mask = job->context.signature_algorithms_mask;
         std::vector<std::shared_ptr<Score>> scores; std::vector<double> rates;
-        for (auto& item : cached.endpoints) {
+        std::vector<size_t> eligible;
+        for (size_t index = 0; index < cached.endpoints.size(); ++index) {
+            auto& item = cached.endpoints[index];
+            if (!EndpointAvailableLocked(item.endpoint)) continue;
             auto& score = item.scores[mask]; if (!score) score = std::make_shared<Score>();
             scores.push_back(score); rates.push_back(score->Rate());
+            eligible.push_back(index);
         }
+        if (eligible.empty()) throw EndpointExcluded();
         const auto maximum = *std::max_element(rates.begin(), rates.end());
         double total = 0; for (auto& value : rates) { value /= maximum; total += value; }
         const auto count = scores.size();
@@ -250,7 +297,8 @@ struct ClaimsService::Impl {
             if (scores[candidate]->credit > scores[selected]->credit) selected = candidate;
         }
         scores[selected]->credit -= 1; cached.next[mask] = (selected + 1) % count; cached.touched = ++touched;
-        return {cached.endpoints[selected].endpoint, scores[selected]};
+        job->endpoint = cached.endpoints[eligible[selected]].endpoint;
+        return {*job->endpoint, scores[selected]};
     }
     void Resolve(const std::shared_ptr<Job>& job) {
         bool ok = false, cached = false;
@@ -258,7 +306,7 @@ struct ClaimsService::Impl {
             { std::lock_guard lock(mutex);
                 const auto found = dns.find(job->domain);
                 if (found != dns.end() && found->second.expires > Now()) {
-                    cached = true; ok = !found->second.endpoints.empty(); found->second.touched = ++touched;
+                    cached = true; ok = HasEndpointLocked(found->second); found->second.touched = ++touched;
                 }
             }
             if (!cached) {
@@ -273,7 +321,11 @@ struct ClaimsService::Impl {
                     if (previous != dns.end()) for (const auto& old : previous->second.endpoints) if (old.endpoint == endpoint) { item.scores = old.scores; break; }
                     next.endpoints.push_back(std::move(item));
                 }
-                ok = !endpoints.empty(); next.expires = Now() + (ok ? 60.0 : 2.0); next.touched = ++touched;
+                // Keep DNS separate from local reachability. If every address
+                // is excluded, resolve=false engages the controller's existing
+                // two-second retry without repeated DNS or a hot attempt loop.
+                next.expires = Now() + (!endpoints.empty() ? 60.0 : 2.0); next.touched = ++touched;
+                ok = HasEndpointLocked(next);
                 dns[job->domain] = std::move(next);
                 if (dns.size() > MAX_DNS) {
                     const auto oldest = std::min_element(dns.begin(), dns.end(), [](const auto& a, const auto& b) { return a.second.touched < b.second.touched; });
@@ -301,6 +353,14 @@ struct ClaimsService::Impl {
             try { captured = deps.capture(job->context, selected.first, job->control, [&] { Connecting(job); }); job->captured = true; }
             catch (const OutputFailure&) { throw; }
             catch (const CaptureCancelled&) { capture_error = std::current_exception(); }
+            catch (const LocalEndpointUnavailable& error) {
+                if (!job->control.Cancelled()) {
+                    std::lock_guard lock(mutex);
+                    ExcludeEndpointLocked(selected.first, error.family_unsupported);
+                    if (job->started) validated = false;
+                }
+                capture_error = std::current_exception();
+            }
             catch (...) { if (job->started && !job->control.Cancelled()) validated = false; capture_error = std::current_exception(); }
             if (job->started) {
                 const auto elapsed = Now() - job->started_at;
@@ -321,6 +381,10 @@ struct ClaimsService::Impl {
             }
         } catch (const OutputFailure&) { throw; }
         catch (const BudgetExhausted&) { blocked = true; }
+        catch (const EndpointExcluded&) { message = "Local network endpoint is temporarily unavailable"; }
+        catch (const LocalEndpointUnavailable& error) {
+            message = error.family_unsupported ? "Local IP family is unsupported" : "Local network route is unavailable";
+        }
         catch (const CaptureCancelled&) { message = "TLS capture cancelled"; }
         catch (const CaptureTimeout&) { if (validating && !validated) validated = false; message = job->started ? "TLS connection timed out" : "Public DNS resolution is required"; }
         catch (...) { if (validating && !validated) validated = false; message = job->started ? "TLS capture or proof validation failed" : "Public DNS resolution is required"; }

@@ -93,6 +93,14 @@ working directory. Source runs default to `./claimer.conf`.
   still verifying certificate path, domain, signature policy, proof binding and
   target before accepting a winning proof. Uses the pinned consensus roots.
 - Restricts TLS endpoints to public IPs on port 443; does not send HTTP requests.
+- Immediately excludes an endpoint after an explicit OS no-route/network-down
+  error, rather than repeatedly selecting it through the normal success EMA.
+  Only an unsupported socket family excludes that entire IP family. Exclusions
+  last 60 seconds, span domains/signature policies and survive DNS refreshes;
+  queued attempts check them again before TCP starts. All-excluded domains use
+  the existing bounded DNS retry while waiting for connectivity to recover.
+  Timeouts, connection refusal, TLS/certificate errors and local resource
+  exhaustion do not declare an address family unsupported. Validation is unchanged.
 - Discovers up to 600 recent blocks with at most four parallel block reads;
   stages coherent snapshots and replays the bounty journal. Healthy polling
   reuses the cursor and block cache rather than redownloading every block.
@@ -104,7 +112,7 @@ working directory. Source runs default to `./claimer.conf`.
 - Disconnects pause the workers; discovery catches up before resuming. Invalid
   chain identity, malformed snapshots and fatal helper errors stop the client.
 
-Terminal output reports real TCP starts, active started connections, valid and
+Terminal output reports TCP connection attempts, active started connections, valid and
 failed observations, targets reached and accepted submissions. The recent rate
 uses a bounded ten-second window. `accepted` means the RPC acknowledged the
 transaction, **not** that it is confirmed in a block. Duplicate winning proofs

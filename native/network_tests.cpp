@@ -3,6 +3,7 @@
 #ifdef _WIN32
 #include <winsock2.h>
 #else
+#include <cerrno>
 #include <sys/socket.h>
 #endif
 #include <chrono>
@@ -21,8 +22,52 @@ claimer::Context FixtureContext()
 {
     return {"example.com", std::string(64, '1'), 0, std::string(64, 'f'), 1, 7, 1800000000};
 }
+void SocketFailureTests()
+{
+    const auto classified = [](int error, bool creating, int expected) {
+        // -1 means an ordinary error, 0 endpoint-only, 1 unsupported family.
+        int actual{-2};
+        try { claimer::ThrowSocketFailureForTesting(error, creating); }
+        catch (const claimer::LocalEndpointUnavailable& failure) { actual = failure.family_unsupported ? 1 : 0; }
+        catch (const std::runtime_error&) { actual = -1; }
+        Require(actual == expected, "Socket error classified at wrong endpoint/family scope");
+    };
+#ifdef _WIN32
+    const std::vector<int> unsupported{WSAEAFNOSUPPORT, WSAEPFNOSUPPORT, WSAEPROTONOSUPPORT, WSAESOCKTNOSUPPORT};
+    const std::vector<int> route{WSAENETUNREACH, WSAEHOSTUNREACH, WSAENETDOWN};
+    const std::vector<int> ordinary{0, WSAECONNREFUSED, WSAECONNRESET, WSAETIMEDOUT, WSAEMFILE, WSAENOBUFS,
+                                   WSAEACCES, WSAEINVAL, WSAEINTR, WSAEWOULDBLOCK, WSAEINPROGRESS, WSAEALREADY,
+                                   WSAEPROTOTYPE, WSAEADDRINUSE, WSAEADDRNOTAVAIL, WSAENOTSOCK};
+#else
+    const std::vector<int> unsupported{EAFNOSUPPORT, EPROTONOSUPPORT,
+#ifdef EPFNOSUPPORT
+                                       EPFNOSUPPORT,
+#endif
+#ifdef ESOCKTNOSUPPORT
+                                       ESOCKTNOSUPPORT,
+#endif
+    };
+    const std::vector<int> route{ENETUNREACH, EHOSTUNREACH, ENETDOWN};
+    const std::vector<int> ordinary{0, ECONNREFUSED, ECONNRESET, ETIMEDOUT, EMFILE, ENFILE, ENOBUFS, ENOMEM,
+                                   EACCES, EPERM, EINVAL, EINTR, EAGAIN, EWOULDBLOCK, EINPROGRESS, EALREADY,
+                                   EPROTOTYPE, EADDRINUSE, EADDRNOTAVAIL, ENOTSOCK};
+#endif
+    for (int error : unsupported) {
+        classified(error, true, 1);
+        classified(error, false, -1); // A connect error is not socket-family proof.
+    }
+    for (int error : route) {
+        classified(error, false, 0);
+        classified(error, true, -1); // Route scope only comes from connect/SO_ERROR.
+    }
+    for (int error : ordinary) {
+        classified(error, true, -1);
+        classified(error, false, -1);
+    }
+}
 void PolicyTests()
 {
+    SocketFailureTests();
     for (const char* ip : {"8.8.8.8", "1.1.1.1", "9.9.9.9", "192.0.0.9", "192.0.0.10", "192.0.1.1",
                           "100.63.255.255", "100.128.0.0", "172.15.255.255", "172.32.0.0",
                           "2001:4860:4860::8888", "2606:4700:4700::1111", "2001:1::1", "2001:1::2",

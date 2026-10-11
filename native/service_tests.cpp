@@ -37,6 +37,7 @@ struct Fixture {
         if (overrides.resolve) deps.resolve = overrides.resolve;
         if (overrides.capture) deps.capture = overrides.capture;
         if (overrides.verify) deps.verify = overrides.verify;
+        if (overrides.reachability_time) deps.reachability_time = overrides.reachability_time;
         UniValue options(UniValue::VOBJ); options.pushKV("connectionsPerSecond", 100000); options.pushKV("concurrency", static_cast<uint64_t>(concurrency));
         service = std::make_unique<ClaimsService>(options, [this](const std::string& text) { UniValue frame; Check(frame.read(text), "Output is JSON"); { std::lock_guard lock(mutex); frames.push_back(std::move(frame)); } condition.notify_all(); }, deps);
     }
@@ -140,8 +141,110 @@ void OutputFailureStopsBeforeTcp() {
     for (int i = 0; i < 1000 && !service.Failed(); ++i) std::this_thread::sleep_for(1ms);
     Check(service.Failed() && tcp == 0, "Failed start acknowledgement must prevent TCP and fail helper"); service.Close();
 }
+void UnreachableEndpointIsExcludedAcrossMasksAndDomains() {
+    std::atomic<int> bad{}, good{};
+    ServiceDependencies deps;
+    deps.capture = [&](const Context&, const Endpoint& endpoint, CaptureControl&, const std::function<void()>& started) -> Bytes {
+        started();
+        if (endpoint.ip == "8.8.8.8") { ++bad; throw LocalEndpointUnavailable(false); }
+        ++good; return Bytes{2, 1};
+    };
+    Fixture fixture(1, deps); fixture.Ready(); fixture.service->Command(Attempt(2));
+    const auto failed = fixture.Wait("attempt", 2);
+    Check(failed["started"].isTrue() && failed["validationPassed"].isFalse() && failed["captured"].isFalse(), "Actual unreachable TCP remains a failed attempt");
+    Check(failed["successfulConnections"].get_str() == "0", "Unreachable route spends no successful capture budget");
+    for (uint64_t id = 3; id < 10; ++id) {
+        fixture.service->Command(Attempt(id, ContextFor(id % 2 ? 6 : 7)));
+        Check(fixture.Wait("attempt", id)["validationPassed"].isTrue(), "Another address in the same family must stay available");
+    }
+    fixture.service->Command(Resolve(10, "other.example")); Check(fixture.Wait("resolved", 10)["ok"].isTrue(), "Other domain has a usable endpoint");
+    auto context = ContextFor(); context.domain = "other.example";
+    for (uint64_t id = 11; id < 15; ++id) { fixture.service->Command(Attempt(id, context)); Check(fixture.Wait("attempt", id)["validationPassed"].isTrue(), "Exclusion survives domain changes"); }
+    Check(bad == 1 && good == 11 && fixture.verifications == 11, "Impossible IP excluded immediately; all good captures still verified");
+}
+void UnsupportedFamilyAndTimedRecovery() {
+    std::atomic<int> unavailable{};
+    std::atomic<double> now{100};
+    std::atomic<bool> supported{false};
+    ServiceDependencies deps;
+    deps.reachability_time = [&] { return now.load(); };
+    deps.resolve = [](const std::string& domain) { return std::vector<Endpoint>{{domain == "example.com" ? "2001:4860:4860::8888" : "2606:4700:4700::1111", 10, 443}}; };
+    deps.capture = [&](const Context&, const Endpoint&, CaptureControl&, const std::function<void()>& started) -> Bytes {
+        if (!supported) { ++unavailable; throw LocalEndpointUnavailable(true); }
+        started(); return Bytes{2, 1};
+    };
+    Fixture fixture(1, deps); fixture.Ready(); fixture.service->Command(Attempt(2));
+    const auto failed = fixture.Wait("attempt", 2);
+    Check(failed["started"].isFalse() && failed["validationPassed"].isNull(), "Unsupported socket family spends no TCP counter");
+    now = 159;
+    fixture.service->Command(Attempt(3)); Check(fixture.Wait("attempt", 3)["started"].isFalse(), "Cached exclusion prevents capture");
+    fixture.service->Command(Resolve(4)); Check(fixture.Wait("resolved", 4)["ok"].isFalse(), "All excluded tells controller to back off, not spin");
+    fixture.service->Command(Resolve(5, "other.example")); Check(fixture.Wait("resolved", 5)["ok"].isFalse(), "Unsupported family blocked across new DNS addresses");
+    Check(unavailable == 1, "Cached exclusions do not invoke capture or renew deadline");
+    supported = true; now = 160;
+    fixture.service->Command(Resolve(6)); Check(fixture.Wait("resolved", 6)["ok"].isTrue(), "Family re-enabled exactly at the monotonic deadline");
+    fixture.service->Command(Attempt(7)); Check(fixture.Wait("attempt", 7)["validationPassed"].isTrue(), "Recovered family must capture and fully verify");
+    Check(fixture.verifications == 1, "Recovery retains proof validation");
+}
+void RouteRecoveryAndOrdinaryFailures() {
+    std::atomic<double> now{10}; std::atomic<bool> reachable{false}; std::atomic<int> captures{};
+    ServiceDependencies deps;
+    deps.reachability_time = [&] { return now.load(); };
+    deps.resolve = [](const std::string&) { return std::vector<Endpoint>{{"8.8.8.8", 2, 443}}; };
+    deps.capture = [&](const Context&, const Endpoint&, CaptureControl&, const std::function<void()>& started) -> Bytes {
+        ++captures; started(); if (!reachable) throw LocalEndpointUnavailable(false); return Bytes{2, 1};
+    };
+    Fixture fixture(1, deps); fixture.Ready(); fixture.service->Command(Attempt(2)); fixture.Wait("attempt", 2);
+    now = 69; fixture.service->Command(Resolve(3)); Check(fixture.Wait("resolved", 3)["ok"].isFalse(), "Single unreachable endpoint excluded");
+    fixture.service->Command(Attempt(4)); const auto blocked = fixture.Wait("attempt", 4);
+    Check(blocked["started"].isFalse() && blocked["validationPassed"].isNull() && captures == 1, "Exclusion itself is not another failure or TCP attempt");
+    now = 70; reachable = true;
+    fixture.service->Command(Resolve(5)); Check(fixture.Wait("resolved", 5)["ok"].isTrue(), "Route exclusion expires without new DNS");
+    fixture.service->Command(Attempt(6)); Check(fixture.Wait("attempt", 6)["validationPassed"].isTrue() && captures == 2, "Recovered IP is probed again");
+    deps.capture = [&](const Context&, const Endpoint&, CaptureControl&, const std::function<void()>& started) -> Bytes { ++captures; started(); throw CaptureTimeout(); };
+    Fixture ordinary(1, deps); ordinary.Ready();
+    for (uint64_t id = 2; id < 6; ++id) { ordinary.service->Command(Attempt(id)); Check(ordinary.Wait("attempt", id)["started"].isTrue(), "Timeout does not declare a family or route impossible"); }
+    Check(captures == 6, "Normal transient failures keep ordinary selection policy");
+}
+void QueuedEndpointRecheckedAndCancellationDoesNotExclude() {
+    std::mutex gate; std::condition_variable cv;
+    int entered = 0; bool first_done = false;
+    std::atomic<int> starts{};
+    ServiceDependencies deps;
+    deps.resolve = [](const std::string&) { return std::vector<Endpoint>{{"8.8.8.8", 2, 443}}; };
+    deps.capture = [&](const Context&, const Endpoint&, CaptureControl&, const std::function<void()>& started) -> Bytes {
+        std::unique_lock lock(gate); const int order = ++entered; cv.notify_all();
+        if (order == 1) { Check(cv.wait_for(lock, 2s, [&] { return entered == 2; }), "Second worker did not select endpoint"); lock.unlock(); started(); ++starts; throw LocalEndpointUnavailable(false); }
+        Check(cv.wait_for(lock, 2s, [&] { return first_done; }), "First route failure not recorded"); lock.unlock();
+        started(); ++starts; return Bytes{2, 1};
+    };
+    Fixture fixture(2, deps); fixture.Ready(); fixture.service->Command(Attempt(2)); fixture.service->Command(Attempt(3));
+    // IDs need not enter the fake capture in dispatch order.
+    for (int i = 0; i < 2000; ++i) {
+        bool terminal = false;
+        { std::lock_guard lock(fixture.mutex); terminal = std::any_of(fixture.frames.begin(), fixture.frames.end(), [](const auto& frame) { return frame["type"].get_str() == "attempt"; }); }
+        if (terminal) break;
+        std::this_thread::sleep_for(1ms);
+    }
+    { std::lock_guard lock(gate); first_done = true; } cv.notify_all();
+    const auto a = fixture.Wait("attempt", 2), b = fixture.Wait("attempt", 3);
+    Check(starts == 1 && a["started"].isTrue() != b["started"].isTrue(), "Already-selected queued worker must not open excluded endpoint");
+    Check(fixture.verifications == 0, "No imaginary proof validation for skipped capture");
+
+    std::atomic<bool> cancel_entered{false}; std::atomic<int> attempts{};
+    deps.capture = [&](const Context&, const Endpoint&, CaptureControl& control, const std::function<void()>& started) -> Bytes {
+        if (++attempts == 1) { cancel_entered = true; while (!control.Cancelled()) std::this_thread::sleep_for(1ms); throw LocalEndpointUnavailable(true); }
+        started(); return Bytes{2, 1};
+    };
+    Fixture cancelled(1, deps); cancelled.Ready(); cancelled.service->Command(Attempt(2));
+    for (int i = 0; i < 2000 && !cancel_entered; ++i) std::this_thread::sleep_for(1ms);
+    Check(cancel_entered, "Cancellation capture did not enter"); cancelled.service->Command(Cancel(2));
+    Check(cancelled.Wait("attempt", 2)["cancelled"].isTrue(), "Cancellation reported");
+    cancelled.service->Command(Resolve(3)); Check(cancelled.Wait("resolved", 3)["ok"].isTrue(), "Cancelled failure does not poison family availability");
+    cancelled.service->Command(Attempt(4)); Check(cancelled.Wait("attempt", 4)["validationPassed"].isTrue(), "Capture after cancellation remains usable");
+}
 } // namespace
 int main() {
-    try { Parsing(); BudgetAndPacing(); SuccessfulAndMissedProof(); FailuresAndDnsCache(); CancelQueuedAndActive(); CancelWhileVerifying(); BudgetAcrossRequestsAndIds(); OutputFailureStopsBeforeTcp(); std::cout << "8 offline service test groups passed\n"; return 0; }
+    try { Parsing(); BudgetAndPacing(); SuccessfulAndMissedProof(); FailuresAndDnsCache(); CancelQueuedAndActive(); CancelWhileVerifying(); BudgetAcrossRequestsAndIds(); OutputFailureStopsBeforeTcp(); UnreachableEndpointIsExcludedAcrossMasksAndDomains(); UnsupportedFamilyAndTimedRecovery(); RouteRecoveryAndOrdinaryFailures(); QueuedEndpointRecheckedAndCancellationDoesNotExclude(); std::cout << "12 offline service test groups passed\n"; return 0; }
     catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }

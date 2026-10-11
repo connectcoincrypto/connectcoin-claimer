@@ -21,6 +21,16 @@ struct Endpoint {
 };
 struct CaptureCancelled : std::runtime_error { CaptureCancelled() : std::runtime_error("TLS capture cancelled") {} };
 struct CaptureTimeout : std::runtime_error { CaptureTimeout() : std::runtime_error("TLS connection timed out") {} };
+// A local socket/route limitation, not a remote TLS/proof validation failure.
+// Only socket creation can establish family-wide lack of support. A connect
+// route failure is endpoint-specific even when another address shares its family.
+class LocalEndpointUnavailable : public std::runtime_error {
+public:
+    bool family_unsupported;
+    explicit LocalEndpointUnavailable(bool family)
+        : std::runtime_error(family ? "Local socket family unavailable" : "Local endpoint route unavailable"),
+          family_unsupported(family) {}
+};
 class SocketLease;
 class CaptureControl {
 public:
@@ -50,6 +60,9 @@ Bytes Capture(const Context& context, const Endpoint& endpoint, CaptureControl& 
               std::chrono::milliseconds timeout = std::chrono::seconds{10},
               bool complete_handshake = false);
 #ifdef CLAIMER_NETWORK_TESTING
+// Hermetic OS-error classification seam; never creates a socket or sends bytes.
+// The boolean distinguishes socket creation from connect/SO_ERROR failures.
+[[noreturn]] void ThrowSocketFailureForTesting(int error, bool creating);
 // Available only in the separately compiled offline-fixture target, never in
 // connectcoin-claims. This entry point only permits literal loopback addresses.
 Bytes CaptureForTesting(const Context& context, const Endpoint& endpoint, CaptureControl& control,
