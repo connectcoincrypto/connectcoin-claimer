@@ -110,9 +110,15 @@ working directory. Source runs default to `./claimer.conf`.
   a final pre-write check also fences broadcasts queued behind RPC quotas.
   Known spent/reorganized outpoints are cancelled individually. Normal window
   aging does not discard already-started captures or their verified winners.
+- Preparation is limited to four concurrent jobs. Parked candidates become
+  eligible again whenever preparation capacity is available, through the same
+  priority scheduler and retry deadlines. Removing or aging out an awakened
+  candidate cannot strand the remaining queue.
 - Uses one RPC connection, polling every five seconds, with conservative client
   quotas: 48 ordinary calls/minute/method, eight calls/minute/block for bounty
-  streams, and at most four submissions in flight. These are separate from the
+  streams, at most four normal submissions in flight, and one serial recovery
+  operation (which can retransmit one saved claim). Recovery shares the same
+  RPC quotas and twelve-request global capacity. These are separate from the
   TCP/TLS connection settings. Server limits/cooldowns are also respected;
   other clients sharing your IP consume the same server quotas.
 - Disconnects pause the workers; discovery catches up before resuming. Invalid

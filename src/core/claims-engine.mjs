@@ -430,6 +430,7 @@ export class ClaimsEngine {
       await this.poolReady;
     } else await this.poolReady;
     if (!this.enabled || this.paused || generation !== this.generation) return;
+    this.refreshPreparationReadiness();
     this.retrySubmissions(generation);
     for (let checked = 0; checked < this.maxQueue + 8; checked++) {
       // At least two pending starts let one slow admission be bypassed. The
@@ -508,7 +509,6 @@ export class ClaimsEngine {
       job.preparing = false; job.prepareController = null; this.preparing.delete(job); this.controllers.delete(controller);
       if (this.queue.get(key) === job && this.ready(job) && this.attemptable(job)) this.scheduler.setReady(key, true, { due: this.jobDue(job) });
       else this.scheduler.remove(key);
-      this.releasePreparationSlot();
     });
     void this.track(job, task);
   }
@@ -681,12 +681,19 @@ export class ClaimsEngine {
     }
     return due;
   }
-  releasePreparationSlot() {
+  refreshPreparationReadiness() {
+    if (this.preparing.size >= 4) return;
+    // A free slot is capacity, not a reservation for one particular waiter.
+    // That waiter can be removed/retired before preparation ever starts, so
+    // completion-only, wake-one notifications can strand the rest forever.
+    // Re-admit all parked candidates to the priority scheduler when capacity
+    // exists; pump still enforces four preparations, original due times and
+    // capture capacity. Empty waiter sets make normal connection pumps O(1).
     for (const job of this.waitingPrepare) {
       this.waitingPrepare.delete(job); job.waitingPrepare = false;
       const key = keyOf(job.bounty);
-      if (this.queue.get(key) !== job || !this.ready(job)) continue;
-      if (this.scheduler.setReady(key, true, { due: this.jobDue(job) }) && this.jobDue(job) <= Date.now()) break;
+      if (this.queue.get(key) !== job) continue;
+      this.scheduler.setReady(key, this.ready(job) && this.attemptable(job), { due: this.jobDue(job) });
     }
   }
   releaseDnsSlot() {
