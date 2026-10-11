@@ -29,7 +29,7 @@
 #endif
 #include <windows.h>
 #include <bcrypt.h>
-#elif defined(__linux__)
+#elif defined(__linux__) || defined(__APPLE__)
 #include <sys/random.h>
 #else
 #include <unistd.h>

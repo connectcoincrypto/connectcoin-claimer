@@ -41,7 +41,11 @@ file(SHA256 "${CMAKE_CURRENT_SOURCE_DIR}/../helpers/p2c_roots_v1.pem" root_hash)
 if(NOT root_hash STREQUAL "f66dff1bdf8f96060b8177976f8b7d9254bc89bc4db933d769f7384d28480bc9")
   message(FATAL_ERROR "Immutable P2C v1 root bundle hash mismatch")
 endif()
-file(READ "${CMAKE_CURRENT_SOURCE_DIR}/../helpers/p2c_roots_v1.pem" CLAIMER_ROOT_PEM)
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/../helpers/p2c_roots_v1.pem" CLAIMER_ROOT_HEX HEX)
+# MSVC 2022 cannot compile the complete PEM as one string literal. Preserve
+# every pinned input byte in an ordinary array, plus the PEM parser's NUL.
+string(REGEX REPLACE "(................................)" "\\1\n" CLAIMER_ROOT_HEX "${CLAIMER_ROOT_HEX}")
+string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," CLAIMER_ROOT_BYTES "${CLAIMER_ROOT_HEX}")
 configure_file(roots.hpp.in generated/roots.hpp @ONLY)
 add_library(claimer_crypto STATIC crypto.cpp)
 target_include_directories(claimer_crypto PUBLIC include PRIVATE vendor/mbedtls-adapters "${CMAKE_CURRENT_BINARY_DIR}/generated")

@@ -1,3 +1,3 @@
 // Generated from the byte-pinned public root bundle. No OS roots are used.
 #pragma once
-inline constexpr char CLAIMER_ROOTS_V1[] = R"P2CROOT(@CLAIMER_ROOT_PEM@)P2CROOT";
+inline constexpr unsigned char CLAIMER_ROOTS_V1[] = {@CLAIMER_ROOT_BYTES@0};
