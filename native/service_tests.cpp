@@ -80,10 +80,40 @@ public:
     }
     void Close() { { std::lock_guard lock(mutex_); closed_ = true; } condition_.notify_all(); }
 };
-struct CloseInput {
+struct CloseAndJoinInput {
     InteractiveInput& input;
-    ~CloseInput() { input.Close(); }
+    std::thread& consumer;
+    ~CloseAndJoinInput() {
+        // Closing first wakes a reader blocked between frames. Join before
+        // stream/fixture destruction, including when a test assertion throws.
+        input.Close();
+        if (consumer.joinable()) consumer.join();
+    }
 };
+void InteractiveInputUnwind() {
+    InteractiveInput buffer; std::istream stream(&buffer);
+    std::atomic<bool> entered{}, exited{};
+    std::exception_ptr failure;
+    bool unwound = false;
+    try {
+        std::thread consumer([&] {
+            entered = true;
+            try { ProtocolFrameReader reader(stream); Check(!reader.Next(), "Unwind must close the empty input"); }
+            catch (...) { failure = std::current_exception(); }
+            exited = true;
+        });
+        CloseAndJoinInput close{buffer, consumer};
+        for (int i = 0; i < 3000 && !entered; ++i) std::this_thread::sleep_for(1ms);
+        Check(entered, "Interactive unwind reader did not start");
+        Check(!exited, "Reader must wait while the empty input remains open");
+        throw std::runtime_error("Controlled interactive input unwind");
+    } catch (const std::runtime_error& error) {
+        unwound = std::string(error.what()) == "Controlled interactive input unwind";
+        if (!unwound) throw;
+    }
+    Check(unwound && exited, "Input guard must join its consumer during exception unwinding");
+    if (failure) std::rethrow_exception(failure);
+}
 void Parsing() {
     for (const auto& value : {"{\"a\":1,\"a\":2}\n", "{\"x\":{\"a\":1,\"a\":2}}\n", "{\"x\":NaN}\n", "{}", "[1,]\n"}) {
         Rejects([&] { std::istringstream input(value); ReadFrame(input); });
@@ -131,11 +161,11 @@ void InteractiveFrameCancellation() {
     };
     Fixture fixture(1, deps); fixture.Ready();
     InteractiveInput buffer; std::istream stream(&buffer); std::exception_ptr failure;
-    std::jthread consumer([&] {
+    std::thread consumer([&] {
         try { ProtocolFrameReader reader(stream); while (auto command = reader.Next()) fixture.service->Command(*command); }
         catch (...) { failure = std::current_exception(); }
     });
-    CloseInput close{buffer};
+    CloseAndJoinInput close{buffer, consumer};
     const auto attempt = Attempt(2).write();
     buffer.Push(attempt.substr(0, attempt.size() / 2));
     buffer.Push(attempt.substr(attempt.size() / 2) + "\n");
@@ -489,6 +519,6 @@ void QueuedEndpointRecheckedAndCancellationDoesNotExclude() {
 }
 } // namespace
 int main() {
-    try { Parsing(); BufferedFrameBoundaries(); InteractiveFrameCancellation(); NativePreparedContextReuse(); BudgetAndPacing(); PrecomputedBudgetBoundaries(); SuccessfulAndMissedProof(); ConcurrentCaptureSnapshotsRemainImmutable(); FailuresAndDnsCache(); CancelQueuedAndActive(); CancelWhileVerifying(); BudgetAcrossRequestsAndIds(); BudgetCountsInvalidCapturesAndMonotonicReports(); EndpointSelectionBoundAndRoundRobin(); OutputFailureStopsBeforeTcp(); UnreachableEndpointIsExcludedAcrossMasksAndDomains(); UnsupportedFamilyAndTimedRecovery(); RouteRecoveryAndOrdinaryFailures(); QueuedEndpointRecheckedAndCancellationDoesNotExclude(); std::cout << "19 offline service test groups passed\n"; return 0; }
+    try { Parsing(); BufferedFrameBoundaries(); InteractiveInputUnwind(); InteractiveFrameCancellation(); NativePreparedContextReuse(); BudgetAndPacing(); PrecomputedBudgetBoundaries(); SuccessfulAndMissedProof(); ConcurrentCaptureSnapshotsRemainImmutable(); FailuresAndDnsCache(); CancelQueuedAndActive(); CancelWhileVerifying(); BudgetAcrossRequestsAndIds(); BudgetCountsInvalidCapturesAndMonotonicReports(); EndpointSelectionBoundAndRoundRobin(); OutputFailureStopsBeforeTcp(); UnreachableEndpointIsExcludedAcrossMasksAndDomains(); UnsupportedFamilyAndTimedRecovery(); RouteRecoveryAndOrdinaryFailures(); QueuedEndpointRecheckedAndCancellationDoesNotExclude(); std::cout << "20 offline service test groups passed\n"; return 0; }
     catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }
