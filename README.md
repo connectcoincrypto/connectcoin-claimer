@@ -62,7 +62,7 @@ fee_rate=1500
 - `min_connects_per_connection_second`: minimum estimated **net atomic connects
   earned per second of connection effort**, not a minimum number of connections.
   Default `1000`; `0` disables this economic floor. Uses work probability,
-  payout after fee, and the domain/signature-policy recent valid-proof/time ratio.
+  payout after fee, and the domain/signature-policy smoothed recent valid-proof/time ratio.
 - `rpc_host`, `rpc_port`: the public plaintext TCP JSON-RPC endpoint, **not**
   Core's administrative HTTP RPC. No RPC username/password is needed. Mainnet
   identity/genesis are checked; another network is rejected.
@@ -146,8 +146,15 @@ bandwidth and CPU; a configured rate does not guarantee earnings.
 
 Each tracked domain/signature policy and native DNS endpoint/signature policy keeps
 up to **60 one-minute buckets**: concluded observations, locally validated proofs
-and total TCP/TLS duration. The estimated rate is valid proofs divided by that
-duration, not connections divided by wall-clock time. Failed conclusive attempts
+and total TCP/TLS duration. The estimated rate includes a fixed smoothing base:
+
+`rate = (5 + valid proofs in the window) / (1 + total TCP/TLS seconds in the window)`
+
+The base is **5 virtual successes and 1 second**, applied once at score lookup,
+not once per observation or per bucket. It never appears in real attempt/proof
+counters, successful-capture budgets or claims. This is a fixed-window ratio with
+a smoothing base, not an exponential moving average or a wall-clock start rate.
+Failed conclusive attempts
 contribute time but no valid proof; cancellation without a validation result is
 not an observation. All certificate and proof validations still run.
 
@@ -157,11 +164,13 @@ completion, not exactly 3,600 seconds later. A monotonic clock advances buckets
 on both observation and score lookup, including when an endpoint is idle. The
 usual update does not scan past connections or allocate a per-connection record.
 
-Only an entirely unobserved policy has the initial 5/s estimate. Once an observed
-history expires, it does **not** become optimistically healthy again. The existing
-economic recovery probes (one per minute per policy) and native 1% endpoint
-exploration allow new measurements; a fresh conclusive observation supplies a
-new measured rate. The native 99% performance / 1% rotation weighting is unchanged.
+An empty, expired or evicted history has the same base estimate of **5/s**. One
+failed attempt lasting 1 second changes an otherwise empty history to **2.5/s**,
+not zero; one lasting 0.2 seconds gives approximately **4.167/s**. The base does
+not expire, accumulate on reads or create imaginary valid proofs. Repeated
+failures can still bring expected return below the configured economic floor;
+the existing one-per-minute recovery probes remain applicable in that case.
+The native 99% performance / 1% rotation weighting is unchanged.
 
 The numeric buckets occupy 1,440 bytes per allocated history, plus metadata.
 Native endpoint histories are allocated lazily and bounded to 8,192 histories

@@ -2,6 +2,7 @@
 import { performance } from 'node:perf_hooks';
 import { P2CDomainStats } from '../src/core/claim-priority.mjs';
 
+// Historical benchmark reference only; these constants do not configure production.
 class PreviousEma {
   connections = 0.1; totalTime = 0.02; completed = 0;
   record(valid, seconds) {

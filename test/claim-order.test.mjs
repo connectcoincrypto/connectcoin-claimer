@@ -78,13 +78,13 @@ test('raw expected return floor is inclusive and independent of random factor', 
   for (const rate of [NaN, Infinity, -Infinity, -1, 0]) assert.equal(isWorthAttempting(SPACE, rate), false);
 });
 
-test('domain statistics replace the unobserved prior with all recent conclusive observations', () => {
+test('domain statistics smooth all recent conclusive observations without changing raw totals', () => {
   const stats = new P2CDomainStats();
   assert.equal(stats.connectionRate(), 5);
   assert.equal(stats.connections, 0); assert.equal(stats.totalTime, 0);
   stats.record(true, 0.2); stats.record(false, 0.8);
   assert.equal(stats.connections, 1); assert.equal(stats.totalTime, 1);
-  assert.equal(stats.connectionRate(), 1);
+  assert.equal(stats.connectionRate(), 3);
   const before = stats.snapshot();
   for (const seconds of [-1, NaN, Infinity, -Infinity]) stats.record(true, seconds);
   for (const success of [0, 1, null, undefined, 'true']) stats.record(success, 0.1);
@@ -92,23 +92,26 @@ test('domain statistics replace the unobserved prior with all recent conclusive 
   assert.equal(stats.completed, 2);
 });
 
-test('all failures remain below the profitability floor and later valid observations can recover', () => {
-  const stats = new P2CDomainStats(), priority = claimPriority(MAX_TARGET, 1000000n);
+test('sustained failures cross the profitability floor and later valid observations can recover', () => {
+  const stats = new P2CDomainStats(), priority = claimPriority(MAX_TARGET, 100000n);
+  let previousRate = stats.connectionRate();
   for (let n = 1; n <= 20000; n++) {
     stats.record(false, 0.1);
-    assert.equal(stats.connectionRate(), Number.MIN_VALUE);
+    const rate = stats.connectionRate();
+    assert.ok(rate > 0 && rate < previousRate);
+    previousRate = rate;
   }
   assert.equal(stats.completed, 20000);
   assert.equal(isWorthAttempting(priority, stats.connectionRate()), false);
   for (let n = 0; n < 20000; n++) stats.record(true, 0.1);
-  assert.ok(Math.abs(stats.connectionRate() - 5) < 1e-9, 'successes and failures both contribute TCP/TLS effort');
+  assert.ok(Math.abs(stats.connectionRate() - 20005 / 4001) < 1e-9, 'successes and failures both contribute TCP/TLS effort, with one fixed prior');
   assert.equal(isWorthAttempting(priority, stats.connectionRate()), true);
 });
 
 test('failed domain history survives catalog refresh and admits only a delayed recovery probe without restoring the prior', t => {
   const { engine, starts } = fixture(t);
-  const failed = bounty(1, '1000000', 0, { domain: 'failed.example' });
-  const fresh = bounty(2, '1000000', 0, { domain: 'fresh.example' });
+  const failed = bounty(1, '100000', 0, { domain: 'failed.example' });
+  const fresh = bounty(2, '100000', 0, { domain: 'fresh.example' });
   engine.enqueue([failed, fresh]);
   const job = engine.queue.get(key(failed));
   for (let i = 0; i < 20000; i++) {
@@ -532,7 +535,7 @@ test('a real failed TLS capture consumes exactly one turn at its TCP start', asy
   assert.equal(assignments, 1); assert.equal(engine.preferReward, true);
   assert.equal(engine.scheduler.domainAfter, 'example.com');
   assert.equal(engine.domainStats.get('example.com:7').completed, 1);
-  assert.equal(engine.domainStats.get('example.com:7').connectionRate(), Number.MIN_VALUE);
+  assert.equal(engine.domainStats.get('example.com:7').connectionRate(), 5 / 1.1);
 });
 
 test('a verified proof from an injected runner without progress still consumes exactly one turn', async t => {

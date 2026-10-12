@@ -16,6 +16,18 @@ struct PerformanceTotals {
     double seconds{};
 };
 
+inline constexpr double PERFORMANCE_BASE_VALID = 5.0;
+inline constexpr double PERFORMANCE_BASE_SECONDS = 1.0;
+
+// Apply the prior once to the window totals, never to each sample or bucket.
+// Adding one to a finite nonnegative duration cannot overflow a double: at
+// that magnitude its representable spacing is already much larger than one.
+inline double SmoothedPerformanceRate(const PerformanceTotals& totals) {
+    const auto rate = (PERFORMANCE_BASE_VALID + static_cast<double>(totals.valid)) /
+                      (PERFORMANCE_BASE_SECONDS + totals.seconds);
+    return std::clamp(rate, std::numeric_limits<double>::denorm_min(), std::numeric_limits<double>::max());
+}
+
 // Completion-time buckets: the current minute and the preceding 59 minutes.
 // Ordinary samples/readers touch one bucket; elapsed empty minutes are removed
 // once, and a gap of an hour clears a fixed-size array, never per-connection data.
@@ -73,15 +85,14 @@ struct EndpointPerformanceScore {
     double credit{};
 private:
     friend class EndpointPerformanceCache;
-    bool observed_{};
     std::unique_ptr<MinutePerformanceWindow> window_;
     PerformanceScoreList::iterator position_;
 };
 
 // DNS entries and running jobs own scores independently of their histories.
 // Keep at most 8192 lazy windows (~12 MiB), not 4096 domains * 32 IPs * 7 masks.
-// Eviction/expiration retains the observed bit and rotation credit, never any
-// optimistic prior, and is unrelated to claim counters and bounty budgets.
+// Eviction/expiration retains rotation credit and restores the same 5/1 prior
+// as a fresh history. Claim counters and bounty budgets are entirely separate.
 class EndpointPerformanceCache {
     const size_t maximum_;
     PerformanceScoreList recent_;
@@ -113,11 +124,7 @@ public:
     size_t Size() const { return recent_.size(); }
     double Rate(const std::shared_ptr<EndpointPerformanceScore>& score, double now) {
         const auto minute = Advance(now);
-        if (!score->window_) return score->observed_ ? std::numeric_limits<double>::denorm_min() : 5.0;
-        const auto totals = score->window_->ReadMinute(minute);
-        if (!totals.attempts || !totals.valid) return std::numeric_limits<double>::denorm_min();
-        if (totals.seconds == 0) return std::numeric_limits<double>::max();
-        return std::clamp(totals.valid / totals.seconds, std::numeric_limits<double>::denorm_min(), std::numeric_limits<double>::max());
+        return SmoothedPerformanceRate(score->window_ ? score->window_->ReadMinute(minute) : PerformanceTotals{});
     }
     bool Record(const std::shared_ptr<EndpointPerformanceScore>& score, bool valid, double seconds, double now) {
         if (!std::isfinite(seconds) || seconds < 0) return false;
@@ -129,7 +136,6 @@ public:
             score->window_ = std::move(window);
         }
         if (!score->window_->RecordMinute(valid, seconds, minute)) return false;
-        score->observed_ = true;
         recent_.splice(recent_.end(), recent_, score->position_);
         return true;
     }

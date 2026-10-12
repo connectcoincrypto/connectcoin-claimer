@@ -6,6 +6,7 @@
 #include <vector>
 
 using namespace claimer;
+// Historical benchmark reference only; these constants do not configure production.
 struct PreviousEma {
     double valid{0.1}, seconds{0.02};
     void Record(bool success, double elapsed) { valid = 0.999 * valid + 0.001 * success; seconds = 0.999 * seconds + 0.001 * elapsed; }

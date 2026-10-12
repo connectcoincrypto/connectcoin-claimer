@@ -557,34 +557,56 @@ void PerformanceMinuteBoundariesAndGaps() {
     const auto small_remaining = precision.Read(3600);
     Check(small_remaining.attempts == 1 && small_remaining.seconds == 0.125, "Expiring large totals cannot erase smaller retained sample duration");
 }
-void PerformanceCacheBoundsAndConservativeExpiry() {
+void PerformancePriorAndFiniteRates() {
+    MinutePerformanceWindow window;
+    Check(SmoothedPerformanceRate(window.Read(0)) == 5, "Empty history starts at five valid connections per second");
+    Check(window.Record(false, 1, 0), "First one-second failure recorded");
+    Check(SmoothedPerformanceRate(window.Read(0)) == 2.5, "One failure softens the rate rather than zeroing it");
+    Check(window.Record(true, 0.25, 60), "Mixed successful observation recorded");
+    auto totals = window.Read(60);
+    Check(totals.attempts == 2 && totals.valid == 1 && totals.seconds == 1.25, "Buckets contain only real observations, not repeated priors");
+    Check(SmoothedPerformanceRate(totals) == 6.0 / 2.25, "One base is added to the combined window totals");
+    Check(SmoothedPerformanceRate(window.Read(3600)) == 6.0 / 1.25, "Expiry removes only the old observation, not part of the base");
+    Check(SmoothedPerformanceRate(window.Read(3660)) == 5, "Fully expired history returns exactly to five");
+    Check(SmoothedPerformanceRate({1, 0, 0.2}) == 5.0 / 1.2, "Short first failure remains close to the prior");
+    Check(SmoothedPerformanceRate({1, 0, 0}) == 5, "Zero-time failure leaves the base rate unchanged");
+    Check(SmoothedPerformanceRate({1, 1, 0}) == 6, "Zero-time success increments only the numerator");
+    Check(SmoothedPerformanceRate({UINT64_MAX, UINT64_MAX, 0}) > 0 && std::isfinite(SmoothedPerformanceRate({UINT64_MAX, UINT64_MAX, 0})), "Maximum valid count does not wrap the base or produce infinity");
+    const auto extreme = SmoothedPerformanceRate({1, 0, std::numeric_limits<double>::max()});
+    Check(extreme > 0 && std::isfinite(extreme), "Largest finite elapsed time preserves a finite positive prior");
+    EndpointPerformanceCache cache;
+    const auto failed = std::make_shared<EndpointPerformanceScore>();
+    for (int i = 0; i < 100; ++i) Check(cache.Record(failed, false, 2, i), "Repeated failed observations remain measurable");
+    Check(cache.Rate(failed, 100) == 5.0 / 201, "Sustained failures lower the score without multiplying the base per sample");
+    Check(cache.Record(failed, true, 0.125, 100) && cache.Rate(failed, 100) == 6.0 / 201.125, "A valid observation improves a failure-heavy score without discarding history");
+}
+void PerformanceCacheBoundsAndSmoothedExpiry() {
     EndpointPerformanceCache cache(2);
     const auto a = std::make_shared<EndpointPerformanceScore>(), b = std::make_shared<EndpointPerformanceScore>(), c = std::make_shared<EndpointPerformanceScore>();
-    const auto minimum = std::numeric_limits<double>::denorm_min();
     Check(cache.Rate(a, 0) == 5 && cache.Size() == 0, "Never observed prior allocates no history");
     a->credit = 0.375;
-    Check(cache.Record(a, true, 0.5, 0) && cache.Rate(a, 0) == 2, "Fresh ratio uses actual conclusive sample");
-    Check(cache.Record(b, false, 1, 1) && cache.Rate(b, 1) == minimum, "Failed validation counts as time without a valid proof");
+    Check(cache.Record(a, true, 0.5, 0) && cache.Rate(a, 0) == 4, "Fresh ratio combines actual conclusive sample with one prior");
+    Check(cache.Record(b, false, 1, 1) && cache.Rate(b, 1) == 2.5, "Failed validation adds time without erasing the valid-connection prior");
     Check(cache.Record(a, true, 0.5, 2), "Conclusive observation updates LRU order");
     Check(cache.Record(c, true, 0, 3), "Third score evicts oldest history at cap");
-    Check(cache.Size() == 2 && cache.Rate(b, 3) == minimum && cache.Rate(a, 3) == 2, "Eviction retains observed state, no optimistic reset");
-    Check(cache.Rate(c, 3) == std::numeric_limits<double>::max(), "Zero-time valid sample remains finite maximum");
-    Check(cache.Rate(a, 3600) == minimum && cache.Size() == 0 && a->credit == 0.375, "Expiry frees histories without resetting rotation credit");
-    Check(cache.Rate(a, 0) == minimum, "Backwards cache clock does not restore prior");
-    Check(cache.Record(a, true, 0.25, 0) && cache.Rate(a, 3600) == 4, "Fresh recovery observation can replace expired history");
-    Check(cache.Rate(a, 7199.999) == 4 && cache.Rate(a, 7200) == minimum, "Backwards record honors clamped current cache minute");
+    Check(cache.Size() == 2 && cache.Rate(b, 3) == 5 && cache.Rate(a, 3) == 3.5, "Eviction restores prior while retained histories still share a single base");
+    Check(cache.Rate(c, 3) == 6, "Zero-time valid sample adds one to the finite base");
+    Check(cache.Rate(a, 3600) == 5 && cache.Size() == 0 && a->credit == 0.375, "Expiry frees histories without resetting rotation credit");
+    Check(cache.Rate(a, 0) == 5, "Backwards cache clock cannot resurrect expired samples");
+    Check(cache.Record(a, true, 0.25, 0) && cache.Rate(a, 3600) == 4.8, "Fresh recovery observation combines with the permanent base");
+    Check(cache.Rate(a, 7199.999) == 4.8 && cache.Rate(a, 7200) == 5, "Backwards record honors clamped current cache minute");
     Check(!cache.Record(b, true, NAN, 7200) && cache.Size() == 0, "Invalid sample does not allocate a history");
     std::vector<std::shared_ptr<EndpointPerformanceScore>> held;
     for (int i = 0; i < 10000; ++i) {
         held.push_back(std::make_shared<EndpointPerformanceScore>());
         Check(cache.Record(held.back(), true, 1, 7200) && cache.Size() <= 2, "Even running jobs holding old scores cannot exceed cache bound");
     }
-    Check(cache.Rate(held.front(), 7200) == minimum && cache.Rate(held.back(), 7200) == 1, "Evicted active-job score remains safe to read");
+    Check(cache.Rate(held.front(), 7200) == 5 && cache.Rate(held.back(), 7200) == 3, "Evicted active-job score remains safe to read");
     Check(cache.Record(held.front(), false, 1, 7200) && cache.Size() == 2, "Previously evicted score can record without stale iterator use");
-    Check(cache.Rate(held.back(), 10800) == minimum && cache.Size() == 0, "Bulk stale cleanup is bounded and frees all histories");
+    Check(cache.Rate(held.back(), 10800) == 5 && cache.Size() == 0, "Bulk stale cleanup is bounded and frees all histories");
     auto survivor = std::make_shared<EndpointPerformanceScore>();
     { EndpointPerformanceCache temporary; temporary.Record(survivor, true, 1, 0); }
-    Check(cache.Rate(survivor, 10800) == minimum && cache.Record(survivor, true, 0.5, 10800), "Cache destruction leaves externally held scores safely reusable");
+    Check(cache.Rate(survivor, 10800) == 5 && cache.Record(survivor, true, 0.5, 10800), "Cache destruction leaves externally held scores safely reusable");
 }
 void PerformanceSurvivesSameIpDnsRefreshAndKeepsBudgets() {
     std::atomic<double> dns_now{0}, performance_now{0};
@@ -593,22 +615,36 @@ void PerformanceSurvivesSameIpDnsRefreshAndKeepsBudgets() {
     deps.dns_time = [&] { return dns_now.load(); };
     deps.performance_time = [&] { return performance_now.load(); };
     deps.capture = [&](const Context&, const Endpoint& endpoint, CaptureControl&, const std::function<void()>& started) -> Bytes {
-        if (endpoint.ip == "8.8.8.8") { ++bad; started(); throw CaptureTimeout(); }
+        if (endpoint.ip == "8.8.8.8") {
+            if (++bad == 1) { started(); std::this_thread::sleep_for(1s); throw CaptureTimeout(); }
+            throw CaptureCancelled(); // Preserve the one measured failure for selection/expiry checks.
+        }
         ++good; throw CaptureCancelled(); // Unknown score, no fabricated validation result.
     };
     Fixture fixture(1, deps); fixture.Ready();
+    double failure_seconds = 0;
     for (uint64_t id = 2; id < 52; ++id) {
         fixture.service->Command(Attempt(id));
-        Check(fixture.Wait("attempt", id)["successfulConnections"].get_str() == "0", "Failed/inconclusive attempt does not reset or fabricate capture budget");
+        const auto frame = fixture.Wait("attempt", id);
+        Check(frame["successfulConnections"].get_str() == "0", "Failed/inconclusive attempt does not reset or fabricate capture budget");
+        if (id == 2) {
+            Check(frame["started"].isTrue() && frame["validationPassed"].isFalse(), "Actual first timeout is a failed observation, not a fabricated valid proof");
+            failure_seconds = frame["seconds"].get_real();
+        }
     }
-    Check(bad == 1 && good == 49, "Observed failing endpoint loses performance share, with exploration retained");
+    // A busy test host can oversleep. Derive the expected 99/1 weighted share
+    // from the actual measured timeout instead of assuming sleep_for took 1 s.
+    const auto failed_share = 0.005 + 0.99 / (2 + failure_seconds);
+    Check(std::abs(bad - (1 + 49 * failed_share)) <= 2 && good > bad, "One timeout keeps its smoothed share, not merely the one-percent exploration share");
     const auto previous_good = good.load();
     dns_now = 60;
     fixture.service->Command(Resolve(52)); Check(fixture.Wait("resolved", 52)["ok"].isTrue() && fixture.resolutions == 2, "DNS refreshed on exact deadline");
     for (uint64_t id = 53; id < 103; ++id) { fixture.service->Command(Attempt(id)); fixture.Wait("attempt", id); }
-    Check(good - previous_good >= 49, "Same-IP refresh preserves failure window and 99/1 selection credit");
+    Check(std::abs((good - previous_good) - 50 * (1 - failed_share)) <= 2, "Same-IP refresh preserves smoothed failure window and 99/1 selection credit");
     performance_now = 3600;
-    for (uint64_t id = 103; id < 113; ++id) { fixture.service->Command(Attempt(id)); fixture.Wait("attempt", id); }
+    const auto before_expiry_bad = bad.load(), before_expiry_good = good.load();
+    for (uint64_t id = 103; id < 123; ++id) { fixture.service->Command(Attempt(id)); fixture.Wait("attempt", id); }
+    Check(std::abs((bad - before_expiry_bad) - (good - before_expiry_good)) <= 2, "Expired histories share the same prior again without losing rotation credit");
     Check(fixture.verifications == 0, "Performance expiration never fabricates validation or proof");
 
     ServiceDependencies success;
@@ -617,12 +653,13 @@ void PerformanceSurvivesSameIpDnsRefreshAndKeepsBudgets() {
     auto context = ContextFor(); context.connection_work_target = std::string(64, 'f');
     budget.service->Command(Attempt(2, context, "2"));
     Check(budget.Wait("attempt", 2)["successfulConnections"].get_str() == "3", "Successful capture consumes final bounty slot");
+    Check(budget.verifications == 1, "Smoothing does not bypass successful proof verification");
     performance_now = 100000;
     budget.service->Command(Attempt(3, context)); const auto blocked = budget.Wait("attempt", 3);
     Check(blocked["blocked"].get_str() == "budget" && blocked["successfulConnections"].get_str() == "3" && blocked["started"].isFalse(), "Expired IP window cannot reopen bounty budget or erase lifetime counter");
 }
 } // namespace
 int main() {
-    try { Parsing(); BufferedFrameBoundaries(); InteractiveInputUnwind(); InteractiveFrameCancellation(); NativePreparedContextReuse(); BudgetAndPacing(); PrecomputedBudgetBoundaries(); SuccessfulAndMissedProof(); ConcurrentCaptureSnapshotsRemainImmutable(); FailuresAndDnsCache(); CancelQueuedAndActive(); CancelWhileVerifying(); BudgetAcrossRequestsAndIds(); BudgetCountsInvalidCapturesAndMonotonicReports(); EndpointSelectionBoundAndRoundRobin(); OutputFailureStopsBeforeTcp(); UnreachableEndpointIsExcludedAcrossMasksAndDomains(); UnsupportedFamilyAndTimedRecovery(); RouteRecoveryAndOrdinaryFailures(); QueuedEndpointRecheckedAndCancellationDoesNotExclude(); PerformanceMinuteBoundariesAndGaps(); PerformanceCacheBoundsAndConservativeExpiry(); PerformanceSurvivesSameIpDnsRefreshAndKeepsBudgets(); std::cout << "23 offline service test groups passed\n"; return 0; }
+    try { Parsing(); BufferedFrameBoundaries(); InteractiveInputUnwind(); InteractiveFrameCancellation(); NativePreparedContextReuse(); BudgetAndPacing(); PrecomputedBudgetBoundaries(); SuccessfulAndMissedProof(); ConcurrentCaptureSnapshotsRemainImmutable(); FailuresAndDnsCache(); CancelQueuedAndActive(); CancelWhileVerifying(); BudgetAcrossRequestsAndIds(); BudgetCountsInvalidCapturesAndMonotonicReports(); EndpointSelectionBoundAndRoundRobin(); OutputFailureStopsBeforeTcp(); UnreachableEndpointIsExcludedAcrossMasksAndDomains(); UnsupportedFamilyAndTimedRecovery(); RouteRecoveryAndOrdinaryFailures(); QueuedEndpointRecheckedAndCancellationDoesNotExclude(); PerformanceMinuteBoundariesAndGaps(); PerformancePriorAndFiniteRates(); PerformanceCacheBoundsAndSmoothedExpiry(); PerformanceSurvivesSameIpDnsRefreshAndKeepsBudgets(); std::cout << "24 offline service test groups passed\n"; return 0; }
     catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }

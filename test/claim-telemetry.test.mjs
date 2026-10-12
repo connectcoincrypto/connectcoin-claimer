@@ -16,10 +16,9 @@ const progress = (completed, recent, extra = {}) => ({ type: 'progress', attempt
   elapsed: 1, attemptStats: { validation: 'certificate-proof-v1', completed, recent }, ...extra });
 // Aggregate the observed minute independently of the production ring buffer.
 function expectedRate(samples) {
-  if (!samples.length) return 5;
   const success = samples.filter(sample => sample[0]).length;
   const seconds = samples.reduce((sum, sample) => sum + sample[1], 0);
-  return success ? Math.max(Number.MIN_VALUE, Math.min(Number.MAX_VALUE, success / seconds)) : Number.MIN_VALUE;
+  return (5 + success) / (1 + seconds);
 }
 function assertRate(stats, samples) {
   const expected = expectedRate(samples);

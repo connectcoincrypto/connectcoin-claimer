@@ -4,6 +4,9 @@ export const PRIORITY_FACTOR_MAX = 1_100_000;
 export const MIN_EXPECTED_RETURN = 1000; // connects / second of TCP/TLS effort
 const MAX_MONEY = 1_000_000_000_000_000_000n;
 const HASH_SPACE = 2 ** 256;
+// A permanent smoothing prior, separate from actual observations and counters.
+const PERFORMANCE_PRIOR_CONNECTIONS = 5;
+const PERFORMANCE_PRIOR_SECONDS = 1;
 
 export const MAX_P2C_SUCCESSFUL_CONNECTIONS = (1n << 64n) - 1n;
 
@@ -120,13 +123,12 @@ export class P2CDomainStats {
   }
   connectionRate() {
     this.#advance();
-    // The prior belongs only to an unobserved policy. An expired history is
-    // unknown, not recovered: existing bounded recovery probes obtain new data.
-    if (this.completed === 0) return 5;
-    if (this.connections === 0) return Number.MIN_VALUE;
+    // Apply the same prior once to every estimate, including an empty or expired
+    // window. Never insert synthetic successes or time into the raw buckets.
     // Preserve a positive, finite rate even at the limits of IEEE doubles.
     // These representational bounds are not a scheduling/profitability floor.
-    return Math.max(Number.MIN_VALUE, Math.min(Number.MAX_VALUE, this.connections / this.totalTime));
+    return Math.max(Number.MIN_VALUE, Math.min(Number.MAX_VALUE,
+      (PERFORMANCE_PRIOR_CONNECTIONS + this.connections) / (PERFORMANCE_PRIOR_SECONDS + this.totalTime)));
   }
   snapshot() {
     this.#advance();
