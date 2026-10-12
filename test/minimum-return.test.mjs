@@ -97,7 +97,7 @@ for (const [threshold, amount] of [[0, 1], [600, 150], [1000, 200], [3000, 600]]
   });
 }
 
-test('EMA decline uses custom recovery threshold for admission and scheduler rebuild', () => {
+test('recent performance uses custom recovery threshold for admission and scheduler rebuild', () => {
   const stats = new P2CDomainStats();
   const custom = createEngine({ minExpectedReturn: 600 });
   const normal = createEngine();
@@ -121,7 +121,7 @@ test('EMA decline uses custom recovery threshold for admission and scheduler reb
   fresh.domainStats.set('example.com:7', stats);
   assert.equal(fresh.enqueue([row(150)]), 1, 'recovery admission applies the custom prior threshold');
   assert.equal(normal.enqueue([row(150)]), 0, 'instances retain independent return floors');
-  for (let i = 0; i < 100; i++) stats.record(true, 0.01);
+  for (let i = 0; i < 200; i++) stats.record(true, 0.01);
   assert.ok(stats.connectionRate() > 4);
   custom.rebuild();
   assert.equal(selected.recoveryProbe, false);

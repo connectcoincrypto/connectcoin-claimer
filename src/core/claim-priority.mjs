@@ -47,7 +47,7 @@ export function domainPriority(priority, rate, scale = 1) {
   for (let shift = 320n; shift >= 0n; shift -= 32n) numerator = numerator * 4294967296 + Number((priority >> shift) & 0xffffffffn);
   const expected = numerator / HASH_SPACE;
   const score = expected * rate / scale;
-  // EMA rates have no fixed maximum. Avoid poisoning scheduler ordering with
+  // Measured rates have no fixed maximum. Avoid poisoning scheduler ordering with
   // infinity after an extreme run of zero-duration captures. Divide first on
   // overflow so a finite scaled result is not needlessly saturated.
   return score === Infinity ? Math.min(Number.MAX_VALUE, (expected / scale) * rate) : score;
@@ -72,23 +72,65 @@ export function compareClaimPriority(a, b) {
 }
 
 export class P2CDomainStats {
-  constructor() {
-    this.connections = 0.1;
-    this.totalTime = 0.02;
+  #counts = new Float64Array(60);
+  #valid = new Float64Array(60);
+  #seconds = new Float64Array(60);
+  #minute = null;
+  #now;
+  constructor({ now = () => performance.now() } = {}) {
+    if (typeof now !== 'function') throw new Error('Performance clock must be a function');
+    this.#now = now;
+    this.attempts = 0;
+    this.connections = 0;
+    this.totalTime = 0;
     this.completed = 0;
+  }
+  #advance() {
+    const time = this.#now();
+    // Production uses a monotonic clock. A faulty/backwards injected reading
+    // must not resurrect expired buckets or move new samples into the past.
+    const current = Number.isFinite(time) ? Math.floor(Math.max(0, Math.min(Number.MAX_SAFE_INTEGER, time)) / 60000) : this.#minute ?? 0;
+    const minute = Math.max(current, this.#minute ?? current);
+    if (this.#minute === null) this.#minute = minute;
+    if (minute === this.#minute) return minute % 60;
+    if (minute - this.#minute >= 60) {
+      this.#counts.fill(0); this.#valid.fill(0); this.#seconds.fill(0);
+    } else for (let cursor = this.#minute + 1; cursor <= minute; cursor++) {
+      const index = cursor % 60;
+      this.#counts[index] = 0; this.#valid[index] = 0; this.#seconds[index] = 0;
+    }
+    // At most once per minute, rebuild totals instead of accumulating floating
+    // point subtraction drift. The per-connection hot path does not scan buckets.
+    this.attempts = 0; this.connections = 0; this.totalTime = 0;
+    for (let index = 0; index < 60; index++) {
+      this.attempts += this.#counts[index]; this.connections += this.#valid[index];
+      this.totalTime = Math.min(Number.MAX_VALUE, this.totalTime + this.#seconds[index]);
+    }
+    this.#minute = minute;
+    return minute % 60;
   }
   record(success, seconds) {
     if (typeof success !== 'boolean' || !Number.isFinite(seconds) || seconds < 0) return;
-    // Only the initial observation supplies the 5/s prior; it decays along
-    // with the entire history rather than being added back on every query.
-    this.connections = 0.999 * this.connections + 0.001 * Number(success);
-    this.totalTime = 0.999 * this.totalTime + 0.001 * seconds;
+    const index = this.#advance();
+    this.#counts[index]++; this.attempts++;
+    this.#valid[index] += Number(success); this.connections += Number(success);
+    this.#seconds[index] = Math.min(Number.MAX_VALUE, this.#seconds[index] + seconds);
+    this.totalTime = Math.min(Number.MAX_VALUE, this.totalTime + seconds);
     this.completed = Math.min(Number.MAX_SAFE_INTEGER, this.completed + 1);
   }
   connectionRate() {
+    this.#advance();
+    // The prior belongs only to an unobserved policy. An expired history is
+    // unknown, not recovered: existing bounded recovery probes obtain new data.
+    if (this.completed === 0) return 5;
+    if (this.connections === 0) return Number.MIN_VALUE;
     // Preserve a positive, finite rate even at the limits of IEEE doubles.
     // These representational bounds are not a scheduling/profitability floor.
     return Math.max(Number.MIN_VALUE, Math.min(Number.MAX_VALUE, this.connections / this.totalTime));
+  }
+  snapshot() {
+    this.#advance();
+    return { attempts: this.attempts, connections: this.connections, totalTime: this.totalTime, completed: this.completed };
   }
 }
 

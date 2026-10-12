@@ -14,16 +14,12 @@ const bounty = (vout = 0, extra = {}) => ({ txid: '02'.repeat(32), vout, amount:
   root_certificates_version: 1, signature_algorithms_mask: 7, ...extra });
 const progress = (completed, recent, extra = {}) => ({ type: 'progress', attempts: completed,
   elapsed: 1, attemptStats: { validation: 'certificate-proof-v1', completed, recent }, ...extra });
-// Closed-form weighted sum, independent of the production accumulator updates.
+// Aggregate the observed minute independently of the production ring buffer.
 function expectedRate(samples) {
-  const priorWeight = 0.999 ** samples.length;
-  let success = 0.1 * priorWeight, seconds = 0.02 * priorWeight;
-  for (let index = 0; index < samples.length; index++) {
-    const weight = 0.001 * 0.999 ** (samples.length - index - 1);
-    success += Number(samples[index][0]) * weight;
-    seconds += samples[index][1] * weight;
-  }
-  return success / seconds;
+  if (!samples.length) return 5;
+  const success = samples.filter(sample => sample[0]).length;
+  const seconds = samples.reduce((sum, sample) => sum + sample[1], 0);
+  return success ? Math.max(Number.MIN_VALUE, Math.min(Number.MAX_VALUE, success / seconds)) : Number.MIN_VALUE;
 }
 function assertRate(stats, samples) {
   const expected = expectedRate(samples);
@@ -89,7 +85,7 @@ test('TLS helper forwards valid cumulative completion snapshots, including zero 
   assert.deepEqual(observed.map(value => value.attemptStats), messages.map(value => value.attemptStats));
 });
 
-test('legacy proof generation accepts high-rate bounded progress without importing incomplete EMA history', async () => {
+test('legacy proof generation accepts high-rate bounded progress without importing incomplete performance history', async () => {
   const messages = [progress(1, [[true, 0.1]]), progress(150, Array(100).fill([false, 0.1]))];
   const observed = [];
   assert.equal(await runner(messages)(context, { onProgress: value => observed.push(value) }), '020100');
@@ -140,7 +136,7 @@ test('duplicate cumulative snapshots count each completed connection once and ne
   assertRate(stats, samples);
 });
 
-test('a telemetry gap larger than the window fails before changing the EMA', t => {
+test('a telemetry gap larger than the transport snapshot fails before changing performance history', t => {
   const engine = engineFixture(t), job = engine.queue.get(bounty().txid + ':0');
   engine.recordAttemptStats(job, { validation: 'certificate-proof-v1', completed: 1, recent: [[false, 300]] }, 0);
   const samples = Array.from({ length: 100 }, (_, index) => [index % 2 === 0, index / 1000]);
@@ -176,14 +172,14 @@ test('coalesced protocol-4 output records all validated outcomes in terminal ord
   // Real pipe chunks may contain many complete frames. All observations arrive
   // together, followed by verification results in a different completion order.
   write(captures.flatMap(frame => [{ type: 'started', id: frame.id }, frame]));
-  assert.equal(engine.domainStats.has('example.com:7'), false, 'capture alone must not improve the EMA');
+  assert.equal(engine.domainStats.has('example.com:7'), false, 'capture alone must not improve performance history');
   const terminals = captures.map((frame, index) => ({ ...frame, type: 'attempt', proof: null, verified: false, validationPassed: samples[index][0] }));
   write(terminals.reverse());
   await Promise.all(pending);
   const stats = engine.domainStats.get('example.com:7'), completionOrder = [...samples].reverse();
   assertRate(stats, completionOrder);
   assert.equal(stats.completed, 180);
-  assert.notEqual(stats.connectionRate(), expectedRate(completionOrder.slice(-100)), 'older observations still influence the EMA');
+  assert.notEqual(stats.connectionRate(), expectedRate(completionOrder.slice(-100)), 'all observations in the minute influence the window');
   assert.equal(engine.domainStats.has('example.com:1'), false);
   assert.equal(engine.successCounts.get(`${bounty().txid}:0`), 2n);
   write([captures[0]]);
@@ -191,7 +187,7 @@ test('coalesced protocol-4 output records all validated outcomes in terminal ord
   assertRate(stats, completionOrder);
 });
 
-test('EMA distinguishes invalid proofs from valid target misses and excludes unfinished validation cancellation', t => {
+test('performance history distinguishes invalid proofs from valid target misses and excludes unfinished validation cancellation', t => {
   const engine = engineFixture(t), job = engine.queue.get(bounty().txid + ':0');
   const observe = value => {
     const request = { job, observed: false }, result = { started: true, ...value };

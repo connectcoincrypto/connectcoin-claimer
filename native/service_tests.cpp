@@ -1,5 +1,6 @@
 // Offline protocol/lifecycle regression tests. No DNS or sockets are used.
 #include <claimer/service.hpp>
+#include <claimer/performance_window.hpp>
 #include <mbedtls/bignum.h>
 #include <algorithm>
 #include <array>
@@ -41,6 +42,8 @@ struct Fixture {
         if (overrides.capture) deps.capture = overrides.capture;
         if (overrides.verify) deps.verify = overrides.verify;
         if (overrides.reachability_time) deps.reachability_time = overrides.reachability_time;
+        if (overrides.performance_time) deps.performance_time = overrides.performance_time;
+        if (overrides.dns_time) deps.dns_time = overrides.dns_time;
         UniValue options(UniValue::VOBJ); options.pushKV("connectionsPerSecond", 100000); options.pushKV("concurrency", static_cast<uint64_t>(concurrency));
         service = std::make_unique<ClaimsService>(options, [this](const std::string& text) { UniValue frame; Check(frame.read(text), "Output is JSON"); { std::lock_guard lock(mutex); frames.push_back(std::move(frame)); } condition.notify_all(); }, deps);
     }
@@ -387,7 +390,7 @@ void EndpointSelectionBoundAndRoundRobin() {
         for (size_t i = 1; i <= 40; ++i) endpoints.push_back({"8.8.8." + std::to_string(i), 2, 443});
         return endpoints;
     };
-    // An inconclusive cancellation does not change the EMA, leaving equal
+    // An inconclusive cancellation does not change performance, leaving equal
     // credits so the fixed-size selection storage can be checked exactly.
     deps.capture = [&](const Context&, const Endpoint& endpoint, CaptureControl&, const std::function<void()>&) -> Bytes {
         { std::lock_guard lock(mutex); seen.push_back(endpoint.ip); }
@@ -517,8 +520,109 @@ void QueuedEndpointRecheckedAndCancellationDoesNotExclude() {
     cancelled.service->Command(Resolve(3)); Check(cancelled.Wait("resolved", 3)["ok"].isTrue(), "Cancelled failure does not poison family availability");
     cancelled.service->Command(Attempt(4)); Check(cancelled.Wait("attempt", 4)["validationPassed"].isTrue(), "Capture after cancellation remains usable");
 }
+void PerformanceMinuteBoundariesAndGaps() {
+    MinutePerformanceWindow window;
+    Check(window.Record(true, 0.25, 59.999), "Record first bucket");
+    Check(window.Record(false, 0.75, 60), "Record next minute failure");
+    auto totals = window.Read(3599.999);
+    Check(totals.attempts == 2 && totals.valid == 1 && totals.seconds == 1, "Current plus previous 59 minutes retained");
+    totals = window.Read(3600);
+    Check(totals.attempts == 1 && totals.valid == 0 && totals.seconds == 0.75, "Old minute expires on read, not just a new connection");
+    totals = window.Read(0);
+    Check(totals.attempts == 1 && totals.seconds == 0.75, "Backwards clock cannot resurrect expired bucket");
+    Check(window.Record(true, 0.125, 120), "Backwards record assigned to latest minute");
+    totals = window.Read(3660);
+    Check(totals.attempts == 1 && totals.valid == 1 && totals.seconds == 0.125, "Backwards record remains in current minute");
+    totals = window.Read(7200);
+    Check(!totals.attempts && !totals.valid && totals.seconds == 0, "Hour gap clears all samples exactly");
+    Check(window.Record(true, 0, 7200), "Zero measured elapsed time is a valid observation");
+    Check(window.Record(false, 2, 10800), "Record also expires old samples");
+    totals = window.Read(10800);
+    Check(totals.attempts == 1 && !totals.valid && totals.seconds == 2, "Record-after-gap keeps only fresh failure");
+    Check(!window.Record(true, -1, 10800) && !window.Record(true, INFINITY, 10800) && !window.Record(true, NAN, 10800), "Invalid durations do not become samples");
+    totals = window.Read(10800);
+    Check(totals.attempts == 1 && totals.seconds == 2, "Rejected observations leave totals unchanged");
+    Rejects([&] { window.Read(NAN); }); Rejects([&] { window.Read(-1); });
+    Rejects([&] { window.Read(INFINITY); }); Rejects([&] { window.Read(1e300); });
+    MinutePerformanceWindow ring;
+    for (int64_t minute = 0; minute < 6000; ++minute) {
+        Check(ring.Record(minute % 2 == 0, 0.125, minute * 60.0), "Many bounded rotations recorded");
+        const auto count = static_cast<uint64_t>(std::min<int64_t>(minute + 1, 60));
+        const auto current = ring.Read(minute * 60.0);
+        Check(current.attempts == count && current.valid <= count && current.seconds == count * 0.125, "Ring totals match retained bucket count");
+    }
+    Check(ring.Read(6000 * 60.0).attempts == 59, "Idle read advances rolling totals");
+    MinutePerformanceWindow precision;
+    precision.Record(true, 1e16, 0); precision.Record(true, 0.125, 60);
+    const auto small_remaining = precision.Read(3600);
+    Check(small_remaining.attempts == 1 && small_remaining.seconds == 0.125, "Expiring large totals cannot erase smaller retained sample duration");
+}
+void PerformanceCacheBoundsAndConservativeExpiry() {
+    EndpointPerformanceCache cache(2);
+    const auto a = std::make_shared<EndpointPerformanceScore>(), b = std::make_shared<EndpointPerformanceScore>(), c = std::make_shared<EndpointPerformanceScore>();
+    const auto minimum = std::numeric_limits<double>::denorm_min();
+    Check(cache.Rate(a, 0) == 5 && cache.Size() == 0, "Never observed prior allocates no history");
+    a->credit = 0.375;
+    Check(cache.Record(a, true, 0.5, 0) && cache.Rate(a, 0) == 2, "Fresh ratio uses actual conclusive sample");
+    Check(cache.Record(b, false, 1, 1) && cache.Rate(b, 1) == minimum, "Failed validation counts as time without a valid proof");
+    Check(cache.Record(a, true, 0.5, 2), "Conclusive observation updates LRU order");
+    Check(cache.Record(c, true, 0, 3), "Third score evicts oldest history at cap");
+    Check(cache.Size() == 2 && cache.Rate(b, 3) == minimum && cache.Rate(a, 3) == 2, "Eviction retains observed state, no optimistic reset");
+    Check(cache.Rate(c, 3) == std::numeric_limits<double>::max(), "Zero-time valid sample remains finite maximum");
+    Check(cache.Rate(a, 3600) == minimum && cache.Size() == 0 && a->credit == 0.375, "Expiry frees histories without resetting rotation credit");
+    Check(cache.Rate(a, 0) == minimum, "Backwards cache clock does not restore prior");
+    Check(cache.Record(a, true, 0.25, 0) && cache.Rate(a, 3600) == 4, "Fresh recovery observation can replace expired history");
+    Check(cache.Rate(a, 7199.999) == 4 && cache.Rate(a, 7200) == minimum, "Backwards record honors clamped current cache minute");
+    Check(!cache.Record(b, true, NAN, 7200) && cache.Size() == 0, "Invalid sample does not allocate a history");
+    std::vector<std::shared_ptr<EndpointPerformanceScore>> held;
+    for (int i = 0; i < 10000; ++i) {
+        held.push_back(std::make_shared<EndpointPerformanceScore>());
+        Check(cache.Record(held.back(), true, 1, 7200) && cache.Size() <= 2, "Even running jobs holding old scores cannot exceed cache bound");
+    }
+    Check(cache.Rate(held.front(), 7200) == minimum && cache.Rate(held.back(), 7200) == 1, "Evicted active-job score remains safe to read");
+    Check(cache.Record(held.front(), false, 1, 7200) && cache.Size() == 2, "Previously evicted score can record without stale iterator use");
+    Check(cache.Rate(held.back(), 10800) == minimum && cache.Size() == 0, "Bulk stale cleanup is bounded and frees all histories");
+    auto survivor = std::make_shared<EndpointPerformanceScore>();
+    { EndpointPerformanceCache temporary; temporary.Record(survivor, true, 1, 0); }
+    Check(cache.Rate(survivor, 10800) == minimum && cache.Record(survivor, true, 0.5, 10800), "Cache destruction leaves externally held scores safely reusable");
+}
+void PerformanceSurvivesSameIpDnsRefreshAndKeepsBudgets() {
+    std::atomic<double> dns_now{0}, performance_now{0};
+    std::atomic<int> bad{}, good{};
+    ServiceDependencies deps;
+    deps.dns_time = [&] { return dns_now.load(); };
+    deps.performance_time = [&] { return performance_now.load(); };
+    deps.capture = [&](const Context&, const Endpoint& endpoint, CaptureControl&, const std::function<void()>& started) -> Bytes {
+        if (endpoint.ip == "8.8.8.8") { ++bad; started(); throw CaptureTimeout(); }
+        ++good; throw CaptureCancelled(); // Unknown score, no fabricated validation result.
+    };
+    Fixture fixture(1, deps); fixture.Ready();
+    for (uint64_t id = 2; id < 52; ++id) {
+        fixture.service->Command(Attempt(id));
+        Check(fixture.Wait("attempt", id)["successfulConnections"].get_str() == "0", "Failed/inconclusive attempt does not reset or fabricate capture budget");
+    }
+    Check(bad == 1 && good == 49, "Observed failing endpoint loses performance share, with exploration retained");
+    const auto previous_good = good.load();
+    dns_now = 60;
+    fixture.service->Command(Resolve(52)); Check(fixture.Wait("resolved", 52)["ok"].isTrue() && fixture.resolutions == 2, "DNS refreshed on exact deadline");
+    for (uint64_t id = 53; id < 103; ++id) { fixture.service->Command(Attempt(id)); fixture.Wait("attempt", id); }
+    Check(good - previous_good >= 49, "Same-IP refresh preserves failure window and 99/1 selection credit");
+    performance_now = 3600;
+    for (uint64_t id = 103; id < 113; ++id) { fixture.service->Command(Attempt(id)); fixture.Wait("attempt", id); }
+    Check(fixture.verifications == 0, "Performance expiration never fabricates validation or proof");
+
+    ServiceDependencies success;
+    success.performance_time = [&] { return performance_now.load(); };
+    Fixture budget(1, success); budget.Ready();
+    auto context = ContextFor(); context.connection_work_target = std::string(64, 'f');
+    budget.service->Command(Attempt(2, context, "2"));
+    Check(budget.Wait("attempt", 2)["successfulConnections"].get_str() == "3", "Successful capture consumes final bounty slot");
+    performance_now = 100000;
+    budget.service->Command(Attempt(3, context)); const auto blocked = budget.Wait("attempt", 3);
+    Check(blocked["blocked"].get_str() == "budget" && blocked["successfulConnections"].get_str() == "3" && blocked["started"].isFalse(), "Expired IP window cannot reopen bounty budget or erase lifetime counter");
+}
 } // namespace
 int main() {
-    try { Parsing(); BufferedFrameBoundaries(); InteractiveInputUnwind(); InteractiveFrameCancellation(); NativePreparedContextReuse(); BudgetAndPacing(); PrecomputedBudgetBoundaries(); SuccessfulAndMissedProof(); ConcurrentCaptureSnapshotsRemainImmutable(); FailuresAndDnsCache(); CancelQueuedAndActive(); CancelWhileVerifying(); BudgetAcrossRequestsAndIds(); BudgetCountsInvalidCapturesAndMonotonicReports(); EndpointSelectionBoundAndRoundRobin(); OutputFailureStopsBeforeTcp(); UnreachableEndpointIsExcludedAcrossMasksAndDomains(); UnsupportedFamilyAndTimedRecovery(); RouteRecoveryAndOrdinaryFailures(); QueuedEndpointRecheckedAndCancellationDoesNotExclude(); std::cout << "20 offline service test groups passed\n"; return 0; }
+    try { Parsing(); BufferedFrameBoundaries(); InteractiveInputUnwind(); InteractiveFrameCancellation(); NativePreparedContextReuse(); BudgetAndPacing(); PrecomputedBudgetBoundaries(); SuccessfulAndMissedProof(); ConcurrentCaptureSnapshotsRemainImmutable(); FailuresAndDnsCache(); CancelQueuedAndActive(); CancelWhileVerifying(); BudgetAcrossRequestsAndIds(); BudgetCountsInvalidCapturesAndMonotonicReports(); EndpointSelectionBoundAndRoundRobin(); OutputFailureStopsBeforeTcp(); UnreachableEndpointIsExcludedAcrossMasksAndDomains(); UnsupportedFamilyAndTimedRecovery(); RouteRecoveryAndOrdinaryFailures(); QueuedEndpointRecheckedAndCancellationDoesNotExclude(); PerformanceMinuteBoundariesAndGaps(); PerformanceCacheBoundsAndConservativeExpiry(); PerformanceSurvivesSameIpDnsRefreshAndKeepsBudgets(); std::cout << "23 offline service test groups passed\n"; return 0; }
     catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }

@@ -70,6 +70,11 @@ for (const concurrency of [3, 100, 256]) test(`one domain can use all ${concurre
 
 test('repeated TCP failures replenish all global slots without introducing a domain cooldown', async t => {
   const { engine, attempts } = fixture(t);
+  // Keep the measured history profitable while exercising failure retry timing;
+  // an all-failure window correctly enters economic recovery instead.
+  const history = new P2CDomainStats();
+  for (let index = 0; index < 100; index++) history.record(true, 0.1);
+  engine.domainStats.set('alpha.example:7', history);
   engine.enqueue([row(1)]); engine.start(); await settle();
   for (let batch = 0; batch < 3; batch++) {
     assert.equal(attempts.length, (batch + 1) * 100);
@@ -86,7 +91,7 @@ test('repeated TCP failures replenish all global slots without introducing a dom
 
 function failedStats() { const stats = new P2CDomainStats(); for (let i = 0; i < 10; i++) stats.record(false, 10); return stats; }
 
-test('below-floor domain gets at most one recovery TCP start per minute without resetting EMA', async t => {
+test('below-floor domain gets at most one recovery TCP start per minute without resetting history', async t => {
   const { engine, attempts } = fixture(t);
   const stats = failedStats(); engine.domainStats.set('alpha.example:7', stats);
   const bounties = Array.from({ length: 20 }, (_, i) => row(i + 1, 'alpha.example', { amount: '1000', connection_work_target: 'f'.repeat(64) }));
@@ -140,11 +145,50 @@ test('recovery admission never displaces verified pending proofs during catalog 
 
 test('a normally eligible bounty supplies observations without an extra probe of the same domain/mask', async t => {
   const { engine } = fixture(t);
-  engine.domainStats.set('alpha.example:7', failedStats());
+  const stats = failedStats(); stats.record(true, 0.1);
+  engine.domainStats.set('alpha.example:7', stats);
   engine.enqueue([row(1, 'alpha.example', { amount: '1000', connection_work_target: 'f'.repeat(64) }), row(2)]);
   engine.rebuild();
   assert.equal(engine.queue.size, 1); assert.equal(engine.connectionPolicy.probes.size, 0);
   assert.equal(engine.queue.get(key(row(2))).recoveryProbe, false);
+});
+
+test('inactive window expiry uses the existing refresh and recovery cadence without clearing claim state', async t => {
+  let clock = 0;
+  const { engine, attempts } = fixture(t, { options: { connectionsPerSecond: 100, concurrency: 3 } });
+  const stats = new P2CDomainStats({ now: () => clock });
+  stats.record(false, 10); engine.domainStats.set('alpha.example:7', stats);
+  const bounty = row(1, 'alpha.example', { amount: '1000', connection_work_target: 'f'.repeat(64) });
+  engine.enqueue([bounty]);
+  engine.state.attempts = 17; engine.state.completed = 3;
+  engine.completed.add('previous-claim');
+  engine.successCounts.set('previous-claim', 12n);
+  engine.pendingProofs.set('unrelated-pending', { proof: '020100', due: 0, failures: 2 });
+  engine.deferredBroadcasts.set('unrelated-broadcast', { txid: hash(900) });
+  const before = { completed: [...engine.completed], successes: [...engine.successCounts],
+    pending: [...engine.pendingProofs], broadcasts: [...engine.deferredBroadcasts] };
+  engine.start(); await settle();
+  assert.equal(attempts.length, 0);
+  clock = 60 * 60000;
+  t.mock.timers.tick(5000); await settle();
+  assert.equal(stats.attempts, 0, 'the existing five-second refresh expires idle history without a new connection');
+  assert.equal(stats.completed, 1, 'lifetime observations are not erased');
+  assert.equal(stats.connectionRate(), Number.MIN_VALUE);
+  assert.equal(engine.queue.get(key(bounty)).recoveryProbe, true);
+  assert.equal(engine.state.attempts, 17); assert.equal(engine.state.completed, 3);
+  assert.deepEqual({ completed: [...engine.completed], successes: [...engine.successCounts],
+    pending: [...engine.pendingProofs], broadcasts: [...engine.deferredBroadcasts] }, before);
+  t.mock.timers.tick(54999); await settle(); assert.equal(attempts.length, 0);
+  t.mock.timers.tick(1); await settle(); assert.equal(attempts.length, 1);
+  assert.equal(engine.state.attempts, 18);
+  t.mock.timers.tick(59999); await settle();
+  assert.equal(attempts.length, 1, 'the probe does not restore full load or bypass its minute cadence');
+  attempts[0].finish({ captured: true, validationPassed: true, seconds: 0.2 }); await settle();
+  t.mock.timers.tick(5000); await settle();
+  assert.equal(stats.completed, 2); assert.equal(stats.attempts, 1);
+  assert.equal(stats.connectionRate(), 5);
+  assert.equal(engine.queue.get(key(bounty)).recoveryProbe, false, 'one fresh validated observation restores measured economics');
+  assert.equal(attempts.length, 4, 'the normal configured capacity resumes only after fresh evidence');
 });
 
 test('replacing the probe bounty before its TCP acknowledgement cannot spend a second probe in that minute', async t => {

@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { performance } from 'node:perf_hooks';
 import { ClaimsEngine } from '../src/core/claims.mjs';
+import { P2CDomainStats } from '../src/core/claim-priority.mjs';
 
 const hash = n => n.toString(16).padStart(64, '0');
 const key = row => `${row.txid}:${row.vout}`;
@@ -257,6 +258,10 @@ test('successful captures, not hash wins, enforce strict 2E cutoff and survive s
 
 test('failed TCP/TLS captures do not consume the successful-connection budget', async t => {
   const { engine, attempts } = fixture(t, { options: { connectionsPerSecond: 256, concurrency: 1 } });
+  // An earlier valid observation from another bounty keeps this domain
+  // profitable, without contributing to this bounty's raw-capture budget.
+  const history = new P2CDomainStats(); history.record(true, 0.1);
+  engine.domainStats.set('example.com:7', history);
   const bounty = row(); engine.enqueue([bounty]); engine.start();
   await until(() => attempts.length === 1);
   attempts[0].finish({ captured: false, validationPassed: false, message: 'isolated TLS capture failed' });

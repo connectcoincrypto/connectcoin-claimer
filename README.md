@@ -62,7 +62,7 @@ fee_rate=1500
 - `min_connects_per_connection_second`: minimum estimated **net atomic connects
   earned per second of connection effort**, not a minimum number of connections.
   Default `1000`; `0` disables this economic floor. Uses work probability,
-  payout after fee, and the domain/signature-policy success/time EMA.
+  payout after fee, and the domain/signature-policy recent valid-proof/time ratio.
 - `rpc_host`, `rpc_port`: the public plaintext TCP JSON-RPC endpoint, **not**
   Core's administrative HTTP RPC. No RPC username/password is needed. Mainnet
   identity/genesis are checked; another network is rejected.
@@ -87,14 +87,14 @@ working directory. Source runs default to `./claimer.conf`.
   credit. Bounded catch-up can briefly exceed the configured rate over a shorter
   measurement interval; this is not a strict rolling one-second quota.
 - Alternates domain rotation and expected return, using each domain's best
-  eligible bounty. Keeps domain EMA, endpoint rotation and successful-connection
-  budgets from the desktop engine.
+  eligible bounty. Keeps endpoint rotation and successful-connection budgets
+  from the desktop engine; performance estimates use the rolling window below.
 - Captures through **CertificateVerify**, without waiting for Finished, while
   still verifying certificate path, domain, signature policy, proof binding and
   target before accepting a winning proof. Uses the pinned consensus roots.
 - Restricts TLS endpoints to public IPs on port 443; does not send HTTP requests.
 - Immediately excludes an endpoint after an explicit OS no-route/network-down
-  error, rather than repeatedly selecting it through the normal success EMA.
+  error, rather than repeatedly selecting it through normal performance scoring.
   Only an unsupported socket family excludes that entire IP family. Exclusions
   last 60 seconds, span domains/signature policies and survive DNS refreshes;
   queued attempts check them again before TCP starts. All-excluded domains use
@@ -141,6 +141,60 @@ This light client relies on its configured RPC for chain state, availability
 and relay; validating a proof locally is not independent full-node validation.
 The service is plaintext, so use an endpoint/network you trust. Claims consume
 bandwidth and CPU; a configured rate does not guarantee earnings.
+
+### Recent domain and IP performance
+
+Each tracked domain/signature policy and native DNS endpoint/signature policy keeps
+up to **60 one-minute buckets**: concluded observations, locally validated proofs
+and total TCP/TLS duration. The estimated rate is valid proofs divided by that
+duration, not connections divided by wall-clock time. Failed conclusive attempts
+contribute time but no valid proof; cancellation without a validation result is
+not an observation. All certificate and proof validations still run.
+
+The current minute and the previous 59 minutes are retained. This is a
+minute-granularity window: a sample expires approximately 59–60 minutes after
+completion, not exactly 3,600 seconds later. A monotonic clock advances buckets
+on both observation and score lookup, including when an endpoint is idle. The
+usual update does not scan past connections or allocate a per-connection record.
+
+Only an entirely unobserved policy has the initial 5/s estimate. Once an observed
+history expires, it does **not** become optimistically healthy again. The existing
+economic recovery probes (one per minute per policy) and native 1% endpoint
+exploration allow new measurements; a fresh conclusive observation supplies a
+new measured rate. The native 99% performance / 1% rotation weighting is unchanged.
+
+The numeric buckets occupy 1,440 bytes per allocated history, plus metadata.
+Native endpoint histories are allocated lazily and bounded to 8,192 histories
+across the helper, with least-recently-observed eviction. Eviction discards only
+performance history, not endpoint rotation credit or validation state. Domain
+histories are retained only for relevant catalog/active/pending-proof policies.
+The catalog is capped at 100,000 bounties; 100,000 distinct observed policies
+would use about 137 MiB of domain bucket payload, plus object overhead and
+active/pending work retained separately. Ordinary use with a few domains is much
+smaller. This storage depends on tracked policies, not connections per second.
+
+Expiration never clears claims, saved transactions, successful-capture budgets,
+terminal counters or the cumulative observation count. DNS refresh and temporary
+unreachable-address exclusions retain their separate existing lifetimes. Process
+restart and journal recovery behavior are unchanged; this is not a periodic
+service restart or a blanket domain/IP reset.
+
+Existing lifecycle cleanup still applies: a policy removed from the catalog
+with no active/pending work, or an IP removed from DNS and later reintroduced,
+can be a new observation context. The window does not introduce a permanent
+database of every domain or address ever seen.
+
+Offline bookkeeping benchmarks (no network or broadcasts):
+
+```sh
+node --expose-gc scripts/benchmark-performance-window.mjs
+cmake --build tmp/native-build --config Release --target claimer-performance-bench
+```
+
+Run the resulting `claimer-performance-bench` executable from the build folder
+(`Release/` on Visual Studio). It is not installed or packaged. These benchmarks
+measure history bookkeeping and bounded allocation, not full TLS throughput;
+the native wall-time estimate is not a production CPU measurement.
 
 ## Shutdown, crash recovery and uncertain broadcasts
 

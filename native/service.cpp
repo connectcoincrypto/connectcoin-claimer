@@ -1,5 +1,6 @@
 // Copyright (c) 2026 The ConnectCoin developers. MIT license.
 #include <claimer/service.hpp>
+#include <claimer/performance_window.hpp>
 #include <mbedtls/version.h>
 #include <algorithm>
 #include <array>
@@ -55,13 +56,7 @@ uint64_t Decimal(const std::string& text, uint64_t maximum) {
 struct BudgetExhausted : std::exception {};
 struct EndpointExcluded : std::exception {};
 struct OutputFailure : std::runtime_error { OutputFailure() : std::runtime_error("Helper output failed") {} };
-struct Score {
-    double connections{0.1}, seconds{0.02}, credit{};
-    double Rate() const {
-        if (seconds == 0) return std::numeric_limits<double>::max();
-        return std::clamp(connections / seconds, std::numeric_limits<double>::denorm_min(), std::numeric_limits<double>::max());
-    }
-};
+using Score = EndpointPerformanceScore;
 struct Budget {
     std::string target;
     uint64_t stop_count{}, successes{}, users{}, touched{};
@@ -227,6 +222,7 @@ struct ClaimsService::Impl {
     std::deque<std::shared_ptr<Job>> tls_pending, dns_pending;
     std::unordered_map<std::string, Budget> budgets;
     std::unordered_map<std::string, DnsEntry> dns;
+    EndpointPerformanceCache performance;
     std::unordered_map<std::string, double> unavailable_endpoints;
     std::unordered_map<int, double> unavailable_families;
     std::vector<std::thread> workers;
@@ -249,6 +245,8 @@ struct ClaimsService::Impl {
         if (!deps.capture) deps.capture = [](const Context& context, const Endpoint& endpoint, CaptureControl& control, const std::function<void()>& started) { return Capture(context, endpoint, control, started); };
         if (!deps.verify) deps.verify = [](const Bytes& proof, const Context& context) { return VerifyProof(proof, context); };
         if (!deps.reachability_time) deps.reachability_time = Now;
+        if (!deps.performance_time) deps.performance_time = Now;
+        if (!deps.dns_time) deps.dns_time = Now;
     }
     void EmitFrame(const UniValue& value) {
         const auto text = value.write();
@@ -330,7 +328,7 @@ struct ClaimsService::Impl {
     std::pair<Endpoint, std::shared_ptr<Score>> SelectEndpoint(const std::shared_ptr<Job>& job) {
         std::lock_guard lock(mutex);
         const auto found = dns.find(job->domain);
-        Require(found != dns.end() && found->second.expires > Now() && !found->second.endpoints.empty(), "Public DNS resolution required");
+        Require(found != dns.end() && found->second.expires > deps.dns_time() && !found->second.endpoints.empty(), "Public DNS resolution required");
         auto& cached = found->second;
         const auto mask = job->context.signature_algorithms_mask;
         // Resolution bounds this set at 32; avoid three heap allocations on
@@ -340,11 +338,12 @@ struct ClaimsService::Impl {
         std::array<double, MAX_ENDPOINTS> rates{};
         std::array<size_t, MAX_ENDPOINTS> eligible{};
         size_t count = 0;
+        const auto performance_now = deps.performance_time();
         for (size_t index = 0; index < cached.endpoints.size(); ++index) {
             auto& item = cached.endpoints[index];
             if (!EndpointAvailableLocked(item.endpoint)) continue;
             auto& score = item.scores[mask]; if (!score) score = std::make_shared<Score>();
-            scores[count] = score.get(); rates[count] = score->Rate();
+            scores[count] = score.get(); rates[count] = performance.Rate(score, performance_now);
             eligible[count++] = index;
         }
         if (!count) throw EndpointExcluded();
@@ -366,7 +365,7 @@ struct ClaimsService::Impl {
         if (!job->control.Cancelled()) {
             { std::lock_guard lock(mutex);
                 const auto found = dns.find(job->domain);
-                if (found != dns.end() && found->second.expires > Now()) {
+                if (found != dns.end() && found->second.expires > deps.dns_time()) {
                     cached = true; ok = HasEndpointLocked(found->second); found->second.touched = ++touched;
                 }
             }
@@ -385,7 +384,7 @@ struct ClaimsService::Impl {
                 // Keep DNS separate from local reachability. If every address
                 // is excluded, resolve=false engages the controller's existing
                 // two-second retry without repeated DNS or a hot attempt loop.
-                next.expires = Now() + (!endpoints.empty() ? 60.0 : 2.0); next.touched = ++touched;
+                next.expires = deps.dns_time() + (!endpoints.empty() ? 60.0 : 2.0); next.touched = ++touched;
                 ok = HasEndpointLocked(next);
                 dns[job->domain] = std::move(next);
                 if (dns.size() > MAX_DNS) {
@@ -458,8 +457,7 @@ struct ClaimsService::Impl {
         if (frame["cancelled"].get_bool()) proof.reset();
         if (score && validated && std::isfinite(job->seconds) && job->seconds >= 0) {
             std::lock_guard lock(mutex);
-            score->connections = 0.999 * score->connections + 0.001 * (*validated ? 1 : 0);
-            score->seconds = 0.999 * score->seconds + 0.001 * job->seconds;
+            performance.Record(score, *validated, job->seconds, deps.performance_time());
         }
         frame.pushKV("type", "attempt"); frame.pushKV("proof", proof ? UniValue(*proof) : UniValue()); frame.pushKV("verified", proof.has_value());
         frame.pushKV("validationPassed", validated ? UniValue(*validated) : UniValue());

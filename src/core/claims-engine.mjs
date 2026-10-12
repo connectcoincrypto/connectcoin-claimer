@@ -302,7 +302,7 @@ export class ClaimsEngine {
   }
   recordAttemptStats(job, snapshot, previousCompleted) {
     // Legacy tooling only. Production observes every protocol-4 validation result.
-    // A truncated snapshot cannot reconstruct an EMA: never silently drop
+    // A truncated snapshot cannot reconstruct performance history: never silently drop
     // missing observations as the former last-100 window permitted.
     validateAttemptStats(snapshot, Number.MAX_SAFE_INTEGER);
     if (!Number.isSafeInteger(previousCompleted) || previousCompleted < 0 ||
@@ -537,7 +537,7 @@ export class ClaimsEngine {
     if (observation.captured) {
       this.countDiagnostic('captures');
       const count = this.successCounts.get(key) ?? 0n;
-      // The raw-capture budget is independent of the validated domain EMA. Replies
+      // The raw-capture budget is independent of the validated domain window. Replies
       // from parallel workers may arrive out of order, so never add it twice.
       const observed = observation.successfulConnections === undefined
         ? (count < MAX_P2C_SUCCESSFUL_CONNECTIONS ? count + 1n : count)
@@ -592,7 +592,7 @@ export class ClaimsEngine {
       this.pendingRecovery.set(request.policy, request); this.scheduler.setReady(key, false);
     }
     // Reserve turns in dispatch order, not callback arrival order. A failure
-    // before TCP spends no attempt/EMA/probe cooldown, but cannot rewind turns
+    // before TCP spends no attempt/performance observation/probe cooldown, but cannot rewind turns
     // already reserved by other concurrent requests.
     this.scheduler.commit(selection);
     const pool = this.pool;

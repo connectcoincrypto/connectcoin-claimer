@@ -1,4 +1,4 @@
-// Recovery probes for policies excluded by EMA; no transport limits or backoff.
+// Recovery probes for policies excluded by recent performance; no transport limits or backoff.
 export const RECOVERY_PROBE_INTERVAL_MS = 60000;
 export const MAX_RECOVERY_POLICIES = 256;
 

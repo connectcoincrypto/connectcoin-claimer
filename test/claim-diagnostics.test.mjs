@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
 import { ClaimsEngine, createProofRunner } from '../src/core/claims.mjs';
+import { P2CDomainStats } from '../src/core/claim-priority.mjs';
 
 const context = { domain: 'example.com', txid: '01'.repeat(32), input_index: 0,
   connection_work_target: 'ff'.repeat(32), root_certificates_version: 1,
@@ -37,6 +38,10 @@ for (const stage of ['prepare', 'proof', 'submit']) test(`diagnostics retain a $
     submit: async prepared => { if (prepared.item.vout === 0 && stage === 'submit') throw failure; return prepared.context.txid; },
   });
   t.after(() => engine.stop());
+  // Diagnostics are independent of economic recovery: use a domain with a
+  // valid earlier observation so the next outpoint remains profitable.
+  const history = new P2CDomainStats(); history.record(true, 0.1);
+  engine.domainStats.set('example.com:7', history);
   engine.enqueue([bounty(0), bounty(1)]); engine.start();
   await until(() => engine.snapshot().completed === 1 && !engine.running);
   assert.equal(engine.enabled, true);
@@ -125,6 +130,8 @@ for (const failureMode of ['capture-result', 'proof-error']) test(`one ${failure
   });
   // Keep the first retry observable without spending a real one-second backoff.
   engine.pauseWorker = () => retry.promise;
+  const history = new P2CDomainStats(); history.record(true, 0.1);
+  engine.domainStats.set('example.com:7', history);
   t.after(async () => { retry.resolve(); secondCapture.resolve(); await engine.stop(); });
   engine.enqueue([bounty(0)]); engine.start();
   await until(() => engine.snapshot().lastErrorCategory === 'tls-timeout');

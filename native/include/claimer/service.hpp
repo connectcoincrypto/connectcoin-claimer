@@ -17,6 +17,10 @@ struct ServiceDependencies {
     // Monotonic time for temporary local reachability exclusions. Separate from
     // real socket pacing so offline tests can exercise recovery without sleeps.
     std::function<double()> reachability_time;
+    // Steady clocks for performance buckets and DNS cache expiry. Independent
+    // of real socket pacing, so tests can advance an hour without sleeping.
+    std::function<double()> performance_time;
+    std::function<double()> dns_time;
 };
 // Retains only a bounded reusable line buffer; getline stops at the delimiter,
 // never waits for a full block and never consumes the next protocol frame.
