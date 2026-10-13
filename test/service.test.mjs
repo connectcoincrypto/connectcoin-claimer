@@ -9,6 +9,7 @@ import { BroadcastJournal } from '../src/broadcast-journal.mjs';
 import { ClaimMetrics } from '../src/metrics.mjs';
 import { ClaimsEngine } from '../src/core/claims-engine.mjs';
 import { GENESIS } from '../src/core/config.mjs';
+import { FundingTransactionCache, parseTransaction, prepareClaim, serializeTransaction, transactionId, transactionIdFromRaw } from '../src/core/transaction.mjs';
 
 const HASH = '1'.repeat(64), BLOCK = '2'.repeat(64), CLAIM = '3'.repeat(64);
 const tip = { height: 100, hash: BLOCK, mediantime: 1700000000, chain: 'main', genesis_hash: GENESIS.main };
@@ -107,6 +108,90 @@ test('reuses the processed discovery cursor and validates parent transaction bef
   assert.equal(prepared.context.validation_time, tip.mediantime);
   await service.prepare(bounty);
   assert.equal(rpc.calls.filter(call => call.method === 'gettransaction').length, 1);
+});
+
+test('production preparation shares full parent validation across outputs and revalidates after an RPC epoch change', async t => {
+  const funding = parseTransaction('02000000010000000000000000000000000000000000000000000000000000000000000000ffffffff020101ffffffff0100e40b5402000000020b6578616d706c652e636f6dffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff010000000700000000');
+  funding.outputs.push({ ...funding.outputs[0], amount: '20000000000' });
+  const raw = serializeTransaction(funding).toString('hex'), txid = transactionId(funding);
+  const rows = funding.outputs.map((output, vout) => ({ ...bounty, txid, vout, amount: output.amount }));
+  const { service, rpc } = await fixture(t, {
+    config: { ...config, receivingAddress: 'cc1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqr7enya' },
+    prepare: prepareClaim, transactionId: transactionIdFromRaw,
+    discover: async () => ({ blocks: new Map([[BLOCK, rows]]), cursor: 'cursor-one', tip }),
+  });
+  rpc.respond = async method => { assert.equal(method, 'gettransaction'); return { tip, transaction: { hex: raw } }; };
+  let parentDecodes = 0, clears = 0;
+  const from = Buffer.from, clear = FundingTransactionCache.prototype.clear;
+  t.mock.method(Buffer, 'from', function (value, ...args) {
+    if (value === raw && args[0] === 'hex') parentDecodes++;
+    return from(value, ...args);
+  });
+  t.mock.method(FundingTransactionCache.prototype, 'clear', function () { clears++; return clear.call(this); });
+  await service.start();
+  const prepared = await Promise.all(rows.map(row => service.prepare(row)));
+  assert.deepEqual(prepared.map(row => row.bounty.amount), ['10000000000', '20000000000']);
+  assert.equal(rpc.calls.length, 1); assert.equal(parentDecodes, 1);
+  prepared[0].bounty.amount = '1';
+  assert.equal((await service.prepare(rows[0])).bounty.amount, rows[0].amount);
+  service.outpoints.set(`${txid}:1`, { ...rows[1], domain: 'forged.example' });
+  await assert.rejects(service.prepare(rows[1]), /domain differs/);
+  service.outpoints.set(`${txid}:1`, rows[1]);
+  assert.equal(parentDecodes, 1);
+  rpc.emit('disconnected'); await service.suspending; await service.cycle();
+  await service.prepare(rows[0]);
+  assert.equal(rpc.calls.length, 2); assert.equal(parentDecodes, 2); assert.equal(clears, 1);
+  await service.stop(); assert.equal(clears, 2);
+});
+
+test('funding cache limits raw retained bytes without changing injected callback contracts', async t => {
+  const secondId = '4'.repeat(64), second = { ...bounty, txid: secondId };
+  const received = [];
+  const { service, rpc } = await fixture(t, {
+    transactionId: raw => raw.slice(0, 64),
+    prepare: options => {
+      received.push(options);
+      return { bounty: { ...options.bounty, target: options.bounty.connection_work_target, rootVersion: 1, mask: 7 }, txid: CLAIM, fee: options.fee };
+    },
+    discover: async () => ({ blocks: new Map([[BLOCK, [bounty, second]]]), cursor: 'cursor-one', tip }),
+  });
+  // Each raw string is charged as UTF-16 plus entry overhead, so these two
+  // individually valid callback responses cannot coexist in the 16 MiB cache.
+  const suffix = '0'.repeat(4 * 1024 * 1024);
+  rpc.respond = async (method, params) => {
+    assert.equal(method, 'gettransaction'); return { tip, transaction: { hex: params.txid + suffix } };
+  };
+  await service.start();
+  await service.prepare(bounty); await service.prepare(second); await service.prepare(bounty);
+  assert.equal(rpc.calls.length, 3);
+  assert.equal(received.length, 3);
+  for (const options of received) {
+    assert.equal(typeof options.rawTransaction, 'string');
+    assert.equal(options.rawTransaction.slice(0, 64), options.bounty.txid);
+    assert.deepEqual(Object.keys(options).sort(), ['bounty', 'fee', 'network', 'rawTransaction', 'rewardAddress']);
+  }
+});
+
+test('stale or cancelled parent requests cannot refill caches or cancel another output read', async t => {
+  const { service, rpc } = await fixture(t);
+  const pending = [];
+  rpc.respond = () => new Promise(resolve => pending.push(resolve));
+  await service.start();
+  const signal = new AbortController();
+  const cancelled = service.funding(HASH, { signal: signal.signal });
+  const shared = service.funding(HASH);
+  signal.abort(); await assert.rejects(cancelled, { name: 'AbortError' });
+  pending.shift()({ tip, transaction: { hex: 'funding-hex' } });
+  assert.equal(await shared, 'funding-hex'); assert.equal(rpc.calls.length, 1);
+  rpc.emit('disconnected'); await service.suspending; await service.cycle();
+  const stale = service.funding(HASH);
+  rpc.emit('disconnected'); await service.suspending; await service.cycle();
+  pending.shift()({ tip, transaction: { hex: 'funding-hex' } });
+  await assert.rejects(stale, { name: 'AbortError' });
+  const fresh = service.funding(HASH);
+  assert.equal(rpc.calls.length, 3);
+  pending.shift()({ tip, transaction: { hex: 'funding-hex' } });
+  assert.equal(await fresh, 'funding-hex');
 });
 
 test('writes pending state durably before broadcasting and retains accepted outpoints across restart', async t => {
@@ -436,6 +521,26 @@ test('malformed funding identity halts instead of repeatedly attempting claims',
   await assert.rejects(service.prepare(bounty), /do not match/);
   assert.equal(service.snapshot().status, 'failed');
   assert.equal(rpc.closed, true);
+});
+
+test('production funding rejects invalid sibling keys and clears validation state on fatal failure', async t => {
+  const publicKey = '79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798';
+  const funding = { version: 2, inputs: [{ txid: '00'.repeat(32), vout: 0xffffffff, scriptSig: '', sequence: 0xffffffff, witness: [] }],
+    outputs: [{ type: 2, amount: bounty.amount, domain: bounty.domain, target: bounty.connection_work_target, rootVersion: 1, mask: 7 },
+      { type: 1, amount: '100', publicKey }], locktime: 0 };
+  const raw = serializeTransaction(funding).toString('hex').replace(publicKey, 'ff'.repeat(32));
+  const row = { ...bounty, txid: transactionIdFromRaw(raw) };
+  let clears = 0;
+  const clear = FundingTransactionCache.prototype.clear;
+  t.mock.method(FundingTransactionCache.prototype, 'clear', function () { clears++; return clear.call(this); });
+  const { service, rpc } = await fixture(t, {
+    prepare: prepareClaim, transactionId: transactionIdFromRaw,
+    discover: async () => ({ blocks: new Map([[BLOCK, [row]]]), cursor: 'cursor-one', tip }),
+  });
+  rpc.respond = async () => ({ tip, transaction: { hex: raw } });
+  await service.start();
+  await assert.rejects(service.prepare(row), /key|point|field/i);
+  assert.equal(service.snapshot().status, 'failed'); assert.equal(rpc.closed, true); assert.equal(clears, 1);
 });
 
 test('journal serializes concurrent reservations and fails closed on corrupt state', async t => {

@@ -163,12 +163,19 @@ export async function discoverBounties({ rpc, network, lookback = 600, previous 
       return page;
     };
     const apply = page => {
-      const outpoints = new Map();
-      for (const [hash, rows] of staged) for (const row of rows) outpoints.set(bountyKey(row), hash);
+      // Most pages are empty or already identify the affected block. Only
+      // build the fallback index for an event that actually needs it, after
+      // validating that event. Keep it page-local: block reloads/reorgs between
+      // pages must never reuse an index of a former staged catalog.
+      let outpoints;
       for (const event of page.changes) {
         if (event?.type === 'resync_required') throw new RescanRequired('Bounty journal requested a new snapshot.');
         if (!event || !['added','spent','pending_spend','available_again','matured','window_exit'].includes(event.type) || !uint(event.sequence, Number.MAX_SAFE_INTEGER) || event.sequence <= lastSequence || typeof event.txid !== 'string' || !HASH.test(event.txid) || !uint(event.vout) || (event.block_hash !== undefined && !HASH.test(event.block_hash))) throw new Error('Invalid bounty change event.');
         lastSequence = event.sequence;
+        if (event.block_hash === undefined && !outpoints) {
+          outpoints = new Map();
+          for (const [hash, rows] of staged) for (const row of rows) outpoints.set(bountyKey(row), hash);
+        }
         const hash = event.block_hash ?? outpoints.get(bountyKey(event));
         if (hash && desired.has(hash) && event.type !== 'window_exit') dirty.add(hash);
         if (['spent','pending_spend','window_exit'].includes(event.type)) onInvalidate(event, event.type);

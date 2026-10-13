@@ -92,6 +92,9 @@ working directory. Source runs default to `./claimer.conf`.
 - Captures through **CertificateVerify**, without waiting for Finished, while
   still verifying certificate path, domain, signature policy, proof binding and
   target before accepting a winning proof. Uses the pinned consensus roots.
+  The abbreviated capture omits only the TLS library's unused Certificate
+  transcript checksum; the proof verifier still hashes and authenticates the
+  exact captured transcript. Completed TLS handshakes keep their usual checksum.
 - Restricts TLS endpoints to public IPs on port 443; does not send HTTP requests.
 - Immediately excludes an endpoint after an explicit OS no-route/network-down
   error, rather than repeatedly selecting it through normal performance scoring.
@@ -120,16 +123,28 @@ working directory. Source runs default to `./claimer.conf`.
   server must support the optional `getrecentblockhashes` `count` parameter for
   reduced transfers. Older servers that reject it fall back to a full request;
   malformed data never triggers that compatibility fallback.
+  Journal pages build a fallback outpoint index only when a validated event
+  lacks its block hash, at most once per page. Empty pages and explicitly located
+  events avoid that scan; event validation, replay and final snapshot checks remain.
 - A catalog resync keeps the same helper, validated captures, successful-work
   budgets and verified proofs. New preparations and broadcasts wait until the
   complete replacement snapshot and journal replay are published atomically;
   a final pre-write check also fences broadcasts queued behind RPC quotas.
   Known spent/reorganized outpoints are cancelled individually. Normal window
   aging does not discard already-started captures or their verified winners.
-- Preparation is limited to four concurrent jobs. Parked candidates become
-  eligible again whenever preparation capacity is available, through the same
-  priority scheduler and retry deadlines. Removing or aging out an awakened
-  candidate cannot strand the remaining queue.
+- Preparation is limited to four concurrent jobs. Indexed views of all eligible
+  candidates and already-prepared candidates share the same priority and rotation
+  state. Filling or freeing a preparation slot does not scan and repark the entire
+  backlog. Retry deadlines, cancellation and prepared-cache eviction update these
+  views without stranding queued candidates.
+- Reuses fully validated funding transactions by their exact bytes, including
+  witness, across bounties sharing a parent. Cached output records are private and
+  immutable; each claim still checks its outpoint, amount, ownership, bounty
+  metadata, receiving address, fee and dust. Both caches use least-recently-used
+  eviction, with at most 256 entries each and conservative retained-size budgets
+  of 16 MiB for raw transactions and 32 MiB for validated records. These are cache
+  budgets, not process-memory limits. Oversized entries are validated without
+  retention; disconnect, failure and stop clear both caches.
 - Uses one RPC connection, polling every five seconds, with conservative client
   quotas: 48 ordinary calls/minute/method, eight calls/minute/block for bounty
   streams, at most four normal submissions in flight, and one serial recovery

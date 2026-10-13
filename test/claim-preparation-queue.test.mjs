@@ -16,7 +16,7 @@ async function settle() { for (let i = 0; i < 30; i++) await new Promise(resolve
 // Exercise the real scheduler/pump and public invalidation/lifecycle methods.
 // Only preparation completion and connection lifetime are controlled here; no
 // waiting/preparing flag or scheduler entry is injected, and no network is used.
-function fixture(t, { concurrency = 800 } = {}) {
+function fixture(t, { concurrency = 800, warmVout = 99 } = {}) {
   t.mock.timers.enable({ apis: ['Date', 'setTimeout', 'setInterval'], now: 1800000000000 });
   const pending = new Map(), prepareCalls = [], requests = [];
   let activePreparations = 0, peakPreparations = 0;
@@ -42,7 +42,7 @@ function fixture(t, { concurrency = 800 } = {}) {
     getNetReward: () => 75283000n, options: { connectionsPerSecond: 800, concurrency },
     submit: async () => assert.fail('queue preparation tests must not submit a claim'),
     prepare: (bounty, { signal }) => {
-      if (bounty.vout === 99) return Promise.resolve(prepared(bounty));
+      if (bounty.vout === warmVout) return Promise.resolve(prepared(bounty));
       prepareCalls.push(bounty.vout); peakPreparations = Math.max(peakPreparations, ++activePreparations);
       return new Promise((resolve, reject) => {
         const finish = (error) => {
@@ -67,7 +67,9 @@ async function parkBehindLiveCapture(f) {
   f.engine.enqueue(rows); f.requests[0].finish(); await settle();
   assert.deepEqual(f.prepareCalls, [0, 1, 2, 3]);
   assert.equal(f.engine.preparing.size, 4);
-  assert.equal(f.engine.waitingPrepare.size, 13);
+  assert.equal(f.engine.scheduler.entries.size, 18);
+  assert.equal(f.engine.scheduler.groups.get(warm.domain).ready.total, 14,
+    'queued preparations remain indexed while the prepared leader can still capture');
   assert.equal(f.engine.connections.size, f.engine.options.concurrency);
   return { rows, warm };
 }
@@ -139,7 +141,7 @@ for (const action of ['stop', 'suspend']) {
     await engine[action]();
     t.mock.timers.tick(120000); await settle();
     assert.equal(f.requests.length, starts); assert.equal(f.prepareCalls.length, 4);
-    assert.equal(engine.preparing.size, 0); assert.equal(engine.waitingPrepare.size, 0);
+    assert.equal(engine.preparing.size, 0);
     assert.equal(engine.connections.size, 0); assert.equal(f.pending.size, 0);
     if (action === 'stop') engine.start(); else engine.resume();
     await settle();
@@ -148,3 +150,31 @@ for (const action of ['stop', 'suspend']) {
     assert.equal(f.peakPreparations, 4);
   });
 }
+
+test('20,000 candidates: each preparation vacancy touches only the replacement and completed job', async t => {
+  const f = fixture(t, { concurrency: 4, warmVout: 65535 }), { engine } = f;
+  const warm = row(65535), rows = Array.from({ length: 19999 }, (_, index) => row(index));
+  engine.enqueue([warm]); engine.start(); await settle();
+  const setReady = t.mock.method(engine.scheduler, 'setReady');
+  const next = t.mock.method(engine.scheduler, 'next');
+  engine.enqueue(rows); f.requests[0].finish(); await settle();
+  assert.equal(engine.queue.size, 20000);
+  assert.deepEqual(f.prepareCalls, [0, 1, 2, 3]);
+  assert.ok(setReady.mock.callCount() <= 8, 'initial saturation must not park the full backlog');
+  assert.ok(next.mock.callCount() <= 12, 'prepared captures bypass the indexed preparation backlog');
+  for (let cycle = 0; cycle < 6; cycle++) {
+    const writes = setReady.mock.callCount(), selections = next.mock.callCount();
+    f.pending.values().next().value(new Error('Controlled retry'));
+    await settle();
+    assert.equal(engine.preparing.size, 3, 'full capture capacity still delays preparation');
+    f.requests.find(request => !request.settled).finish(); await settle();
+    assert.equal(engine.preparing.size, 4);
+    assert.equal(f.prepareCalls.at(-1), 4 + cycle);
+    assert.ok(setReady.mock.callCount() - writes <= 4, 'one vacancy must not wake/repark 20,000 jobs');
+    assert.ok(next.mock.callCount() - selections <= 6, 'selection work must be independent of queue length');
+  }
+  assert.equal(f.peakPreparations, 4);
+  assert.equal(engine.snapshot().attempts, f.requests.length);
+  assert.equal(engine.successCounts.size, 1, 'only the warm bounty produced actual captures');
+  assert.equal(engine.pendingProofs.size, 0); assert.equal(engine.completed.size, 0);
+});

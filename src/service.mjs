@@ -5,19 +5,25 @@ import { ClaimsEngine } from './core/claims-engine.mjs';
 import { ConnectionPool } from './core/claim-pool.mjs';
 import { isKnownClaimRejection } from './core/claims.mjs';
 import { discoverBounties, readBountyBlock, bountyKey } from './core/bounty-discovery.mjs';
-import { prepareClaim, attachClaimProof, estimateClaimFee, transactionIdFromRaw } from './core/transaction.mjs';
+import { prepareClaim, attachClaimProof, estimateClaimFee, transactionIdFromRaw, FundingTransactionCache } from './core/transaction.mjs';
 import { BroadcastJournal, transactionDigest } from './broadcast-journal.mjs';
 import { deferredBroadcast, validateSavedClaim, validateObservedClaim } from './broadcast-recovery.mjs';
 import { diagnosticError } from './core/diagnostics.mjs';
 import { ClaimMetrics } from './metrics.mjs';
 
 const aborted = () => Object.assign(new Error('Claimer stopped or its RPC connection changed.'), { name: 'AbortError', code: 'ABORT_ERR', notSent: true });
+const MAX_FUNDING_CACHE_ENTRIES = 256;
+const MAX_FUNDING_CACHE_BYTES = 16 * 1024 * 1024;
 const transient = error => [-32001, -32002, -32029, -32030].includes(error?.code) ||
   ['ECONNRESET', 'ECONNREFUSED', 'ENETUNREACH', 'EHOSTUNREACH', 'ETIMEDOUT', 'ENOTFOUND', 'EAI_AGAIN', 'EPIPE'].includes(error?.code) ||
   /^(?:Cannot connect to RPC|RPC connection timed out\.|RPC request timed out\.|Connection to the RPC server was lost\.|RPC connection is closed\.|RPC connection closed before connecting\.)/.test(error?.message ?? '');
 
 /** Address-only orchestration. No wallet, private key, or local Core RPC is involved. */
 export class ClaimerService {
+  #fundingCache = new Map();
+  #fundingBytes = 0;
+  #fundingValidation = new FundingTransactionCache();
+
   constructor({ config, basePath = process.cwd(), statePath = resolve(basePath, 'claimer.conf.state.json'), emit = () => {},
     rpcFactory = options => new RpcClient(options), engineFactory = options => new ClaimsEngine(options), poolFactory,
     journal = new BroadcastJournal(statePath), discover = discoverBounties, readBlock = readBountyBlock,
@@ -26,11 +32,17 @@ export class ClaimerService {
     pollMs = 5000, retryMinMs = 1000, retryMaxMs = 30000, setTimer = setTimeout, clearTimer = clearTimeout } = {}) {
     Object.assign(this, { config, basePath, statePath, emit, journal, discover, readBlock, prepareTransaction: prepare,
       attachProof: attach, transactionId, validateSaved, validateObserved, pollMs, retryMinMs, retryMaxMs, setTimer, clearTimer });
+    // Preserve injected callbacks and their raw-string API. The production
+    // callbacks share privately owned, fully validated parents for this epoch.
+    if (prepare === prepareClaim) {
+      this.prepareTransaction = options => this.#fundingValidation.prepareClaim(options);
+      if (transactionId === transactionIdFromRaw) this.transactionId = raw => this.#fundingValidation.transactionId(raw);
+    }
     this.running = false; this.started = false; this.ready = false; this.epoch = 0; this.failures = 0;
     this.status = 'stopped'; this.lastError = null; this.fatalError = null; this.tip = null;
     this.blocks = new Map(); this.outpoints = new Map(); this.cursor = null; this.blockWindow = null; this.reserved = new Set();
     this.catalogGate = null;
-    this.fundingCache = new Map(); this.fundingPending = new Map(); this.ioAbort = new AbortController();
+    this.fundingPending = new Map(); this.ioAbort = new AbortController();
     this.metrics = new ClaimMetrics();
     this.timer = null; this.cycling = null; this.suspending = null; this.stopping = null;
     this.inFlightBroadcasts = new Set(); this.recoveryDue = new Map(); this.recoveryBlocked = new Set();
@@ -150,7 +162,7 @@ export class ClaimerService {
   disconnected() {
     if (!this.running || this.fatalError) return;
     this.epoch++; this.ioAbort.abort(); this.cancelCatalogWaiters(); this.ioAbort = new AbortController();
-    this.tip = null; this.blockWindow = null; this.fundingCache.clear(); this.fundingPending.clear();
+    this.tip = null; this.blockWindow = null; this.clearFundingCache(); this.fundingPending.clear();
     this.status = 'reconnecting';
     const epoch = this.epoch;
     const saved = this.persistPendingProofs(), previous = this.suspending;
@@ -252,9 +264,17 @@ export class ClaimerService {
     }
   }
 
+  clearFundingCache() {
+    this.#fundingCache.clear(); this.#fundingBytes = 0; this.#fundingValidation.clear();
+  }
+
   async funding(txid, { signal, epoch = this.epoch } = {}) {
     this.check(epoch, signal);
-    if (this.fundingCache.has(txid)) return this.fundingCache.get(txid);
+    if (this.#fundingCache.has(txid)) {
+      const cached = this.#fundingCache.get(txid);
+      this.#fundingCache.delete(txid); this.#fundingCache.set(txid, cached);
+      return cached.raw;
+    }
     let entry = this.fundingPending.get(txid);
     if (!entry || entry.epoch !== epoch) {
       if (this.fundingPending.size >= 256) throw new Error('Too many funding lookups are pending.');
@@ -268,8 +288,15 @@ export class ClaimerService {
           validateTip(result?.tip, this.config.network); raw = result.transaction?.hex;
           if (this.transactionId(raw) !== txid) throw new Error('RPC funding bytes do not match their transaction ID.');
         } catch (error) { error.helperFatal = true; this.fail(error); throw error; }
-        if (this.fundingCache.size >= 256) this.fundingCache.delete(this.fundingCache.keys().next().value);
-        this.fundingCache.set(txid, raw); return raw;
+        const bytes = 256 + txid.length * 2 + raw.length * 2;
+        if (bytes <= MAX_FUNDING_CACHE_BYTES) {
+          while (this.#fundingCache.size >= MAX_FUNDING_CACHE_ENTRIES || this.#fundingBytes + bytes > MAX_FUNDING_CACHE_BYTES) {
+            const oldest = this.#fundingCache.keys().next().value;
+            this.#fundingBytes -= this.#fundingCache.get(oldest).bytes; this.#fundingCache.delete(oldest);
+          }
+          this.#fundingCache.set(txid, { raw, bytes }); this.#fundingBytes += bytes;
+        }
+        return raw;
       })().finally(() => { if (this.fundingPending.get(txid) === entry) this.fundingPending.delete(txid); });
       this.fundingPending.set(txid, entry);
     }
@@ -473,6 +500,7 @@ export class ClaimerService {
     this.running = false; this.ready = false; this.status = this.fatalError.unknownOutcome ? 'review-required' : 'failed';
     this.lastError = this.fatalError.message;
     this.epoch++; this.ioAbort.abort();
+    this.clearFundingCache();
     this.cancelCatalogWaiters();
     if (this.recoveryTimer !== null) this.clearTimer(this.recoveryTimer); this.recoveryTimer = null;
     if (this.timer !== null) this.clearTimer(this.timer); this.timer = null;
@@ -488,6 +516,7 @@ export class ClaimerService {
   stop() {
     if (this.stopping) return this.stopping;
     this.running = false; this.ready = false; this.epoch++; this.ioAbort.abort();
+    this.clearFundingCache();
     this.cancelCatalogWaiters();
     if (this.recoveryTimer !== null) this.clearTimer(this.recoveryTimer); this.recoveryTimer = null;
     if (this.timer !== null) this.clearTimer(this.timer); this.timer = null;

@@ -102,7 +102,8 @@ const deadline = value => {
  * No RNG, network, keys or mutable rank comparator.
  * Rebuild (normally every five seconds) snapshots each job's exact adjusted priority
  * and each domain/mask's observed rate. The hot path uses indexed ready sets, not
- * queue scans/sorts. Call setReady/remove when a job changes outside a refresh.
+ * queue scans/sorts. Call setReady/remove when a job changes outside a refresh,
+ * or refreshPrepared when only its cached proposal changes.
  * next is a peek; commit consumes a turn only after a connection is dispatched.
  */
 export class ClaimScheduler {
@@ -120,7 +121,10 @@ export class ClaimScheduler {
   clear({ preserveSelection = true } = {}) {
     this.entries = new Map(); this.groups = new Map(); this.names = [];
     this.readyDomains = new ReadyIndex([]);
-    this.economic = new IndexedHeap((a, b) => b.score - a.score || compareClaimPriority(a.leader, b.leader) || compareText(a.name, b.name));
+    this.preparedDomains = new ReadyIndex([]);
+    const compareEconomic = (a, b) => b.score - a.score || compareClaimPriority(a.leader, b.leader) || compareText(a.name, b.name);
+    this.economic = new IndexedHeap(compareEconomic);
+    this.preparedEconomic = new IndexedHeap(compareEconomic);
     this.waiting = new IndexedHeap((a, b) => a.due - b.due || compareText(a.id, b.id));
     this.pending = null;
     if (!preserveSelection) {
@@ -147,16 +151,19 @@ export class ClaimScheduler {
       if (!Number.isFinite(score)) continue;
       let group = this.groups.get(name);
       if (!group) {
-        group = { name, entries: [], masks: new Map(), active: false, gate: this.domainGates.get(name) ?? { ready: true, due: 0 } };
+        group = { name, entries: [], masks: new Map(), active: false, preparedActive: false,
+          gate: this.domainGates.get(name) ?? { ready: true, due: 0 } };
         this.groups.set(name, group);
       }
       const due = deadline(Math.max(job.due ?? 0, job.recoveryProbe ? job.probeDue ?? 0 : 0)), allowed = Boolean(isReady(job));
-      const entry = { key, job, ...rank, score, due, allowed, active: allowed && due <= now, group };
+      const active = allowed && due <= now;
+      const entry = { key, job, ...rank, score, due, allowed, active, preparedActive: active && Boolean(job.prepared), group };
       this.entries.set(key, entry); group.entries.push(entry);
     }
     for (const name of this.domainGates.keys()) if (!trackedDomains.has(name)) this.domainGates.delete(name);
     this.names = [...this.groups.keys()].sort(compareText);
     this.readyDomains = new ReadyIndex(this.names.map(() => 0));
+    this.preparedDomains = new ReadyIndex(this.names.map(() => 0));
     for (let index = 0; index < this.names.length; index++) {
       const group = this.groups.get(this.names[index]); group.index = index;
       group.entries.sort(compareClaimPriority);
@@ -169,7 +176,10 @@ export class ClaimScheduler {
         if (entry.allowed && entry.due > now) this.waiting.set(`job:${entry.key}`, { id: `job:${entry.key}`, due: entry.due, entry });
       }
       group.ready = new ReadyIndex(group.entries.map(entry => Number(entry.active)));
-      for (const mask of group.masks.values()) mask.ready = new ReadyIndex(mask.entries.map(entry => Number(entry.active)));
+      for (const mask of group.masks.values()) {
+        mask.ready = new ReadyIndex(mask.entries.map(entry => Number(entry.active)));
+        mask.preparedReady = new ReadyIndex(mask.entries.map(entry => Number(entry.preparedActive)));
+      }
       this.armDomain(group, now);
       this.refreshGroup(group, now);
     }
@@ -180,23 +190,39 @@ export class ClaimScheduler {
     else this.waiting.remove(id);
   }
   refreshGroup(group, now) {
-    let leader;
+    let leader, preparedLeader;
     // There are at most seven supported signature masks, not N bounties.
     if (group.gate.ready && group.gate.due <= now) for (const mask of group.masks.values()) {
-      if (!mask.ready.total) continue;
-      const candidate = mask.entries[mask.ready.at(0)];
-      if (!leader || candidate.score > leader.score || (candidate.score === leader.score && compareClaimPriority(candidate, leader) < 0)) leader = candidate;
+      if (mask.ready.total) {
+        const candidate = mask.entries[mask.ready.at(0)];
+        if (!leader || candidate.score > leader.score || (candidate.score === leader.score && compareClaimPriority(candidate, leader) < 0)) leader = candidate;
+      }
+      if (mask.preparedReady.total) {
+        const candidate = mask.entries[mask.preparedReady.at(0)];
+        if (!preparedLeader || candidate.score > preparedLeader.score || (candidate.score === preparedLeader.score && compareClaimPriority(candidate, preparedLeader) < 0)) preparedLeader = candidate;
+      }
     }
     const active = Boolean(leader);
     group.leader = leader;
     if (group.active !== active) { this.readyDomains.add(group.index, active ? 1 : -1); group.active = active; }
     if (active) this.economic.set(group.name, { name: group.name, score: leader.score, leader, group });
     else this.economic.remove(group.name);
+    const preparedActive = Boolean(preparedLeader);
+    group.preparedLeader = preparedLeader;
+    if (group.preparedActive !== preparedActive) { this.preparedDomains.add(group.index, preparedActive ? 1 : -1); group.preparedActive = preparedActive; }
+    if (preparedActive) this.preparedEconomic.set(group.name, { name: group.name, score: preparedLeader.score, leader: preparedLeader, group });
+    else this.preparedEconomic.remove(group.name);
   }
   setActive(entry, active, now) {
-    if (entry.active === active) return;
-    const delta = active ? 1 : -1; entry.active = active;
-    entry.group.ready.add(entry.position, delta); entry.mask.ready.add(entry.maskPosition, delta);
+    const preparedActive = active && Boolean(entry.job.prepared);
+    if (entry.active === active && entry.preparedActive === preparedActive) return;
+    if (entry.active !== active) {
+      const delta = active ? 1 : -1; entry.active = active;
+      entry.group.ready.add(entry.position, delta); entry.mask.ready.add(entry.maskPosition, delta);
+    }
+    if (entry.preparedActive !== preparedActive) {
+      entry.preparedActive = preparedActive; entry.mask.preparedReady.add(entry.maskPosition, preparedActive ? 1 : -1);
+    }
     this.refreshGroup(entry.group, now);
   }
   setReady(key, ready, { due, now = Date.now() } = {}) {
@@ -208,6 +234,13 @@ export class ClaimScheduler {
     if (entry.allowed && entry.due > now) this.waiting.set(id, { id, due: entry.due, entry });
     else this.waiting.remove(id);
     this.setActive(entry, entry.allowed && entry.due <= now, now);
+    return true;
+  }
+  refreshPrepared(key, { now = Date.now() } = {}) {
+    deadline(now);
+    const entry = this.entries.get(key);
+    if (!entry) return false;
+    this.setActive(entry, entry.active, now);
     return true;
   }
   setDomainReady(name, ready, { due = 0, now = Date.now() } = {}) {
@@ -237,19 +270,22 @@ export class ClaimScheduler {
     }
   }
   nextDue() { return this.waiting.peek()?.due ?? Infinity; }
-  next(now = Date.now()) {
+  next(now = Date.now(), { allowPreparation = true } = {}) {
     deadline(now); this.promote(now);
-    if (!this.readyDomains.total) return undefined;
+    // Both views use the same turn cursor, rank snapshots and domain gates.
+    // Capacity switches views in O(1), without waking/reparking the backlog.
+    const readyDomains = allowPreparation ? this.readyDomains : this.preparedDomains;
+    if (!readyDomains.total) return undefined;
     let group;
-    if (this.preferReward) group = this.economic.peek().group;
+    if (this.preferReward) group = (allowPreparation ? this.economic : this.preparedEconomic).peek().group;
     else {
       const index = this.domainAfter === null ? 0 : upperBound(this.names, this.domainAfter, compareText);
-      const before = this.readyDomains.before(index);
-      group = this.groups.get(this.names[this.readyDomains.at(before < this.readyDomains.total ? before : 0)]);
+      const before = readyDomains.before(index);
+      group = this.groups.get(this.names[readyDomains.at(before < readyDomains.total ? before : 0)]);
     }
     // Fair and economic turns both use the leader whose mask-adjusted score
     // ranks this domain. In-flight attempts do not rotate to worse bounties.
-    const entry = group.leader;
+    const entry = allowPreparation ? group.leader : group.preparedLeader;
     const token = { serial: this.serial, job: entry.job, key: entry.key, domain: group.name, economic: this.preferReward, committed: false };
     const result = [entry.key, entry.job];
     Object.defineProperty(result, selectionToken, { value: token });

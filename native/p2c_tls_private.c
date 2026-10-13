@@ -107,9 +107,12 @@ int connectcoin_p2c_fetch_certificate(mbedtls_ssl_context* ssl)
     if (ret != 0) return ret;
     ret = capture_certificate_structure(ssl, body, body + length);
     if (ret != 0) return ret;
-    ret = mbedtls_ssl_add_hs_msg_to_checksum(ssl, MBEDTLS_SSL_HS_CERTIFICATE,
-                                           body, length);
-    if (ret != 0) return ret;
+    /* This capture path stops after fetching CertificateVerify and never
+     * authenticates Finished or derives application traffic keys. Its TLS
+     * transcript checksum is therefore no longer consumed. The owned proof
+     * parser independently hashes the exact captured messages, and the full
+     * verifier authenticates the certificate chain and CertificateVerify.
+     * Completed handshakes use the original Mbed TLS certificate handler. */
     mbedtls_ssl_handshake_set_state(ssl, MBEDTLS_SSL_CERTIFICATE_VERIFY);
     return 0;
 }
@@ -122,6 +125,15 @@ int connectcoin_p2c_fetch_certificate_verify(mbedtls_ssl_context* ssl)
                                                &body, &length);
 }
 #ifdef CLAIMER_NETWORK_TESTING
+static int forbidden_abbreviated_checksum(mbedtls_ssl_context* ssl,
+                                         const unsigned char* message,
+                                         size_t length)
+{
+    (void) ssl;
+    (void) message;
+    (void) length;
+    return MBEDTLS_ERR_SSL_INTERNAL_ERROR;
+}
 int connectcoin_p2c_test_certificate(const unsigned char* message, size_t length,
                                    int abbreviated, uint32_t sent_extensions,
                                    uint32_t* received_extensions, int* peer_present)
@@ -155,6 +167,10 @@ int connectcoin_p2c_test_certificate(const unsigned char* message, size_t length
     ssl.in_hslen = length;
     ssl.keep_current_message = 1;
     ssl.handshake->sent_extensions = sent_extensions;
+    /* A valid abbreviated fixture must still succeed with checksum updates
+     * forbidden. The original full-handshake branch retains its real checksum,
+     * so differential fixtures also protect that branch from this optimization. */
+    if (abbreviated) ssl.handshake->update_checksum = forbidden_abbreviated_checksum;
     mbedtls_ssl_handshake_set_state(&ssl, MBEDTLS_SSL_SERVER_CERTIFICATE);
     ret = abbreviated ? connectcoin_p2c_fetch_certificate(&ssl)
                       : mbedtls_ssl_tls13_process_certificate(&ssl);

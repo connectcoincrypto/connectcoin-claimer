@@ -8,8 +8,10 @@ unsigned char* connectcoin_p2c_client_random(mbedtls_ssl_context* ssl);
 /* Abbreviated capture only: retain the pinned TLS Certificate envelope and
  * extension-admission checks, but leave DER parsing/authentication to the
  * caller's exact-byte owned certificate cache and full proof verifier.
- * Advances to CertificateVerify only after successful fetch/checksum update;
- * it must never be used for a completed TLS handshake. */
+ * Advances to CertificateVerify only after successful fetch/structure checks.
+ * Does not update the discarded TLS transcript checksum; the owned proof
+ * verifier hashes/authenticates the captured transcript independently. It
+ * must never be used for a completed TLS handshake. */
 int connectcoin_p2c_fetch_certificate(mbedtls_ssl_context* ssl);
 /* Fetch/decrypt only. The caller must independently authenticate the returned
  * proof; this does not validate the CertificateVerify signature or advance TLS. */

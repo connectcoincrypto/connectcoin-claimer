@@ -74,7 +74,7 @@ export class ClaimsEngine {
     this.recoveryJobs = new Map();
     this.pendingStarts = new Set(); this.pendingRecovery = new Map();
     this.tasks = new Set(); this.preparing = new Set(); this.resolving = new Set(); this.controllers = new Set();
-    this.waitingPrepare = new Set(); this.waitingDns = new Set();
+    this.waitingDns = new Set();
     this.scheduler = new ClaimScheduler({ connectionRate: job => this.connectionRate(job), isReady: job => this.ready(job), minExpectedReturn: this.minExpectedReturn });
     this.enabled = false; this.paused = false; this.dirty = true; this.nextDiagnosticId = 0; this.nextToken = 0; this.generation = 0;
     this.nextStart = 0; this.startIdle = true; this.timer = null; this.refreshTimer = null; this.coordinator = null; this.stopping = null;
@@ -178,7 +178,7 @@ export class ClaimsEngine {
     this.tasks.add(tracked); return tracked;
   }
   eligible(job) { return !job.unavailable && !job.retired && !job.winner && !job.budgetExceeded; }
-  ready(job) { return this.eligible(job) && !job.preparing && !job.waitingPrepare &&
+  ready(job) { return this.eligible(job) && !job.preparing &&
     !(job.recoveryProbe && this.pendingRecovery.has(policyOf(job))); }
   drawIndex(length) {
     const value = this.randomIndex(length);
@@ -233,7 +233,10 @@ export class ClaimsEngine {
     this.scheduler.rebuild(this.queue);
     this.dirty = false;
   }
-  nextReady(now = Date.now()) { if (this.dirty) this.rebuild(); return this.scheduler.next(now); }
+  nextReady(now = Date.now()) {
+    if (this.dirty) this.rebuild();
+    return this.scheduler.next(now, { allowPreparation: this.preparing.size < 4 });
+  }
   markAssigned(jobOrSelection) { this.scheduler.commit(jobOrSelection); }
   enqueue(bounties) {
     if (!Array.isArray(bounties)) throw new Error('Bounty list required');
@@ -277,7 +280,7 @@ export class ClaimsEngine {
       const probeSlots = Math.min(recovery.length, MAX_RECOVERY_POLICIES, Math.max(1, Math.floor(this.maxQueue / 10)), Math.max(0, slots - Math.max(proofSlots, Number(ordinary.length > 0))));
       const selected = [...ordinary.slice(0, slots - probeSlots), ...recovery.slice(0, probeSlots)];
       const retained = new Set([...protectedKeys, ...selected.map(item => item.key)]);
-      for (const [key, job] of this.queue) if (!retained.has(key)) { this.queue.delete(key); this.waitingPrepare.delete(job); }
+      for (const key of this.queue.keys()) if (!retained.has(key)) this.queue.delete(key);
       for (const { key, job, fresh } of selected) if (fresh) { job.bounty = structuredClone(job.bounty); this.queue.set(key, job); count++; }
     }
     this.dirty = true; if (count) this.notify(); this.kick(); return count;
@@ -318,7 +321,7 @@ export class ClaimsEngine {
   remove(txid, vout) {
     const key = `${txid}:${vout}`, job = this.queue.get(key); this.queue.delete(key); this.scheduler.remove(key);
     this.pendingProofs.delete(key);
-    if (job) { job.unavailable = true; this.cancelOperation(job.prepareController, 'unavailable'); this.cancelOperation(job.submitController, 'unavailable'); this.waitingPrepare.delete(job); }
+    if (job) { job.unavailable = true; this.cancelOperation(job.prepareController, 'unavailable'); this.cancelOperation(job.submitController, 'unavailable'); }
     let cancelled = false;
     for (const request of this.connections.values()) if (keyOf(request.job.bounty) === key) { request.job.unavailable = true; this.cancelOperation(request.controller, 'unavailable'); cancelled = true; }
     if (this.compatActiveKey === key && this.compatController && !this.compatController.signal.aborted) { this.compatController.abort(); cancelled = true; }
@@ -338,7 +341,7 @@ export class ClaimsEngine {
     for (const job of this.queue.values()) job.unavailable = true;
     this.queue.clear();
     this.recoveryJobs.clear();
-    this.waitingPrepare.clear(); this.waitingDns.clear();
+    this.waitingDns.clear();
     for (const controller of this.controllers) this.cancelOperation(controller, 'clear');
     this.scheduler.clear({ preserveSelection }); this.dirty = true;
     if (!preserveSelection) { this.completed.clear(); this.deferredBroadcasts.clear(); this.factors.clear(); this.successCounts.clear(); this.proposals.clear(); this.pendingProofs.clear(); this.domainStats.clear(); this.connectionPolicy.clear(); }
@@ -381,8 +384,7 @@ export class ClaimsEngine {
     this.stopping = pending.finally(() => {
       this.stopping = null; this.dns.clear(); this.scheduler.domainGates.clear();
       this.pendingStarts.clear(); this.pendingRecovery.clear(); this.nextStart = 0; this.startIdle = true;
-      for (const job of this.waitingPrepare) job.waitingPrepare = false;
-      this.waitingPrepare.clear(); this.waitingDns.clear(); this.dirty = true;
+      this.waitingDns.clear(); this.dirty = true;
       const reason = this.haltReason; this.haltReason = null;
       if (this.diagnosticRun) {
         const event = this.enabled ? 'claims.suspended' : 'claims.stopped';
@@ -430,7 +432,6 @@ export class ClaimsEngine {
       await this.poolReady;
     } else await this.poolReady;
     if (!this.enabled || this.paused || generation !== this.generation) return;
-    this.refreshPreparationReadiness();
     this.retrySubmissions(generation);
     for (let checked = 0; checked < this.maxQueue + 8; checked++) {
       // At least two pending starts let one slow admission be bypassed. The
@@ -457,9 +458,6 @@ export class ClaimsEngine {
       const [key, job] = selection;
       if (!this.ready(job)) { this.scheduler.remove(key); continue; }
       if (!job.prepared) {
-        if (this.preparing.size >= 4) {
-          job.waitingPrepare = true; this.waitingPrepare.add(job); this.scheduler.setReady(key, false); continue;
-        }
         this.prepareJob(job, generation); continue;
       }
       const dns = this.dns.get(job.bounty.domain);
@@ -479,7 +477,11 @@ export class ClaimsEngine {
     if (!this.proposals.has(key) && this.proposals.size >= 256) {
       const old = [...this.proposals.keys()].find(candidate => !this.hasActive(candidate) && !this.pendingProofs.has(candidate) && !this.queue.get(candidate)?.winner);
       if (!old) return false;
-      this.proposals.delete(old); const idle = this.queue.get(old); if (idle) idle.prepared = undefined;
+      this.proposals.delete(old); const idle = this.queue.get(old);
+      if (idle) {
+        idle.prepared = undefined;
+        this.scheduler.refreshPrepared(old);
+      }
     }
     this.proposals.delete(key); this.proposals.set(key, prepared); return true;
   }
@@ -680,21 +682,6 @@ export class ClaimsEngine {
       if (job && !job.unavailable && !job.submitting) due = Math.min(due, pending.due);
     }
     return due;
-  }
-  refreshPreparationReadiness() {
-    if (this.preparing.size >= 4) return;
-    // A free slot is capacity, not a reservation for one particular waiter.
-    // That waiter can be removed/retired before preparation ever starts, so
-    // completion-only, wake-one notifications can strand the rest forever.
-    // Re-admit all parked candidates to the priority scheduler when capacity
-    // exists; pump still enforces four preparations, original due times and
-    // capture capacity. Empty waiter sets make normal connection pumps O(1).
-    for (const job of this.waitingPrepare) {
-      this.waitingPrepare.delete(job); job.waitingPrepare = false;
-      const key = keyOf(job.bounty);
-      if (this.queue.get(key) !== job) continue;
-      this.scheduler.setReady(key, this.ready(job) && this.attemptable(job), { due: this.jobDue(job) });
-    }
   }
   releaseDnsSlot() {
     for (const domain of this.waitingDns) {

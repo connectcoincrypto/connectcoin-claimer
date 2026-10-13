@@ -236,6 +236,105 @@ test('20,000 candidates: 1,000 selections never rescan jobs, call rate estimatio
   assert.equal(scheduler.entries.size, 20000);
 });
 
+test('prepared selection preserves exact ties, shared turns, gates and cache eviction', () => {
+  const a = job(256, 'alpha.example', 3000n), b = job(1, 'alpha.example', 3000n, { prepared: {} });
+  const c = job(2, 'beta.example', 2000n, { prepared: {} }), d = job(3, 'gamma.example', 4000n);
+  const scheduler = new ClaimScheduler(); scheduler.rebuild(queue([b, d, a, c]), { now: 0 });
+  const peek = allowPreparation => scheduler.next(0, { allowPreparation });
+  assert.equal(peek(true)[1], a, 'same-priority preparation uses storage-byte order');
+  assert.equal(peek(false)[1], b, 'full preparation capacity still allows the best prepared bounty');
+  assert.equal(scheduler.preferReward, false, 'changing views never spends a connection turn');
+  scheduler.commit(peek(false));
+  assert.equal(peek(true)[1], d, 'economic turn ranks all domains when capacity is free');
+  assert.equal(peek(false)[1], b, 'the same economic turn ranks prepared domain leaders when full');
+  scheduler.setDomainReady('alpha.example', false, { now: 0 });
+  assert.equal(peek(false)[1], c);
+  scheduler.commit(peek(false));
+  scheduler.setDomainReady('alpha.example', true, { now: 0 });
+  assert.equal(peek(true)[1], c, 'the economic beta dispatch did not advance the fair alpha cursor');
+  assert.equal(peek(false)[1], c);
+  scheduler.commit(peek(false));
+  assert.equal(peek(true)[1], d);
+  scheduler.commit(peek(false));
+  assert.equal(peek(true)[1], d, 'preparation peeks preserve the fair cursor after beta');
+  assert.equal(peek(false)[1], b, 'fair selection wraps over only prepared domains');
+  b.prepared = undefined; scheduler.refreshPrepared(keyOf(b), { now: 0 });
+  assert.equal(peek(false)[1], c, 'cache eviction removes a still-ready job from the prepared index');
+  a.prepared = {}; scheduler.setReady(keyOf(a), true, { now: 0 });
+  assert.equal(peek(false)[1], a, 'preparation completion joins the prepared index without a rebuild');
+  scheduler.remove(keyOf(a), { now: 0 });
+  scheduler.remove(keyOf(c), { now: 0 });
+  assert.equal(peek(false), undefined);
+  assert.equal(peek(true)[1], d, 'removing candidates cannot strand other unprepared entries');
+});
+
+test('four-slot preparation transitions match a scan/sort dispatch oracle with retries, removal and retirement', () => {
+  let seed = 0x1234abcd;
+  const random = max => { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; return (seed >>> 8) % max; };
+  const jobs = Array.from({ length: 240 }, (_, id) => job(id + 1, `domain${String(id % 20).padStart(2, '0')}.example`,
+    2000n + BigInt(random(6) * 1000), { mask: 1 + Math.floor(id / 20) % 7, prepared: id % 4 === 0 ? {} : undefined }));
+  const items = queue(jobs), gates = new Map(), preparing = new Set();
+  const rate = item => item.bounty.signature_algorithms_mask + 1;
+  const scheduler = new ClaimScheduler({ connectionRate: rate, isReady: item => !item.preparing });
+  scheduler.rebuild(items, { now: 0 });
+  let after = null, economic = false, preparations = 0, dispatches = 0, saturated = 0, retries = 0;
+  const expectedNext = now => {
+    const groups = new Map();
+    for (const item of items.values()) {
+      const gate = gates.get(item.bounty.domain);
+      if (item.retired || item.preparing || item.due > now || (!item.prepared && preparing.size >= 4) ||
+          (gate && (!gate.ready || gate.due > now))) continue;
+      const score = domainPriority(item.priority, rate(item), 1_000_000), previous = groups.get(item.bounty.domain);
+      if (!previous || score > previous.score || (score === previous.score && compareClaimPriority(item, previous.item) < 0)) {
+        groups.set(item.bounty.domain, { item, score });
+      }
+    }
+    if (!groups.size) return undefined;
+    if (economic) return [...groups.values()].sort((a, b) => b.score - a.score || compareClaimPriority(a.item, b.item))[0].item;
+    const names = [...groups.keys()].sort(), name = names.find(value => after === null || value > after) ?? names[0];
+    return groups.get(name).item;
+  };
+  for (let now = 0; now < 600; now++) {
+    if (now % 2 === 0 && preparing.size) {
+      const completed = [...preparing][random(preparing.size)];
+      preparing.delete(completed); completed.preparing = false;
+      if (random(4) === 0) { completed.due = now + 15; retries++; }
+      else completed.prepared = {};
+      scheduler.setReady(keyOf(completed), true, { now, due: completed.due });
+    }
+    const changed = jobs[random(jobs.length)], key = keyOf(changed);
+    if (items.has(key) && !changed.preparing) {
+      if (now % 7 === 0) {
+        changed.prepared = undefined; scheduler.refreshPrepared(key, { now });
+      }
+      if (now % 11 === 0) {
+        const gate = { ready: random(4) !== 0, due: now + random(6) };
+        gates.set(changed.bounty.domain, gate); scheduler.setDomainReady(changed.bounty.domain, gate.ready, { now, due: gate.due });
+      }
+      if (now % 17 === 0) { items.delete(key); scheduler.remove(key, { now }); }
+      else if (now % 19 === 0) { changed.retired = true; scheduler.remove(key, { now }); }
+    }
+    if (now % 31 === 0) scheduler.rebuild(items, { now });
+    for (let admission = 0; admission < 8; admission++) {
+      const expected = expectedNext(now), selection = scheduler.next(now, { allowPreparation: preparing.size < 4 });
+      assert.equal(selection?.[1], expected, `dispatch trace differs at ${now}:${admission}`);
+      if (!selection) break;
+      if (!expected.prepared) {
+        expected.preparing = true; preparing.add(expected); preparations++;
+        assert.ok(preparing.size <= 4);
+        scheduler.setReady(keyOf(expected), false, { now });
+      } else {
+        assert.equal(scheduler.commit(selection), true); dispatches++;
+        if (preparing.size === 4) saturated++;
+        if (!economic) after = expected.bounty.domain;
+        economic = !economic;
+      }
+    }
+  }
+  assert.ok(preparations > 30 && dispatches > 100 && saturated > 30 && retries > 5,
+    `trace must exercise capacity transitions, full captures and retries: ${JSON.stringify({ preparations, dispatches, saturated, retries })}`);
+});
+
 test('successful connection budget is strict and exact across easiest/hardest targets and uint64 saturation', () => {
   assert.equal(isP2CClaimConnectionLimitExceeded(maximum, 2), false);
   assert.equal(isP2CClaimConnectionLimitExceeded(maximum, 3), true);

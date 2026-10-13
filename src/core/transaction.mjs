@@ -243,6 +243,61 @@ export function verifyFunding(utxo, expectedPublicKey) {
   return checkFundingOutput(utxo, expectedPublicKey, funding, transactionId(funding));
 }
 
+/** Full validation of exact immutable bytes, scoped to one service/RPC epoch. */
+export class FundingTransactionCache {
+  #entries = new Map();
+  #bytes = 0;
+  #maxEntries;
+  #maxBytes;
+
+  constructor({ maxEntries = 256, maxBytes = 32 * 1024 * 1024 } = {}) {
+    if (!Number.isSafeInteger(maxEntries) || maxEntries < 1 || maxEntries > 256 ||
+        !Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > 32 * 1024 * 1024) throw new Error('Invalid funding cache bounds');
+    this.#maxEntries = maxEntries; this.#maxBytes = maxBytes;
+  }
+
+  get size() { return this.#entries.size; }
+  get retainedBytes() { return this.#bytes; }
+  clear() { this.#entries.clear(); this.#bytes = 0; }
+
+  #validated(raw) {
+    const cached = this.#entries.get(raw);
+    if (cached) {
+      this.#entries.delete(raw); this.#entries.set(raw, cached);
+      return cached;
+    }
+    // No caller-supplied parsed object or txid can establish a cache entry.
+    // Complete parsing includes sibling outputs, curve checks, canonical
+    // reserialization, sums, duplicates and witness framing on the first use.
+    const publicKeys = new Map(), funding = parseTransactionWithKeys(raw, publicKeys);
+    const id = hash256(serializeTransactionWithKeys(funding, { witness: false }, publicKeys)).reverse().toString('hex');
+    const outputs = Object.freeze(funding.outputs.map(output => Object.freeze(output)));
+    // Charge strings as UTF-16 plus conservative object/map overhead. Retain
+    // only scalar outputs: decoded inputs, scripts and witness are discarded.
+    const bytes = 256 + raw.length * 2 + outputs.reduce((total, output) =>
+      total + 512 + Object.values(output).reduce((size, value) => size + (typeof value === 'string' ? value.length * 2 : 8), 0), 0);
+    const entry = Object.freeze({ id, outputs, bytes });
+    if (bytes <= this.#maxBytes) {
+      while (this.#entries.size >= this.#maxEntries || this.#bytes + bytes > this.#maxBytes) {
+        const oldest = this.#entries.keys().next().value;
+        this.#bytes -= this.#entries.get(oldest).bytes; this.#entries.delete(oldest);
+      }
+      this.#entries.set(raw, entry); this.#bytes += bytes;
+    }
+    return entry;
+  }
+
+  transactionId(raw) { return this.#validated(raw).id; }
+  verifyFunding(utxo, expectedPublicKey) {
+    if (!utxo || typeof utxo !== 'object') throw new Error('Missing funding output');
+    hexBytes(utxo.txid, 32, 'funding transaction ID');
+    const funding = this.#validated(utxo.rawTransaction);
+    // A caller may mutate the result without ever altering trusted cache data.
+    return { ...checkFundingOutput(utxo, expectedPublicKey, funding, funding.id) };
+  }
+  prepareClaim(options) { return prepareClaimWithFunding(options, (utxo, key) => this.verifyFunding(utxo, key)); }
+}
+
 export function dustThreshold(output) {
   const spend = output.type === 2 ? 41 + Math.ceil((1 + 5 + MAX_PROOF_SIZE) / 4) : 58;
   return BigInt((serializeOutput(output).length + spend) * 3);
@@ -263,8 +318,8 @@ export function estimateClaimFee(feeRate = DEFAULT_FEE_RATE, proofSize = MAX_PRO
   // Fixed one-input/one-output P2PK claim: 92 stripped bytes.
   return (BigInt(Math.ceil((92 * 4 + 2 + 1 + compactSize(proofSize).length + proofSize) / 4)) * BigInt(feeRate)).toString();
 }
-export function prepareClaim({ bounty, rawTransaction, rewardAddress, fee = estimateClaimFee(), network = 'main', maxFee = COIN.toString() }) {
-  const output = verifyFunding({ ...bounty, rawTransaction });
+function prepareClaimWithFunding({ bounty, rawTransaction, rewardAddress, fee = estimateClaimFee(), network = 'main', maxFee = COIN.toString() }, verify) {
+  const output = verify({ ...bounty, rawTransaction });
   if (output.type !== 2 || output.rootVersion !== 1) throw new Error('Not a supported P2C bounty');
   for (const [remote, local] of [['domain', 'domain'], ['connection_work_target', 'target'], ['root_certificates_version', 'rootVersion'], ['signature_algorithms_mask', 'mask']]) {
     if (bounty[remote] !== undefined && bounty[remote] !== output[local]) throw new Error(`Bounty ${remote} differs from the funding transaction`);
@@ -277,6 +332,7 @@ export function prepareClaim({ bounty, rawTransaction, rewardAddress, fee = esti
   const challenge = claimChallenge(transaction);
   return { transaction, hex: serializeTransaction(transaction).toString('hex'), txid: transactionId(transaction), challenge, clienthello_random: challenge, bounty: { ...bounty, ...output }, fee: feeAmount.toString(), payout: reward.amount };
 }
+export function prepareClaim(options) { return prepareClaimWithFunding(options, verifyFunding); }
 export function attachClaimProof(prepared, proofHex) {
   const proof = hexBytes(proofHex);
   if (proof.length < 1 || proof.length > MAX_PROOF_SIZE || proof[0] !== 2) throw new Error('Invalid P2C version-2 proof');

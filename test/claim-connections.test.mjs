@@ -510,7 +510,7 @@ test('a verified pending proof retains the only queue slot after resync even bey
   assert.equal(submitted[1].proof, submitted[0].proof);
 });
 
-test('a high-value candidate parked for preparation keeps its admission slot over a lower-value newcomer', async t => {
+test('a high-value candidate waiting for preparation keeps its admission slot over a lower-value newcomer', async t => {
   let pendingPrepares = 0;
   const { engine, attempts } = fixture(t, {
     maxQueue: 5, options: { connectionsPerSecond: 256, concurrency: 1 },
@@ -518,14 +518,16 @@ test('a high-value candidate parked for preparation keeps its admission slot ove
   });
   const bounties = ['alpha', 'beta', 'delta', 'epsilon', 'gamma'].map((domain, index) => row(index + 1, `${domain}.example`));
   engine.enqueue(bounties); engine.start();
-  await until(() => pendingPrepares === 4 && engine.waitingPrepare.size === 1);
-  const parked = [...engine.waitingPrepare][0], factor = parked.factor;
+  await until(() => pendingPrepares === 4);
+  const parked = [...engine.queue.values()].find(job => !job.preparing), factor = parked.factor;
   assert.equal(engine.hasActive(key(parked.bounty)), false, 'the parked candidate has not consumed a preparation slot');
   const low = { ...row(99, 'low.example'), amount: '1000000' };
   assert.equal(engine.enqueue([low]), 0);
   assert.equal(engine.queue.size, 5);
   assert.strictEqual(engine.queue.get(key(parked.bounty)), parked);
-  assert.equal(parked.factor, factor); assert.equal(engine.waitingPrepare.has(parked), true);
+  assert.equal(parked.factor, factor); assert.equal(parked.preparing, undefined);
+  assert.equal(engine.nextReady(), undefined, 'full preparation capacity keeps the queued candidate indexed but unavailable');
+  assert.strictEqual(engine.scheduler.next(Date.now(), { allowPreparation: true })[1], parked);
   assert.equal(engine.queue.has(key(low)), false); assert.equal(attempts.length, 0);
 });
 
