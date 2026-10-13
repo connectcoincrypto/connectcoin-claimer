@@ -30,6 +30,7 @@ for (const trigger of [-32004, -32011, 'resync_required']) test(`catalog reset $
   const rpc = { async request(method, params = {}) {
     calls.push({ method, params });
     if (method === 'getrecentblockhashes') return window;
+    if (method === 'getchaintip') return tip;
     assert.equal(method, 'getbountychanges');
     if (params.cursor === 'old') {
       if (typeof trigger === 'number') throw Object.assign(new Error('untrusted private server response'), { code: trigger });
@@ -54,6 +55,7 @@ test('a reset still replays changes during block transfer before publishing', as
   let changes = 0, spent = false;
   const rpc = { async request(method, params = {}) {
     if (method === 'getrecentblockhashes') return window;
+    if (method === 'getchaintip') return tip;
     if (params.cursor === 'old') throw Object.assign(new Error('expired'), { code: -32011 });
     const events = ++changes === 2 ? [{ type: 'spent', sequence: 1, txid: bounty.txid, vout: 0, block_hash: bounty.block_hash }] : [];
     if (events.length) spent = true;
@@ -71,6 +73,7 @@ test('reset does not turn malformed journal or incomplete block transfer into an
   let calls = 0;
   const rpc = { async request(method) {
     if (method === 'getrecentblockhashes') return window;
+    if (method === 'getchaintip') return tip;
     return { tip, next_cursor: `cursor-${++calls}`, has_more: false,
       changes: calls > 1 ? [{ type: 'spent', sequence: -1, txid: hash(1), vout: 0 }] : [] };
   } };

@@ -5,7 +5,7 @@ import { performance } from 'node:perf_hooks';
 import { validateRpcEndpoint } from './config.mjs';
 
 const PARAMS = Object.freeze({
-  getchaintip: [], getrecentblockhashes: [], getblockbounties: ['block_hash'],
+  getchaintip: [], getrecentblockhashes: ['count'], getblockbounties: ['block_hash'],
   getaddressbalance: ['address'], getaddresshistory: ['address', 'cursor'], getaddressutxos: ['address', 'cursor', 'include_pending_spent'],
   getaddresschanges: ['addresses', 'cursor'],
   gettransaction: ['txid'], gettransactions: ['txids'], sendrawtransaction: ['transaction_hex'], getbountychanges: ['cursor'],
@@ -27,12 +27,16 @@ export function validateRpcParams(method, params) {
   const clean = {};
   for (const key of PARAMS[method]) {
     if (!Object.hasOwn(params, key)) {
-      if (key !== 'cursor' && key !== 'include_pending_spent' && key !== 'changes_only') throw new Error(`Missing RPC parameter: ${key}.`);
+      if (key !== 'cursor' && key !== 'include_pending_spent' && key !== 'changes_only' && key !== 'count') throw new Error(`Missing RPC parameter: ${key}.`);
       continue;
     }
     const descriptor = Object.getOwnPropertyDescriptor(params, key);
     if (!Object.hasOwn(descriptor, 'value')) throw new Error('RPC parameters must be plain data.');
     const value = descriptor.value;
+    if (key === 'count') {
+      if (!Number.isSafeInteger(value) || value < 1 || value > 600) throw new Error('Invalid RPC recent-block count.');
+      clean[key] = value; continue;
+    }
     if (key === 'include_pending_spent') {
       if (typeof value !== 'boolean') throw new Error('Invalid RPC pending-spend option.');
       clean[key] = value; continue;

@@ -34,7 +34,9 @@ test('real TCP discovery caches empty blocks, follows tips/reorgs, reconnects, a
             socket.write(line({ jsonrpc: '2.0', id: request.id, error: { code: -32011, message: 'Cursor invalidated by test reorganization.' } }));
           } else reply({ tip: network.tip, changes: [], next_cursor: network.cursor, has_more: false });
         } else if (request.method === 'getrecentblockhashes') {
-          reply({ tip: network.tip, blocks: network.blocks, window: 600 });
+          reply({ tip: network.tip, blocks: network.blocks.slice(0, request.params.count ?? 600), window: 600 });
+        } else if (request.method === 'getchaintip') {
+          reply(network.tip);
         } else if (request.method === 'getblockbounties') {
           const block = network.blocks.find(item => item.hash === request.params.block_hash);
           assert.ok(block, 'The client requested a block outside the active test window.');
@@ -87,21 +89,27 @@ test('real TCP discovery caches empty blocks, follows tips/reorgs, reconnects, a
   assert.equal(connections, 1);
   assert.equal(requests[0].method, 'getbountychanges');
   assert.equal(requests[0].params.cursor, undefined);
+  const windowCalls = () => requests.filter(row => row.method === 'getrecentblockhashes').length;
+  assert.equal(windowCalls(), 1, 'Cold start fetches the canonical list once, then uses a lightweight tip fence.');
+  assert.ok(Object.isFrozen(service.blockWindow));
 
   await service.cycle();
   assert.deepEqual(streams, [genesis], 'An unchanged poll must reuse the complete block snapshot.');
   assert.equal(connections, 1, 'RPC methods share one persistent socket.');
+  assert.equal(windowCalls(), 1, 'An unchanged poll must not retransmit the canonical list.');
 
   network.tip = { ...network.tip, height: 1, hash: firstTip, mediantime: 1700000001 };
   network.blocks = [{ height: 1, hash: firstTip }, { height: 0, hash: genesis }];
   await service.cycle();
   assert.deepEqual(streams, [genesis, firstTip], 'Tip growth fetches only the new block.');
   assert.equal(service.snapshot().height, 1);
+  assert.equal(windowCalls(), 2, 'A new tip requires one updated canonical list.');
 
   const disconnected = once(service.rpc, 'disconnected');
   for (const socket of sockets) socket.destroy();
   await disconnected;
   assert.equal(service.ready, false);
+  assert.equal(service.blockWindow, null, 'Disconnect invalidates the compact window cache, not the journal cursor.');
   await service.cycle();
   // Reconnection intentionally starts a new helper, but cycle() publishes the
   // catalog before its asynchronous startup finishes. Await THIS generation,
@@ -115,6 +123,7 @@ test('real TCP discovery caches empty blocks, follows tips/reorgs, reconnects, a
   assert.equal(poolCloses, 1);
   assert.equal(service.ready, true);
   assert.deepEqual(streams, [genesis, firstTip], 'Reconnect catches up from the saved cursor without a redundant full scan.');
+  assert.equal(windowCalls(), 3, 'Reconnect revalidates the canonical window even at the same tip.');
 
   network.tip = { ...network.tip, hash: reorgTip, mediantime: 1700000002 };
   network.blocks = [{ height: 1, hash: reorgTip }, { height: 0, hash: genesis }];
@@ -123,6 +132,7 @@ test('real TCP discovery caches empty blocks, follows tips/reorgs, reconnects, a
   const startsBeforeResync = poolStarts, closesBeforeResync = poolCloses;
   await service.cycle();
   assert.equal(service.tip.hash, reorgTip);
+  assert.equal(windowCalls(), 4, 'An expired cursor requires a fresh window after reset.');
   assert.equal(service.blocks.has(firstTip), false);
   assert.deepEqual(streams, [genesis, firstTip, genesis, reorgTip], 'Expired cursors discard the old snapshot and reload the active window oldest first.');
   assert.strictEqual(service.engine.pool, helperBeforeResync, 'A catalog reset must preserve the same helper instance.');

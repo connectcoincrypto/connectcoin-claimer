@@ -104,6 +104,22 @@ working directory. Source runs default to `./claimer.conf`.
 - Discovers up to 600 recent blocks with at most four parallel block reads;
   stages coherent snapshots and replays the bounty journal. Healthy polling
   reuses the cursor and block cache rather than redownloading every block.
+  The validated canonical hash list is also cached: an unchanged tip requires
+  no `getrecentblockhashes` download. Discovery still replays all journal pages
+  (including mempool changes), then checks a small `getchaintip` response before
+  publication. A changed tip, including a same-height reorganization, requests
+  the latest 5 hashes, then 100, then 600 as needed to find a matching cached
+  hash **and height** and reconstruct the complete window. Contradictory
+  ancestry is rejected, and a rollback that lacks the oldest required blocks
+  also escalates. Each response is reconciled independently, never joined to
+  another partial response from a different tip. Journal resets discard all
+  cached bounty state and reload the block streams; only validated hashes may
+  remain as anchors for a fresh query. Startup without a cache and RPC reconnects
+  fetch the full hash list; reconnects retain the existing cursor and block
+  contents for incremental recovery when that cursor remains valid. The RPC
+  server must support the optional `getrecentblockhashes` `count` parameter for
+  reduced transfers. Older servers that reject it fall back to a full request;
+  malformed data never triggers that compatibility fallback.
 - A catalog resync keeps the same helper, validated captures, successful-work
   budgets and verified proofs. New preparations and broadcasts wait until the
   complete replacement snapshot and journal replay are published atomically;

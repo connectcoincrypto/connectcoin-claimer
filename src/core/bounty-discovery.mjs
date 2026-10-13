@@ -8,15 +8,88 @@ const uint = (value, maximum = 0xffffffff) => Number.isSafeInteger(value) && val
 const cursorValid = value => typeof value === 'string' && value.length > 0 && value.length <= 4096;
 class RescanRequired extends Error {}
 
-function windowFrom(response, network, lookback) {
+function validateRecentBlocks(response, network, count) {
   validateTip(response?.tip, network);
-  if (response.window !== 600 || !Array.isArray(response.blocks) || response.blocks.length !== Math.min(600, response.tip.height + 1)) throw new Error('RPC did not provide the complete recent-block window.');
+  // Older servers may ignore count and return the complete window. No other
+  // short/overlong response is accepted as a valid prefix.
+  const fullCount = Math.min(600, response.tip.height + 1);
+  if (response.window !== 600 || !Array.isArray(response.blocks) ||
+      (response.blocks.length !== Math.min(count, response.tip.height + 1) && response.blocks.length !== fullCount)) throw new Error('RPC did not provide the complete requested recent-block window.');
   const hashes = new Set();
   for (const [index, block] of response.blocks.entries()) {
-    if (!block || typeof block.hash !== 'string' || !HASH.test(block.hash) || block.height !== response.tip.height - index || hashes.has(block.hash) || (index === 0 && block.hash !== response.tip.hash)) throw new Error('Invalid recent-block sequence.');
+    if (!block || typeof block.hash !== 'string' || !HASH.test(block.hash) || block.height !== response.tip.height - index || hashes.has(block.hash) || (index === 0 && block.hash !== response.tip.hash) || (block.height === 0 && block.hash !== response.tip.genesis_hash)) throw new Error('Invalid recent-block sequence.');
     hashes.add(block.hash);
   }
+}
+
+function windowFrom(response, network, lookback) {
+  validateRecentBlocks(response, network, 600);
   return response.blocks.slice(0, lookback);
+}
+
+function validatedWindow(response, network) {
+  windowFrom(response, network, 600);
+  // Only publish a complete, privately owned immutable snapshot. Callers must
+  // retain it together with the processed journal cursor, never a partial read.
+  return Object.freeze({ window: 600, tip: Object.freeze({ ...response.tip }),
+    blocks: Object.freeze(response.blocks.map(({ height, hash }) => Object.freeze({ height, hash }))) });
+}
+
+function sameTip(left, right) {
+  if (left.hash !== right.hash) return false;
+  // A hash identifies one header and its ancestry. Matching hashes must not
+  // conceal contradictory heights/times (including from a cached response).
+  if (left.height !== right.height || left.mediantime !== right.mediantime ||
+      left.chain !== right.chain || left.genesis_hash !== right.genesis_hash) {
+    throw new Error('The RPC server returned inconsistent metadata for the same chain tip.');
+  }
+  return true;
+}
+
+function joinRecentWindow(response, known, network) {
+  sameTip(known.tip, response.tip); // Check metadata if the tip hash matches.
+  const knownHeights = new Map(known.blocks.map(block => [block.hash, block.height]));
+  const knownHashes = new Map(known.blocks.map(block => [block.height, block.hash]));
+  let anchor = -1;
+  for (const [index, block] of response.blocks.entries()) {
+    if (knownHeights.has(block.hash)) {
+      if (knownHeights.get(block.hash) !== block.height) throw new Error('Inconsistent recent-block hash height.');
+      if (anchor < 0) anchor = index;
+    }
+    // One block identifies its ancestry too: never splice a prefix whose
+    // overlapping ancestors contradict the validated cached chain.
+    if (anchor >= 0 && knownHashes.has(block.height) && knownHashes.get(block.height) !== block.hash) throw new Error('Inconsistent recent-block ancestry.');
+  }
+  const size = Math.min(600, response.tip.height + 1);
+  if (response.blocks.length === size) return validatedWindow(response, network);
+  if (anchor < 0) return null;
+  const anchorHeight = response.blocks[anchor].height;
+  const blocks = [...response.blocks.slice(0, anchor), ...known.blocks.filter(block => block.height <= anchorHeight)].slice(0, size);
+  // A rollback can find an anchor while still lacking the oldest required
+  // blocks. Escalate rather than silently publishing an incomplete window.
+  if (blocks.length !== size) return null;
+  return validatedWindow({ window: 600, tip: response.tip, blocks }, network);
+}
+
+async function refreshRecentWindow(query, known, network) {
+  if (!known) return validatedWindow(await query('getrecentblockhashes'), network);
+  for (const count of [5, 100, 600]) {
+    let response;
+    try { response = await query('getrecentblockhashes', count === 600 ? {} : { count }); }
+    catch (error) {
+      if (count === 600 || error.code !== -32602) throw error;
+      // Compatibility with servers that reject the optional count parameter.
+      // Transport errors and malformed responses must never take this path.
+      response = await query('getrecentblockhashes');
+      validateRecentBlocks(response, network, 600);
+    }
+    validateRecentBlocks(response, network, count);
+    // Each response has its own tip. Do not combine the 5- and 100-block
+    // responses: the chain may have changed between those requests.
+    const joined = joinRecentWindow(response, known, network);
+    if (joined) return joined;
+  }
+  throw new Error('RPC did not provide the complete recent-block window.');
 }
 
 /** A block is applied only after the transport acknowledges a complete stream. */
@@ -45,20 +118,29 @@ export async function readBountyBlock({ rpc, network, hash, height, check = () =
 }
 
 /** Stage the complete window, replay every journal page, then publish atomically. */
-export async function discoverBounties({ rpc, network, lookback = 600, previous = new Map(), cursor = null, check = () => {}, onInvalidate = () => {}, onWindow = () => {}, onReset = async () => {}, readBlock }) {
+export async function discoverBounties({ rpc, network, lookback = 600, previous = new Map(), previousWindow = null, cursor = null, check = () => {}, onInvalidate = () => {}, onWindow = () => {}, onReset = async () => {}, readBlock }) {
   if (!Number.isInteger(lookback) || lookback < 1 || lookback > 600) throw new Error('Invalid bounty lookback.');
   let cached = new Map(previous);
+  let knownWindow = previousWindow ? validatedWindow(previousWindow, network) : null;
+  let cachedWindow = cursor ? knownWindow : null;
   if (!cursor) { check(); await onReset({ reason: 'initial' }); check(); cached = new Map(); }
   for (let restart = 0; restart < 4; restart++) {
     check();
     const staged = new Map(cached), dirty = new Set();
     const budget = { count: 0, limit: MAX_ROWS };
     for (const rows of staged.values()) { budget.count += rows.length; if (budget.count > MAX_ROWS) throw new Error('Recent bounty data exceeds the wallet resource limit.'); }
-    let wanted = [], desired = new Set(), snapshot, journalPages = 0, lastSequence = -1;
+    let wanted = [], desired = new Set(), snapshot = cachedWindow, journalPages = 0, lastSequence = -1;
     const query = async (method, params = {}) => { check(); const value = await rpc.request(method, params); check(); validateTip(value?.tip, network); return value; };
+    const currentTip = async () => { check(); const value = await rpc.request('getchaintip'); check(); return validateTip(value, network); };
     const resetError = error => error instanceof RescanRequired || [-32004, -32011].includes(error.code);
-    const readWindow = async () => {
-      snapshot = await query('getrecentblockhashes');
+    const readWindow = async expectedTip => {
+      if (!snapshot || !sameTip(snapshot.tip, expectedTip)) {
+        snapshot = await refreshRecentWindow(query, snapshot ?? knownWindow, network);
+        // A racing response may have a different tip, but the same hash must
+        // never contradict the triggering journal/fence's header metadata.
+        sameTip(expectedTip, snapshot.tip);
+        knownWindow = snapshot;
+      }
       wanted = windowFrom(snapshot, network, lookback); desired = new Set(wanted.map(block => block.hash));
       onWindow(snapshot);
       const canonical = new Map(snapshot.blocks.map(block => [block.height, block.hash]));
@@ -119,15 +201,19 @@ export async function discoverBounties({ rpc, network, lookback = 600, previous 
       // Capture a watermark BEFORE streaming any blocks. Replay begins there,
       // not at the streams' final cursors, so changes during transfer cannot vanish.
       let page = await changes();
-      await readWindow(); apply(page);
+      await readWindow(page.tip); apply(page);
       while (page.has_more) { page = await changes(); apply(page); }
       for (let pass = 0; pass < 32; pass++) {
         await loadDirty();
         do { page = await changes(); apply(page); } while (page.has_more);
         if (dirty.size) continue;
-        const before = snapshot.tip.hash;
-        await readWindow();
-        if (snapshot.tip.hash !== before || wanted.some(block => !staged.has(block.hash))) continue;
+        // Mempool changes are replayed even when the chain tip stays unchanged.
+        // The final lightweight tip fence also catches a block/reorg arriving
+        // AFTER that replay. A changed tip refreshes the canonical window by
+        // anchoring a small prefix, escalating only when necessary.
+        const tip = await currentTip();
+        if (!sameTip(snapshot.tip, tip)) { await readWindow(tip); continue; }
+        if (wanted.some(block => !staged.has(block.hash))) continue;
         check();
         const outpoints = new Set();
         for (const rows of staged.values()) for (const row of rows) {
@@ -135,14 +221,17 @@ export async function discoverBounties({ rpc, network, lookback = 600, previous 
           if (outpoints.has(key)) throw new Error('Duplicate bounty across the recent window.');
           outpoints.add(key);
         }
-        return { blocks: staged, cursor, tip: snapshot.tip };
+        return { blocks: staged, cursor, tip, window: snapshot };
       }
       throw new Error('The bounty window is changing too quickly. Retry discovery shortly.');
     } catch (error) {
       if (!resetError(error)) throw error;
       check(); await onReset({ reason: error.code === -32004 ? 'data-unavailable' : error.code === -32011 ? 'cursor-invalid' : 'journal-reset',
         ...([-32004, -32011].includes(error.code) ? { code: error.code } : {}) });
-      check(); cached = new Map(); cursor = null;
+      // A reset invalidates all bounty state and the cursor, not block hashes.
+      // Retain only the hash anchor, requiring a fresh prefix even for an ABA
+      // reorg to the same tip, and reload every required bounty stream.
+      check(); cached = new Map(); cachedWindow = null; cursor = null;
     }
   }
   throw new Error('The bounty snapshot could not remain coherent; Automatic Claims was stopped.');

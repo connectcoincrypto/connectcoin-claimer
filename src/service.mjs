@@ -28,7 +28,7 @@ export class ClaimerService {
       attachProof: attach, transactionId, validateSaved, validateObserved, pollMs, retryMinMs, retryMaxMs, setTimer, clearTimer });
     this.running = false; this.started = false; this.ready = false; this.epoch = 0; this.failures = 0;
     this.status = 'stopped'; this.lastError = null; this.fatalError = null; this.tip = null;
-    this.blocks = new Map(); this.outpoints = new Map(); this.cursor = null; this.reserved = new Set();
+    this.blocks = new Map(); this.outpoints = new Map(); this.cursor = null; this.blockWindow = null; this.reserved = new Set();
     this.catalogGate = null;
     this.fundingCache = new Map(); this.fundingPending = new Map(); this.ioAbort = new AbortController();
     this.metrics = new ClaimMetrics();
@@ -118,6 +118,7 @@ export class ClaimerService {
     // TLS worker. Keep validated captures/proofs and their accounting alive;
     // preparation and broadcast wait below until the atomic publication.
     this.ready = false;
+    this.blockWindow = null;
     this.catalogGate ??= Promise.withResolvers();
     if (this.engine.enabled) this.status = 'resyncing';
     const reason = ['initial', 'journal-reset', 'data-unavailable', 'cursor-invalid'].includes(details.reason) ? details.reason : 'journal-reset';
@@ -149,7 +150,7 @@ export class ClaimerService {
   disconnected() {
     if (!this.running || this.fatalError) return;
     this.epoch++; this.ioAbort.abort(); this.cancelCatalogWaiters(); this.ioAbort = new AbortController();
-    this.tip = null; this.fundingCache.clear(); this.fundingPending.clear();
+    this.tip = null; this.blockWindow = null; this.fundingCache.clear(); this.fundingPending.clear();
     this.status = 'reconnecting';
     const epoch = this.epoch;
     const saved = this.persistPendingProofs(), previous = this.suspending;
@@ -187,7 +188,7 @@ export class ClaimerService {
       await this.rpc.connect(); check();
       const scopedRpc = { request: (method, params, options) => this.rpc.request(method, params, { ...options, signal }) };
       const result = await this.discover({ rpc: scopedRpc, network: this.config.network,
-        lookback: this.config.lookbackBlocks, previous: this.blocks, cursor: this.cursor, check,
+        lookback: this.config.lookbackBlocks, previous: this.blocks, previousWindow: this.blockWindow, cursor: this.cursor, check,
         onReset: async details => { check(); this.resetCatalog(details); },
         onInvalidate: (row, reason) => {
           if (reason === 'window_exit') this.engine.retire(row.txid, row.vout);
@@ -225,7 +226,7 @@ export class ClaimerService {
         if (this.engine.queue.get(key)?.retired && (this.engine.hasActive(key) || this.engine.pendingProofs.has(key))) outpoints.set(key, row);
         else this.engine.remove(row.txid, row.vout);
       }
-      this.blocks = result.blocks; this.outpoints = outpoints; this.cursor = result.cursor; this.tip = tip;
+      this.blocks = result.blocks; this.outpoints = outpoints; this.cursor = result.cursor; this.tip = tip; this.blockWindow = result.window ?? null;
       this.engine.retainCatalog(outpoints.values()); this.engine.enqueue(available);
       this.ready = true; this.status = 'running'; this.lastError = null; this.failures = 0;
       this.cancelCatalogWaiters();

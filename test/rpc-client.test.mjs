@@ -87,6 +87,29 @@ test('unsubscribe accepts opaque bounded IDs and rejects overlong or control-cha
   }
 });
 
+test('recent block count is an optional strict bounded integer without getters or coercion', () => {
+  assert.deepEqual(validateRpcParams('getrecentblockhashes', {}), {});
+  for (const count of [1, 5, 100, 600]) {
+    assert.deepEqual(validateRpcParams('getrecentblockhashes', { count }), { count });
+  }
+  for (const count of [null, undefined, false, true, '5', 0, -1, 601, 5.5, NaN, Infinity, [], { valueOf: () => 5 }]) {
+    assert.throws(() => validateRpcParams('getrecentblockhashes', { count }), /Invalid RPC recent-block count/);
+  }
+  assert.throws(() => validateRpcParams('getrecentblockhashes', { get count() { throw new Error('getter executed'); } }), /plain data/);
+  assert.throws(() => validateRpcParams('getrecentblockhashes', { count: 5, limit: 5 }), /Unexpected/);
+});
+
+test('recent block count is transmitted by the real RPC client and copied before queueing', async () => {
+  const server = await mock((request, socket) => socket.write(line(response(request, { count: request.params.count }))));
+  try {
+    const params = { count: 5 };
+    const pending = server.client.request('getrecentblockhashes', params);
+    params.count = 600;
+    assert.deepEqual(await pending, { count: 5 });
+    assert.deepEqual(server.requests[0].params, { count: 5 });
+  } finally { await server.close(); }
+});
+
 test('concurrent requests share one connection; chunk fragmentation is reassembled', async () => {
   const server = await mock((request, socket) => {
     const encoded = line(response(request, { method: request.method }));
