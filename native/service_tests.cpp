@@ -418,6 +418,166 @@ void OutputFailureStopsBeforeTcp() {
     for (int i = 0; i < 1000 && !service.Failed(); ++i) std::this_thread::sleep_for(1ms);
     Check(service.Failed() && tcp == 0, "Failed start acknowledgement must prevent TCP and fail helper"); service.Close();
 }
+void TerminalReplenishmentAtCapacity() {
+    // The larger limit uses DNS jobs so this regression needs only two workers,
+    // even though it exercises the production concurrency+2 admission bound.
+    for (const bool resolving : {false, true}) {
+        const uint64_t limit = resolving ? 802 : 512;
+        std::mutex mutex; std::condition_variable condition;
+        bool ready = resolving, release_first = false, release_all = false, acknowledged = false;
+        std::exception_ptr replacement_error, failure;
+        ClaimsService* controller = nullptr;
+        ServiceDependencies deps;
+        deps.resolve = [&](const std::string& domain) {
+            if (resolving) {
+                std::unique_lock lock(mutex);
+                condition.wait(lock, [&] { return release_all || (domain == "first.example" && release_first); });
+            }
+            return std::vector<Endpoint>{{"8.8.8.8", 2, 443}};
+        };
+        deps.capture = [&](const Context&, const Endpoint&, CaptureControl& control, const std::function<void()>& started) -> Bytes {
+            started();
+            std::unique_lock lock(mutex);
+            while (!release_first && !release_all && !control.Cancelled()) condition.wait_for(lock, 10ms);
+            if (control.Cancelled()) throw CaptureCancelled();
+            return {2, 1};
+        };
+        deps.verify = [](const Bytes&, const Context&) { return Verification{std::string(64, '0'), true, 0x0403}; };
+        UniValue options(UniValue::VOBJ); options.pushKV("connectionsPerSecond", 100000); options.pushKV("concurrency", resolving ? 800 : 1);
+        ClaimsService service(options, [&](const std::string& text) {
+            const auto frame = Json(text); const auto kind = frame["type"].get_str();
+            if (!resolving && kind == "resolved") { std::lock_guard lock(mutex); ready = true; condition.notify_all(); return; }
+            if (kind != (resolving ? "resolved" : "attempt") || frame["id"].getInt<uint64_t>() != (resolving ? 1 : 2)) return;
+            // A real pipe reader can refill while its writer is still returning.
+            // Reenter Command here to make that ordering deterministic.
+            try { controller->Command(resolving ? Resolve(limit + 1, "next.example") : Attempt(limit + 2)); }
+            catch (...) { replacement_error = std::current_exception(); }
+            std::unique_lock lock(mutex); acknowledged = true; condition.notify_all();
+            condition.wait(lock, [&] { return release_all; });
+        }, deps);
+        controller = &service;
+        try {
+            if (!resolving) {
+                service.Command(Resolve(1)); std::unique_lock lock(mutex);
+                Check(condition.wait_for(lock, 3s, [&] { return ready; }), "Capacity fixture DNS did not finish");
+            }
+            for (uint64_t index = 0; index < limit; ++index)
+                service.Command(resolving ? Resolve(index + 1, index ? "queued.example" : "first.example") : Attempt(index + 2));
+            Rejects([&] { service.Command(resolving ? Resolve(limit + 1) : Attempt(limit + 2)); });
+            { std::lock_guard lock(mutex); release_first = true; condition.notify_all(); }
+            { std::unique_lock lock(mutex); Check(condition.wait_for(lock, 3s, [&] { return acknowledged; }), "Terminal was not exposed to its consumer"); }
+            if (replacement_error) std::rethrow_exception(replacement_error);
+            // Exactly one terminal was delivered and exactly one replacement
+            // consumed its slot. A second replacement still exceeds the bound.
+            Rejects([&] { service.Command(resolving ? Resolve(limit + 2) : Attempt(limit + 3)); });
+        } catch (...) { failure = std::current_exception(); }
+        { std::lock_guard lock(mutex); release_all = true; condition.notify_all(); }
+        service.Close();
+        if (failure) std::rethrow_exception(failure);
+        Check(!service.Failed(), "Replacing a completed request must not fail the helper");
+    }
+}
+void QueuedCancellationReplenishmentAndBudgetRetirement() {
+    std::mutex mutex; std::condition_variable condition;
+    bool ready = false, entered = false, release = false, replaced = false;
+    std::exception_ptr replacement_error, failure;
+    ClaimsService* controller = nullptr;
+    ServiceDependencies deps;
+    deps.resolve = [](const std::string&) { return std::vector<Endpoint>{{"8.8.8.8", 2, 443}}; };
+    deps.capture = [&](const Context&, const Endpoint&, CaptureControl& control, const std::function<void()>& started) -> Bytes {
+        started(); std::unique_lock lock(mutex); entered = true; condition.notify_all();
+        while (!release && !control.Cancelled()) condition.wait_for(lock, 10ms);
+        if (control.Cancelled()) throw CaptureCancelled();
+        return {2, 1};
+    };
+    deps.verify = [](const Bytes&, const Context&) { return Verification{}; };
+    ClaimsService service(Json("{\"connectionsPerSecond\":100000,\"concurrency\":1}"), [&](const std::string& text) {
+        const auto frame = Json(text); const auto kind = frame["type"].get_str();
+        if (kind == "resolved") { std::lock_guard lock(mutex); ready = true; condition.notify_all(); }
+        if (kind == "attempt" && frame["id"].getInt<uint64_t>() == 3) {
+            try {
+                Check(frame["cancelled"].isTrue() && frame["started"].isFalse() && frame["validationPassed"].isNull(), "Queued cancellation remains inconclusive");
+                Check(frame["successfulConnections"].get_str() == "0", "Queued cancellation keeps its frozen zero count");
+                controller->Command(Attempt(514)); replaced = true;
+            } catch (...) { replacement_error = std::current_exception(); }
+        }
+    }, deps);
+    controller = &service;
+    try {
+        service.Command(Resolve(1));
+        { std::unique_lock lock(mutex); Check(condition.wait_for(lock, 3s, [&] { return ready; }), "Cancellation fixture DNS"); }
+        service.Command(Attempt(2));
+        { std::unique_lock lock(mutex); Check(condition.wait_for(lock, 3s, [&] { return entered; }), "Active cancellation fixture"); }
+        for (uint64_t id = 3; id <= 513; ++id) service.Command(Attempt(id));
+        service.Command(Cancel(3));
+        if (replacement_error) std::rethrow_exception(replacement_error);
+        Check(replaced, "Queued cancellation releases its slot before output");
+        Rejects([&] { service.Command(Attempt(515)); });
+    } catch (...) { failure = std::current_exception(); }
+    { std::lock_guard lock(mutex); release = true; condition.notify_all(); }
+    service.Close();
+    if (failure) std::rethrow_exception(failure);
+    Check(!service.Failed(), "Queued cancellation and final worker cleanup occur once");
+
+    // More than one full budget cache of completed/cancelled requests must stay
+    // evictable; retained users or a duplicate decrement eventually break this.
+    Fixture budgets(1); budgets.Ready();
+    for (uint64_t index = 0; index < 1100; ++index) {
+        auto request = Attempt(index + 2); request.pushKV("bountyId", std::string(64, 'a') + ":" + std::to_string(index));
+        budgets.service->Command(request);
+        Check(budgets.Wait("attempt", index + 2)["validationPassed"].isTrue(), "Retired budgets remain evictable without losing proof validation");
+    }
+    ServiceDependencies hold;
+    hold.capture = [](const Context&, const Endpoint&, CaptureControl& control, const std::function<void()>& started) -> Bytes {
+        started(); while (!control.Cancelled()) std::this_thread::sleep_for(1ms); throw CaptureCancelled();
+    };
+    Fixture cancelled(1, hold); cancelled.Ready(); cancelled.service->Command(Attempt(2)); cancelled.Wait("started", 2);
+    for (uint64_t index = 1; index <= 1100; ++index) {
+        auto request = Attempt(index + 2, ContextFor(), "7"); request.pushKV("bountyId", std::string(64, 'a') + ":" + std::to_string(index));
+        cancelled.service->Command(request); cancelled.service->Command(Cancel(index + 2));
+        const auto frame = cancelled.Wait("attempt", index + 2);
+        Check(frame["cancelled"].isTrue() && frame["started"].isFalse() && frame["validationPassed"].isNull(), "Evictable queued cancellations never reach capture or validation");
+        Check(frame["successfulConnections"].get_str() == "7", "Last-user cancellation preserves the imported budget counter");
+    }
+}
+void CancellationExceptionPublishesItsFlag() {
+    ServiceDependencies deps;
+    deps.capture = [](const Context&, const Endpoint&, CaptureControl&, const std::function<void()>& started) -> Bytes {
+        started();
+        // Connecting can throw on the service's closed flag before Close has
+        // reached this request's individual cancellation flag.
+        throw CaptureCancelled();
+    };
+    Fixture fixture(1, deps); fixture.Ready(); fixture.service->Command(Attempt(2));
+    const auto frame = fixture.Wait("attempt", 2);
+    Check(frame["started"].isTrue() && frame["cancelled"].isTrue() && frame["validationPassed"].isNull(), "Cancellation exception must produce a truthful terminal cancellation");
+    Check(frame["captured"].isFalse() && frame["proof"].isNull() && frame["verified"].isFalse() && frame["successfulConnections"].get_str() == "0", "Cancellation cannot invent a capture, validation or proof");
+}
+void TerminalOutputFailureRetiresOnce() {
+    for (const bool resolving : {false, true}) {
+        std::mutex mutex; std::condition_variable condition; bool ready = false;
+        unsigned terminal = 0, errors = 0;
+        ServiceDependencies deps;
+        deps.resolve = [](const std::string&) { return std::vector<Endpoint>{{"8.8.8.8", 2, 443}}; };
+        deps.capture = [](const Context&, const Endpoint&, CaptureControl&, const std::function<void()>& started) { started(); return Bytes{2, 1}; };
+        deps.verify = [](const Bytes&, const Context&) { return Verification{}; };
+        ClaimsService service(Json("{\"connectionsPerSecond\":100000,\"concurrency\":1}"), [&](const std::string& text) {
+            const auto frame = Json(text); const auto kind = frame["type"].get_str();
+            if (kind == "error") { ++errors; return; }
+            if (kind == (resolving ? "resolved" : "attempt")) { ++terminal; throw std::runtime_error("Broken terminal writer"); }
+            if (kind == "resolved") { std::lock_guard lock(mutex); ready = true; condition.notify_all(); }
+        }, deps);
+        service.Command(Resolve(1));
+        if (!resolving) {
+            std::unique_lock lock(mutex); Check(condition.wait_for(lock, 3s, [&] { return ready; }), "Terminal failure fixture DNS");
+            lock.unlock(); service.Command(Attempt(2));
+        }
+        for (unsigned index = 0; index < 3000 && !service.Failed(); ++index) std::this_thread::sleep_for(1ms);
+        service.Close();
+        Check(service.Failed() && terminal == 1 && errors == 1, "Terminal output failure remains fatal without duplicate cleanup or acknowledgement");
+        Rejects([&] { service.Command(Attempt(3)); });
+    }
+}
 void UnreachableEndpointIsExcludedAcrossMasksAndDomains() {
     std::atomic<int> bad{}, good{};
     ServiceDependencies deps;
@@ -660,6 +820,6 @@ void PerformanceSurvivesSameIpDnsRefreshAndKeepsBudgets() {
 }
 } // namespace
 int main() {
-    try { Parsing(); BufferedFrameBoundaries(); InteractiveInputUnwind(); InteractiveFrameCancellation(); NativePreparedContextReuse(); BudgetAndPacing(); PrecomputedBudgetBoundaries(); SuccessfulAndMissedProof(); ConcurrentCaptureSnapshotsRemainImmutable(); FailuresAndDnsCache(); CancelQueuedAndActive(); CancelWhileVerifying(); BudgetAcrossRequestsAndIds(); BudgetCountsInvalidCapturesAndMonotonicReports(); EndpointSelectionBoundAndRoundRobin(); OutputFailureStopsBeforeTcp(); UnreachableEndpointIsExcludedAcrossMasksAndDomains(); UnsupportedFamilyAndTimedRecovery(); RouteRecoveryAndOrdinaryFailures(); QueuedEndpointRecheckedAndCancellationDoesNotExclude(); PerformanceMinuteBoundariesAndGaps(); PerformancePriorAndFiniteRates(); PerformanceCacheBoundsAndSmoothedExpiry(); PerformanceSurvivesSameIpDnsRefreshAndKeepsBudgets(); std::cout << "24 offline service test groups passed\n"; return 0; }
+    try { Parsing(); BufferedFrameBoundaries(); InteractiveInputUnwind(); InteractiveFrameCancellation(); NativePreparedContextReuse(); BudgetAndPacing(); PrecomputedBudgetBoundaries(); SuccessfulAndMissedProof(); ConcurrentCaptureSnapshotsRemainImmutable(); FailuresAndDnsCache(); CancelQueuedAndActive(); CancelWhileVerifying(); BudgetAcrossRequestsAndIds(); BudgetCountsInvalidCapturesAndMonotonicReports(); EndpointSelectionBoundAndRoundRobin(); OutputFailureStopsBeforeTcp(); TerminalReplenishmentAtCapacity(); QueuedCancellationReplenishmentAndBudgetRetirement(); CancellationExceptionPublishesItsFlag(); TerminalOutputFailureRetiresOnce(); UnreachableEndpointIsExcludedAcrossMasksAndDomains(); UnsupportedFamilyAndTimedRecovery(); RouteRecoveryAndOrdinaryFailures(); QueuedEndpointRecheckedAndCancellationDoesNotExclude(); PerformanceMinuteBoundariesAndGaps(); PerformancePriorAndFiniteRates(); PerformanceCacheBoundsAndSmoothedExpiry(); PerformanceSurvivesSameIpDnsRefreshAndKeepsBudgets(); std::cout << "28 offline service test groups passed\n"; return 0; }
     catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }

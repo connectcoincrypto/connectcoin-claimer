@@ -267,6 +267,22 @@ struct ClaimsService::Impl {
         fields.pushKV("successfulConnections", std::to_string(count));
         return fields;
     }
+    void RetireLocked(const std::shared_ptr<Job>& job) {
+        const auto found = jobs.find(job->id);
+        if (found == jobs.end() || found->second != job) return;
+        jobs.erase(found);
+        if (job->running) {
+            if (job->attempt) --active_tls; else --active_dns;
+        } else std::erase(job->attempt ? tls_pending : dns_pending, job);
+        if (job->attempt) --budgets.at(job->bounty).users;
+    }
+    void EmitTerminal(const std::shared_ptr<Job>& job, const UniValue& frame) {
+        // A controller can replace this request as soon as it reads the frame,
+        // even while output() is still returning on this worker. Release every
+        // admission reservation before making that acknowledgement visible.
+        { std::lock_guard lock(mutex); RetireLocked(job); }
+        EmitFrame(frame);
+    }
     bool EndpointAvailableLocked(const Endpoint& endpoint) {
         const double now = deps.reachability_time();
         const auto family = unavailable_families.find(endpoint.family);
@@ -396,7 +412,7 @@ struct ClaimsService::Impl {
         const bool cancelled = job->control.Cancelled();
         UniValue frame(UniValue::VOBJ); frame.pushKV("type", "resolved"); frame.pushKV("id", job->id); frame.pushKV("ok", ok && !cancelled);
         if (!ok || cancelled) frame.pushKV("message", cancelled ? "Resolution cancelled" : "Public DNS resolution failed");
-        EmitFrame(frame);
+        EmitTerminal(job, frame);
     }
     void Attempt(const std::shared_ptr<Job>& job) {
         Bytes captured;
@@ -450,7 +466,13 @@ struct ClaimsService::Impl {
         catch (const LocalEndpointUnavailable& error) {
             message = error.family_unsupported ? "Local IP family is unsupported" : "Local network route is unavailable";
         }
-        catch (const CaptureCancelled&) { message = "TLS capture cancelled"; }
+        catch (const CaptureCancelled&) {
+            // Closing publishes the service flag before cancelling each job.
+            // Connecting can observe that flag first. Its socket stack has
+            // unwound here, so publishing this job's cancellation is safe and
+            // ensures an inconclusive terminal observation is labelled so.
+            job->control.Cancel(); message = "TLS capture cancelled";
+        }
         catch (const CaptureTimeout&) { if (validating && !validated) validated = false; message = job->started ? "TLS connection timed out" : "Public DNS resolution is required"; }
         catch (...) { if (validating && !validated) validated = false; message = job->started ? "TLS capture or proof validation failed" : "Public DNS resolution is required"; }
         auto frame = Fields(job);
@@ -463,7 +485,7 @@ struct ClaimsService::Impl {
         frame.pushKV("validationPassed", validated ? UniValue(*validated) : UniValue());
         if (!message.empty()) frame.pushKV("message", message);
         if (blocked) frame.pushKV("blocked", "budget");
-        EmitFrame(frame);
+        EmitTerminal(job, frame);
     }
     void Fatal() noexcept {
         if (!failed.exchange(true)) {
@@ -486,10 +508,9 @@ struct ClaimsService::Impl {
             }
             try { if (attempts) Attempt(job); else Resolve(job); }
             catch (...) { Fatal(); }
-            { std::lock_guard lock(mutex);
-                jobs.erase(job->id);
-                if (attempts) { --active_tls; --budgets.at(job->bounty).users; } else --active_dns;
-            }
+            // Terminal output already retired successful requests. An earlier
+            // exception still needs cleanup; the identity guard makes it once.
+            { std::lock_guard lock(mutex); RetireLocked(job); }
         }
     }
     void Cancel(const std::shared_ptr<Job>& job) {
@@ -500,14 +521,18 @@ struct ClaimsService::Impl {
         { std::lock_guard lock(mutex);
             const auto found = jobs.find(job->id);
             queued = found != jobs.end() && found->second == job && !job->running;
-            if (queued) { std::erase(job->attempt ? tls_pending : dns_pending, job); jobs.erase(found); }
+            if (queued) {
+                // Retiring can make this budget evictable before Fields runs.
+                // Keep the cancelled request's counter snapshot with the job.
+                if (job->attempt) job->successes = budgets.at(job->bounty).successes;
+                RetireLocked(job);
+            }
         }
         if (!queued) return;
         if (job->attempt) {
             auto frame = Fields(job); frame.pushKV("type", "attempt"); frame.pushKV("proof", UniValue()); frame.pushKV("verified", false);
             frame.pushKV("validationPassed", UniValue()); frame.pushKV("message", "TLS capture cancelled");
-            try { EmitFrame(frame); } catch (...) { std::lock_guard lock(mutex); --budgets.at(job->bounty).users; throw; }
-            std::lock_guard lock(mutex); --budgets.at(job->bounty).users;
+            EmitFrame(frame);
         } else { UniValue frame(UniValue::VOBJ); frame.pushKV("type", "resolved"); frame.pushKV("id", job->id); frame.pushKV("ok", false); frame.pushKV("message", "Resolution cancelled"); EmitFrame(frame); }
     }
     void Command(const UniValue& command) {
