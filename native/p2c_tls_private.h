@@ -17,6 +17,8 @@ int connectcoin_p2c_fetch_certificate(mbedtls_ssl_context* ssl);
  * proof; this does not validate the CertificateVerify signature or advance TLS. */
 int connectcoin_p2c_fetch_certificate_verify(mbedtls_ssl_context* ssl);
 #ifdef CLAIMER_NETWORK_TESTING
+/* Test-only private-state inspection; reports no secrets or key material. */
+int connectcoin_p2c_test_tls_reset_clean(const mbedtls_ssl_context* ssl);
 /* Test-only differential seam: feed an already reassembled handshake message
  * through the new capture path or the original Mbed TLS certificate handler.
  * This does not authenticate certificates or expose a production entry point. */

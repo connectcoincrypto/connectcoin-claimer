@@ -80,7 +80,10 @@ Verification VerifyCapturedForTesting(const CapturedProof& proof, std::span<cons
 struct SignatureCacheStats { size_t hits{}, misses{}, entries{}, bytes{}; };
 SignatureCacheStats SignatureCacheStatsForTesting();
 void ClearSignatureCacheForTesting();
-struct CertificateCacheStats { size_t hits{}, misses{}, metadata_builds{}, time_checks{}; };
+struct CertificateCacheStats {
+    size_t hits{}, misses{}, metadata_builds{}, time_checks{};
+    size_t entries{}, bytes{}, estimated_bytes{};
+};
 CertificateCacheStats CertificateCacheStatsForTesting();
 void ClearCertificateCacheForTesting();
 #endif

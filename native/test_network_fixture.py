@@ -54,10 +54,11 @@ def large_identity():
 
 
 class Fixture:
-    def __init__(self, tls_context: ssl.SSLContext | None, mode: str, count: int = 1):
+    def __init__(self, tls_context: ssl.SSLContext | None, mode: str, count: int = 1, *, actions=None):
         self.tls_context = tls_context
         self.mode = mode
         self.count = count
+        self.actions = actions
         self.accepted = 0
         self.completed = 0
         self.received: list[bytes] = []
@@ -82,16 +83,17 @@ class Fixture:
                 connection, _ = self.listener.accept()
             except TimeoutError:
                 continue
+            action = self.actions[self.accepted] if self.actions is not None else self.mode
             self.accepted += 1
-            worker = threading.Thread(target=self.handle, args=(connection,))
+            worker = threading.Thread(target=self.handle, args=(connection, action))
             self.workers.append(worker)
             worker.start()
 
-    def handle(self, connection: socket.socket):
+    def handle(self, connection: socket.socket, action: str):
         try:
             with connection:
                 connection.settimeout(2)
-                if self.tls_context is not None:
+                if self.tls_context is not None and action not in ("idle", "bad-record"):
                     with self.tls_context.wrap_socket(connection, server_side=True) as secured:
                         self.completed += 1
                         # No HTTP is ever expected. A complete handshake sends
@@ -101,14 +103,28 @@ class Fixture:
                             raise AssertionError("Native capture transmitted application data")
                 else:
                     first = connection.recv(16384)
+                    # Read the complete first record so failed/cancelled reuse
+                    # attempts also expose their fresh ephemeral key share.
+                    while first and len(first) < 5:
+                        part = connection.recv(5 - len(first))
+                        if not part:
+                            break
+                        first += part
+                    if len(first) >= 5:
+                        record_size = 5 + int.from_bytes(first[3:5], "big")
+                        while len(first) < record_size:
+                            part = connection.recv(record_size - len(first))
+                            if not part:
+                                break
+                            first += part
                     self.received.append(first)
-                    if self.mode == "bad-record":
+                    if action == "bad-record":
                         connection.sendall(b"\x16\x03\x03\xff\xff" + b"x" * 128)
-                    elif self.mode == "oversized-plaintext":
+                    elif action == "oversized-plaintext":
                         connection.sendall(b"\x16\x03\x03\x40\x01" + b"\x02\x00\x3f\xfd" + b"x" * (16385 - 4))
-                    elif self.mode == "bad-handshake":
+                    elif action == "bad-handshake":
                         connection.sendall(b"\x16\x03\x03\x00\x04\x02\xff\xff\xff")
-                    elif self.mode == "ccs-flood":
+                    elif action == "ccs-flood":
                         connection.sendall(b"\x14\x03\x03\x00\x01\x01" * 12000)
                     else:
                         connection.settimeout(0.1)
@@ -148,6 +164,82 @@ def run(binary: Path, mode: str, fixture: Fixture, timeout: int = 1500, roots: P
 def require(condition: bool, message: str):
     if not condition:
         raise AssertionError(message)
+
+
+def hello_fields(hello: bytes):
+    """Inspect the actual ClientHello key share, SNI and offered policy."""
+    require(hello[0] == 1 and len(hello) == 4 + int.from_bytes(hello[1:4], "big"), "Invalid fixture ClientHello")
+    body = hello[4:]
+    offset = 34
+    session_size = body[offset]
+    session_id = body[offset + 1:offset + 1 + session_size]
+    offset += 1 + session_size
+    offset += 2 + int.from_bytes(body[offset:offset + 2], "big")
+    offset += 1 + body[offset]
+    end = offset + 2 + int.from_bytes(body[offset:offset + 2], "big")
+    offset += 2
+    extensions = {}
+    while offset < end:
+        kind = int.from_bytes(body[offset:offset + 2], "big")
+        size = int.from_bytes(body[offset + 2:offset + 4], "big")
+        extensions[kind] = body[offset + 4:offset + 4 + size]
+        offset += 4 + size
+    require(offset == end == len(body), "Invalid fixture extension bounds")
+    require(not ({41, 42, 45} & extensions.keys()), "Reused TLS session offered PSK/resumption/early data")
+    shares = extensions[51][2:]
+    require(len(shares) >= 36, "Missing ephemeral TLS key share")
+    signatures = extensions[13][2:]
+    return extensions[0][5:].decode("ascii"), signatures, shares, session_id
+
+
+def reuse_sequence(binary: Path, directory: Path, context: ssl.SSLContext, root_pem: bytes, rsa: bool):
+    alternate_root, alternate_cert, alternate_key = identity(rsa_leaf=rsa, leaf_domain="alternate.example.com")
+    cert_path, key_path, roots_path = (directory / name for name in ("reuse-alternate.pem", "reuse-alternate.key", "reuse-roots.pem"))
+    cert_path.write_bytes(alternate_cert)
+    key_path.write_bytes(alternate_key)
+    roots_path.write_bytes(root_pem + alternate_root)
+    alternate = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    alternate.minimum_version = alternate.maximum_version = ssl.TLSVersion.TLSv1_3
+    alternate.load_cert_chain(cert_path, key_path)
+    alternate.num_tickets = 0
+    names = []
+    def select_context(connection, name, _initial):
+        names.append(name)
+        if name == "alternate.example.com":
+            connection.context = alternate
+    context.sni_callback = select_context
+    actions = ("tls", "bad-record", "tls", "idle", "tls", "idle", "tls")
+    mask = 2 if rsa else 1
+    with Fixture(context, "reuse", len(actions), actions=actions) as fixture:
+        result, _ = run(binary, f"reuse-sequence-{mask}", fixture, roots=roots_path)
+    require(result.returncode == 0, f"TLS reuse recovery failed: {result.stderr}")
+    require(fixture.accepted == 7 and fixture.completed == 2, "TLS reuse did not exercise all outcomes/full handshakes")
+    require(names == ["example.com", "alternate.example.com", "alternate.example.com", "example.com"], "Reused TLS hostname leaked")
+    shares, sessions = set(), set()
+    indexes = []
+    for line in result.stdout.splitlines():
+        index_text, encoded = line.split()
+        index = int(index_text)
+        indexes.append(index)
+        proof = bytes.fromhex(encoded)
+        domain = "alternate.example.com" if index in (2, 4) else "example.com"
+        offer_mask = mask if index in (2, 4) else 7
+        envelope = ConnectionProof(domain, "11" * 32, index, "ff" * 32, 1, offer_mask, 1800000000, proof)
+        verify_connection_proof(envelope, roots_path, enforce_root_pin=False)
+        hello = proof[1:5 + int.from_bytes(proof[2:5], "big")]
+        name, signatures, key_share, session = hello_fields(hello)
+        expected_signatures = b"".join(value.to_bytes(2, "big") for bit, value in ((1, 0x0403), (2, 0x0804), (4, 0x0809)) if offer_mask & bit)
+        require(name == domain and signatures == expected_signatures, "Reused ClientHello kept prior domain/signature mask")
+        require(hello[6:38] == envelope.challenge, "Reused ClientHello kept prior challenge")
+        shares.add(key_share)
+        sessions.add(session)
+    require(indexes == [0, 2, 4, 6], "Reuse success/failure sequence changed")
+    require(len(fixture.received) == 3, "Missing failure/cancel/timeout ClientHello")
+    for record in fixture.received:
+        _, _, key_share, session = hello_fields(record[5:5 + int.from_bytes(record[3:5], "big")])
+        shares.add(key_share)
+        sessions.add(session)
+    require(len(shares) == len(sessions) == 7, "TLS reuse repeated an ephemeral key share/session nonce")
 
 
 def certificate_parser_cases(binary: Path, directory: Path, cert_pem: bytes) -> int:
@@ -263,13 +355,14 @@ def main() -> None:
             context.load_cert_chain(cert, key)
             context.num_tickets = 0
             for mode in ("capture", "complete", "slow-start", "parallel", "repeat", f"capture-mask-{2 if rsa else 1}"):
-                count = 8 if mode == "parallel" else 2 if mode == "repeat" else 1
+                count = 16 if mode == "parallel" else 2 if mode == "repeat" else 1
                 with Fixture(context, mode, count) as fixture:
                     result, elapsed = run(binary, mode, fixture, roots=roots)
                 require(result.returncode == 0, f"{mode} failed: {result.stderr}")
                 proofs = [bytes.fromhex(line) for line in result.stdout.splitlines()]
                 require(len(proofs) == count and fixture.accepted == count, "Capture count mismatch")
                 hellos = set()
+                key_shares = set()
                 for proof in proofs:
                     mask = int(mode.removeprefix("capture-mask-")) if mode.startswith("capture-mask-") else 7
                     envelope = ConnectionProof("example.com", "11" * 32, 0, "ff" * 32, 1, mask, 1800000000, proof)
@@ -281,6 +374,7 @@ def main() -> None:
                     hello = proof[1:1 + size]
                     require(hello[6:38] == envelope.challenge, "Wrong exact ClientHello challenge")
                     hellos.add(hello)
+                    key_shares.add(hello_fields(hello)[2])
                     tampered = bytearray(proof)
                     tampered[-1] ^= 1
                     try:
@@ -291,6 +385,7 @@ def main() -> None:
                         raise AssertionError("Python reference accepted tampered CV")
                     require(parsed.certificate_verify_scheme == (0x0804 if rsa else 0x0403), "Unexpected TLS signature scheme")
                 require(len(hellos) == count, "Ephemeral ClientHello randomness was reused")
+                require(len(key_shares) == count, "Ephemeral ClientHello key share was reused")
                 if mode == "complete":
                     require(fixture.completed == 1, "Full TLS handshake was not completed")
                 if mode == "slow-start":
@@ -299,6 +394,8 @@ def main() -> None:
             with Fixture(context, "capture") as fixture:
                 result, _ = run(binary, f"capture-mask-{1 if rsa else 2}", fixture, roots=roots)
             require(result.returncode == 1, "Incompatible signature policy was accepted")
+            checks += 1
+            reuse_sequence(binary, root, context, root_pem, rsa)
             checks += 1
 
         for mode in ("cancel", "cancel-start", "reject-start"):
@@ -337,7 +434,7 @@ def main() -> None:
             result, _ = run(binary, "capture", fixture, roots=roots)
         require(result.returncode == 1, "Separate native verification accepted wrong hostname")
         checks += 1
-    print(f"PASS: {checks} offline native network scenarios, ECDSA/RSA differential verification and 16 parallel captures")
+    print(f"PASS: {checks} offline native network scenarios, ECDSA/RSA differential verification and 32 parallel captures")
 
 
 if __name__ == "__main__":

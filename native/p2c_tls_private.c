@@ -125,6 +125,36 @@ int connectcoin_p2c_fetch_certificate_verify(mbedtls_ssl_context* ssl)
                                                &body, &length);
 }
 #ifdef CLAIMER_NETWORK_TESTING
+static int bytes_are_zero(const void* bytes, size_t length)
+{
+    const unsigned char* p = (const unsigned char*) bytes;
+    size_t i;
+    for (i = 0; i < length; ++i) if (p[i] != 0) return 0;
+    return 1;
+}
+int connectcoin_p2c_test_tls_reset_clean(const mbedtls_ssl_context* ssl)
+{
+    const mbedtls_ssl_handshake_params* handshake;
+    if (ssl->p_bio != NULL || ssl->f_send != NULL || ssl->f_recv != NULL ||
+        mbedtls_ssl_get_hostname_pointer(ssl) != NULL) return 0;
+    if (ssl->conf == NULL)
+        return ssl->in_buf == NULL && ssl->out_buf == NULL && ssl->handshake == NULL;
+    if (ssl->state != MBEDTLS_SSL_HELLO_REQUEST || ssl->session != NULL ||
+        ssl->session_in != NULL || ssl->session_out != NULL || ssl->in_left != 0 || ssl->out_left != 0 ||
+        ssl->transform_in != NULL || ssl->transform_out != NULL || ssl->transform_application != NULL ||
+        ssl->handshake == NULL || ssl->session_negotiate == NULL) return 0;
+    handshake = ssl->handshake;
+    return handshake->resume == 0 && handshake->transform_handshake == NULL &&
+        mbedtls_svc_key_id_is_null(handshake->xxdh_psa_privkey) && handshake->xxdh_psa_peerkey_len == 0 &&
+        handshake->sent_extensions == 0 && handshake->received_extensions == 0 &&
+        bytes_are_zero(handshake->randbytes, sizeof(handshake->randbytes)) &&
+        bytes_are_zero(handshake->xxdh_psa_peerkey, sizeof(handshake->xxdh_psa_peerkey)) &&
+        bytes_are_zero(&handshake->tls13_master_secrets, sizeof(handshake->tls13_master_secrets)) &&
+        bytes_are_zero(&handshake->tls13_hs_secrets, sizeof(handshake->tls13_hs_secrets)) &&
+        ssl->session_negotiate->peer_cert == NULL && ssl->session_negotiate->ticket == NULL &&
+        bytes_are_zero(&ssl->session_negotiate->app_secrets, sizeof(ssl->session_negotiate->app_secrets));
+}
+
 static int forbidden_abbreviated_checksum(mbedtls_ssl_context* ssl,
                                          const unsigned char* message,
                                          size_t length)

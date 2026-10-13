@@ -12,6 +12,7 @@
 #include <deque>
 #include <exception>
 #include <limits>
+#include <list>
 #include <map>
 #include <mutex>
 #include <set>
@@ -77,8 +78,13 @@ struct Job {
     std::optional<Endpoint> endpoint;
     std::string domain, bounty;
     CaptureControl control;
+    // Service cancellation must wake a paced socket before Cancel waits for
+    // that socket's mutex. Every result/proof check observes the same flag.
+    std::atomic<bool> cancel_requested{};
+    std::condition_variable connection_condition;
     double seconds{}, started_at{};
     std::optional<uint64_t> successes;
+    bool Cancelled() const { return cancel_requested.load(std::memory_order_acquire) || control.Cancelled(); }
 };
 } // namespace
 
@@ -216,10 +222,10 @@ struct ClaimsService::Impl {
     uint32_t rate{}, concurrency{};
     size_t pending_limit{};
     std::mutex mutex, output_mutex;
-    std::timed_mutex connection_mutex;
     std::condition_variable tls_condition, dns_condition;
     std::unordered_map<uint64_t, std::shared_ptr<Job>> jobs;
     std::deque<std::shared_ptr<Job>> tls_pending, dns_pending;
+    std::list<std::shared_ptr<Job>> connection_pending;
     std::unordered_map<std::string, Budget> budgets;
     std::unordered_map<std::string, DnsEntry> dns;
     EndpointPerformanceCache performance;
@@ -230,7 +236,7 @@ struct ClaimsService::Impl {
     uint64_t last_id{}, touched{};
     double next_connection{};
     bool idle{true}, closed{}, native_pipeline{};
-    std::atomic<bool> failed{};
+    std::atomic<bool> failed{}, failure_reported{};
 
     Impl(const UniValue& options, Emit emit, ServiceDependencies dependencies) : output(std::move(emit)), deps(std::move(dependencies)) {
         ExactKeys(options, {"connectionsPerSecond", "concurrency"});
@@ -252,7 +258,12 @@ struct ClaimsService::Impl {
         const auto text = value.write();
         Require(text.size() <= 160 * 1024, "Helper response exceeds 160 KiB");
         std::lock_guard lock(output_mutex);
-        try { output(text); } catch (...) { throw OutputFailure(); }
+        try { output(text); } catch (...) {
+            // Stop socket admission before a failing gate owner hands off.
+            // Fatal performs cancellation after the socket stack has unwound.
+            failed.store(true, std::memory_order_release);
+            throw OutputFailure();
+        }
     }
     UniValue Fields(const std::shared_ptr<Job>& job) {
         uint64_t count;
@@ -263,7 +274,7 @@ struct ClaimsService::Impl {
         UniValue fields(UniValue::VOBJ);
         fields.pushKV("id", job->id); fields.pushKV("context", PublicContext(job->context));
         fields.pushKV("started", job->started); fields.pushKV("captured", job->captured);
-        fields.pushKV("seconds", job->seconds); fields.pushKV("cancelled", job->control.Cancelled());
+        fields.pushKV("seconds", job->seconds); fields.pushKV("cancelled", job->Cancelled());
         fields.pushKV("successfulConnections", std::to_string(count));
         return fields;
     }
@@ -313,9 +324,22 @@ struct ClaimsService::Impl {
             }
             unavailable_endpoints[endpoint.Key()] = now + REACHABILITY_RECHECK_SECONDS;
         }
+        for (const auto& waiting : connection_pending) {
+            if (waiting->endpoint && (family_unsupported ? waiting->endpoint->family == endpoint.family : *waiting->endpoint == endpoint))
+                waiting->connection_condition.notify_one();
+        }
+    }
+    void BudgetChangedLocked(const std::string& bounty, const Budget& budget) {
+        if (budget.successes < budget.stop_count) return;
+        for (const auto& waiting : connection_pending)
+            if (waiting->bounty == bounty) waiting->connection_condition.notify_one();
+    }
+    void RequestCancelLocked(const std::shared_ptr<Job>& job) {
+        job->cancel_requested.store(true, std::memory_order_release);
+        job->connection_condition.notify_one();
     }
     void BeforeStartLocked(const std::shared_ptr<Job>& job) {
-        if (closed || job->control.Cancelled()) throw CaptureCancelled();
+        if (closed || failed.load(std::memory_order_acquire) || job->Cancelled()) throw CaptureCancelled();
         // A different worker may have discovered an impossible route after
         // this job selected its address. Do not spend a TCP turn or extend the
         // exclusion deadline merely because a queued job observes the cache.
@@ -325,21 +349,41 @@ struct ClaimsService::Impl {
     }
     void BeforeStart(const std::shared_ptr<Job>& job) { std::lock_guard lock(mutex); BeforeStartLocked(job); }
     void Connecting(const std::shared_ptr<Job>& job) {
-        std::unique_lock turn(connection_mutex, std::defer_lock);
-        while (!turn.try_lock_for(std::chrono::milliseconds(10))) BeforeStart(job);
-        for (;;) {
-            double delay;
-            { std::lock_guard lock(mutex); BeforeStartLocked(job); delay = next_connection - Now(); }
-            if (delay <= 0) break;
-            std::this_thread::sleep_for(std::chrono::duration<double>(std::min(delay, 0.010)));
-        }
-        { std::lock_guard lock(mutex); BeforeStartLocked(job); job->started = true; job->started_at = Now(); }
-        UniValue frame(UniValue::VOBJ); frame.pushKV("type", "started"); frame.pushKV("id", job->id); EmitFrame(frame);
-        { std::lock_guard lock(mutex);
-            if (closed || job->control.Cancelled()) throw CaptureCancelled();
+        std::unique_lock lock(mutex);
+        const auto position = connection_pending.insert(connection_pending.end(), job);
+        const auto release = [&] {
+            if (!lock.owns_lock()) lock.lock();
+            const bool head = position == connection_pending.begin();
+            connection_pending.erase(position);
+            if (head && !connection_pending.empty()) connection_pending.front()->connection_condition.notify_one();
+        };
+        try {
+            for (;;) {
+                BeforeStartLocked(job);
+                if (position != connection_pending.begin()) {
+                    job->connection_condition.wait(lock);
+                    continue;
+                }
+                if (next_connection <= Now()) break;
+                // Only the head owns a deadline. Handoffs wake one successor;
+                // cancellations/exclusions/budget changes wake affected jobs.
+                const auto deadline = Clock::time_point(std::chrono::ceil<Clock::duration>(std::chrono::duration<double>(next_connection)));
+                job->connection_condition.wait_until(lock, deadline);
+            }
+            job->started = true; job->started_at = Now();
+            // Keep the queue reservation across the acknowledgement, but never
+            // hold the scheduler mutex while writing to the controller.
+            lock.unlock();
+            UniValue frame(UniValue::VOBJ); frame.pushKV("type", "started"); frame.pushKV("id", job->id); EmitFrame(frame);
+            lock.lock();
+            if (closed || failed.load(std::memory_order_acquire) || job->Cancelled()) throw CaptureCancelled();
             const auto now = Now(); next_connection = AdvanceConnectionDeadline(next_connection, now, rate, idle);
             idle = false; job->started_at = now;
+        } catch (...) {
+            release();
+            throw;
         }
+        release();
     }
     std::pair<Endpoint, std::shared_ptr<Score>> SelectEndpoint(const std::shared_ptr<Job>& job) {
         std::lock_guard lock(mutex);
@@ -378,7 +422,7 @@ struct ClaimsService::Impl {
     }
     void Resolve(const std::shared_ptr<Job>& job) {
         bool ok = false, cached = false;
-        if (!job->control.Cancelled()) {
+        if (!job->Cancelled()) {
             { std::lock_guard lock(mutex);
                 const auto found = dns.find(job->domain);
                 if (found != dns.end() && found->second.expires > deps.dns_time()) {
@@ -409,7 +453,7 @@ struct ClaimsService::Impl {
                 }
             }
         }
-        const bool cancelled = job->control.Cancelled();
+        const bool cancelled = job->Cancelled();
         UniValue frame(UniValue::VOBJ); frame.pushKV("type", "resolved"); frame.pushKV("id", job->id); frame.pushKV("ok", ok && !cancelled);
         if (!ok || cancelled) frame.pushKV("message", cancelled ? "Resolution cancelled" : "Public DNS resolution failed");
         EmitTerminal(job, frame);
@@ -423,7 +467,7 @@ struct ClaimsService::Impl {
         std::string message;
         std::shared_ptr<Score> score;
         try {
-            if (job->control.Cancelled()) throw CaptureCancelled();
+            if (job->Cancelled()) throw CaptureCancelled();
             const auto selected = SelectEndpoint(job); score = selected.second;
             BeforeStart(job);
             std::exception_ptr capture_error;
@@ -435,14 +479,14 @@ struct ClaimsService::Impl {
             catch (const OutputFailure&) { throw; }
             catch (const CaptureCancelled&) { capture_error = std::current_exception(); }
             catch (const LocalEndpointUnavailable& error) {
-                if (!job->control.Cancelled()) {
+                if (!job->Cancelled()) {
                     std::lock_guard lock(mutex);
                     ExcludeEndpointLocked(selected.first, error.family_unsupported);
                     if (job->started) validated = false;
                 }
                 capture_error = std::current_exception();
             }
-            catch (...) { if (job->started && !job->control.Cancelled()) validated = false; capture_error = std::current_exception(); }
+            catch (...) { if (job->started && !job->Cancelled()) validated = false; capture_error = std::current_exception(); }
             if (job->started) {
                 const auto elapsed = Now() - job->started_at;
                 { std::lock_guard lock(mutex);
@@ -450,15 +494,16 @@ struct ClaimsService::Impl {
                     auto& budget = budgets.at(job->bounty);
                     if (job->captured && budget.successes != UINT64_MAX) ++budget.successes;
                     job->successes = budget.successes;
+                    BudgetChangedLocked(job->bounty, budget);
                 }
                 auto frame = Fields(job); frame.pushKV("type", "capture"); EmitFrame(frame);
             }
             if (capture_error) std::rethrow_exception(capture_error);
-            if (!job->control.Cancelled()) {
+            if (!job->Cancelled()) {
                 validating = true;
                 const auto verified = native_capture ? VerifyCaptured(*native_capture) : deps.verify(captured, job->context);
                 validated = true;
-                if (verified.meets_target && !job->control.Cancelled()) proof = Hex(native_capture ? native_capture->Encoded() : captured);
+                if (verified.meets_target && !job->Cancelled()) proof = Hex(native_capture ? native_capture->Encoded() : captured);
             }
         } catch (const OutputFailure&) { throw; }
         catch (const BudgetExhausted&) { blocked = true; }
@@ -488,11 +533,14 @@ struct ClaimsService::Impl {
         EmitTerminal(job, frame);
     }
     void Fatal() noexcept {
-        if (!failed.exchange(true)) {
+        failed.store(true, std::memory_order_release);
+        std::vector<std::shared_ptr<Job>> cancel;
+        { std::lock_guard lock(mutex); closed = true; for (const auto& [id, job] : jobs) { RequestCancelLocked(job); cancel.push_back(job); } tls_condition.notify_all(); dns_condition.notify_all(); }
+        // Admission failure may already have been published by EmitFrame.
+        // Keep the single diagnostic acknowledgement independent of that flag.
+        if (!failure_reported.exchange(true)) {
             try { UniValue error(UniValue::VOBJ); error.pushKV("type", "error"); error.pushKV("message", "Claims helper worker failed"); EmitFrame(error); } catch (...) {}
         }
-        std::vector<std::shared_ptr<Job>> cancel;
-        { std::lock_guard lock(mutex); closed = true; for (const auto& [id, job] : jobs) cancel.push_back(job); tls_condition.notify_all(); dns_condition.notify_all(); }
         for (const auto& job : cancel) job->control.Cancel();
     }
     void Worker(bool attempts) noexcept {
@@ -514,8 +562,9 @@ struct ClaimsService::Impl {
         }
     }
     void Cancel(const std::shared_ptr<Job>& job) {
-        // Publish cancellation without holding the scheduler lock: the capture
-        // may currently hold its socket mutex while calling the start gate.
+        // Connecting holds the socket mutex while it waits. Publish and wake
+        // under the gate mutex before Cancel can block acquiring that socket.
+        { std::lock_guard lock(mutex); RequestCancelLocked(job); }
         job->control.Cancel();
         bool queued = false;
         { std::lock_guard lock(mutex);
@@ -589,7 +638,8 @@ struct ClaimsService::Impl {
             if (native_pipeline && (!budget.prepared_context || !budget.prepared_context->MatchesStaticContext(job->context)))
                 budget.prepared_context = job->prepared_context;
             budget.successes = std::max(budget.successes, successes); ++budget.users; budget.touched = ++touched;
-            if (std::none_of(jobs.begin(), jobs.end(), [](const auto& item) { return item.second->attempt && !item.second->control.Cancelled(); })) idle = true;
+            BudgetChangedLocked(job->bounty, budget);
+            if (std::none_of(jobs.begin(), jobs.end(), [](const auto& item) { return item.second->attempt && !item.second->Cancelled(); })) idle = true;
         }
         auto& pending = job->attempt ? tls_pending : dns_pending;
         last_id = job->id; jobs.emplace(job->id, job); pending.push_back(job);
@@ -603,7 +653,7 @@ struct ClaimsService::Impl {
     }
     void Close() {
         std::vector<std::shared_ptr<Job>> cancel;
-        { std::lock_guard lock(mutex); closed = true; for (const auto& [id, job] : jobs) cancel.push_back(job); tls_condition.notify_all(); dns_condition.notify_all(); }
+        { std::lock_guard lock(mutex); closed = true; for (const auto& [id, job] : jobs) { RequestCancelLocked(job); cancel.push_back(job); } tls_condition.notify_all(); dns_condition.notify_all(); }
         for (const auto& job : cancel) { try { Cancel(job); } catch (...) { failed = true; } }
         for (auto& worker : workers) if (worker.joinable()) worker.join();
     }

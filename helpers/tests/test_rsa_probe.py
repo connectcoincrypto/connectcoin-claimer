@@ -134,22 +134,57 @@ class ProbeTests(unittest.TestCase):
                 self.assertLessEqual(capture.call_count, 1)
 
     def test_deadline_includes_stuck_dns_and_prevents_late_connection(self):
-        release, exited = threading.Event(), threading.Event()
+        entered, release, exited, finished = (threading.Event() for _ in range(4))
+        control = tls13.CaptureControl()
+        clock = Mock(spec=["monotonic"])
+        clock.monotonic.return_value = 100.0
+        budget = rsa_probe.PROBE_SECONDS
+        deadline = clock.monotonic() + budget
 
         def stalled_resolver(*args, **kwargs):
-            release.wait(2)
+            entered.set()
+            release.wait()
             exited.set()
             return (PUBLIC,)
 
-        with patch.object(rsa_probe, "resolve_endpoints", stalled_resolver), \
+        def expire_while_dns_is_blocked(timeout):
+            self.assertGreater(timeout, 0)
+            self.assertEqual(timeout, budget)
+            # The real pinned-root validation must finish and DNS must start
+            # before the virtual deadline expires, regardless of CPU scheduling.
+            self.assertTrue(entered.wait(10), "probe never entered DNS")
+            self.assertFalse(release.is_set())
+            self.assertFalse(finished.is_set())
+            clock.monotonic.return_value = deadline
+            return False
+
+        completion = Mock(spec=threading.Event)
+        completion.wait.side_effect = expire_while_dns_is_blocked
+        completion.set.side_effect = finished.set
+        frames = []
+        raw = (json.dumps(request()) + "\n").encode()
+        # Replace this module's time binding, not the shared time module used
+        # by threading. Real events retain their normal watchdog behavior.
+        with patch.object(rsa_probe, "time", clock), \
+                patch.object(rsa_probe, "Event", return_value=completion), \
+                patch.object(rsa_probe, "CaptureControl", return_value=control), \
+                patch.object(rsa_probe, "resolve_endpoints", stalled_resolver), \
                 patch.object(rsa_probe, "capture_tls13_proof") as capture:
             try:
-                started = time.monotonic()
-                self.assertFalse(self.invoke(budget=0.05)[1]["verified"])
-                self.assertLess(time.monotonic() - started, 0.5)
+                status = rsa_probe.run_probe(io.BytesIO(raw), frames.append,
+                                             HELPERS / "p2c_roots_v1.pem", deadline=deadline)
+                self.assertEqual(status, 0)
+                self.assertEqual(frames, [{"type": "rsa-probe", **request(), "verified": False}])
+                completion.wait.assert_called_once_with(budget)
+                self.assertTrue(control.cancelled())
+                self.assertFalse(release.is_set())
+                self.assertFalse(exited.is_set())
+                self.assertFalse(finished.is_set())
             finally:
                 release.set()
-            self.assertTrue(exited.wait(1))
+                self.assertTrue(finished.wait(10), "probe worker did not finish after DNS release")
+            self.assertTrue(exited.is_set())
+            completion.set.assert_called_once_with()
             capture.assert_not_called()
 
     def test_verification_finishing_after_deadline_cannot_report_success(self):

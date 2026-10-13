@@ -64,6 +64,17 @@ CapturedProof CapturePrepared(const PreparedContext& context, const Endpoint& en
                               std::chrono::milliseconds timeout = std::chrono::seconds{10},
                               bool complete_handshake = false);
 #ifdef CLAIMER_NETWORK_TESTING
+struct TlsReuseSnapshot {
+    size_t setups{}, resets{}, discarded{};
+    std::uintptr_t input_buffer{}, output_buffer{};
+    bool idle_clean{};
+};
+// Test-only inspection of this worker's storage; never reports key material.
+TlsReuseSnapshot TlsReuseSnapshotForTesting();
+// Simulate a reset error to exercise destruction and fresh-setup recovery.
+void FailNextTlsResetForTesting();
+// Deterministic cancellation after an entire ClientHello was sent/captured.
+void OnTlsClientHelloForTesting(std::function<void()> callback);
 // Inspect both atomic and portable socket-setup paths without connecting.
 bool SocketFlagsForTesting(bool portable);
 // Hermetic OS-error classification seam; never creates a socket or sends bytes.

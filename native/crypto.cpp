@@ -594,11 +594,70 @@ struct CachedCertificateChain {
         : parsed(std::move(chain)), metadata(ReadCertificateMetadata(parsed->value)) {}
 };
 struct CertificateCache {
-    Bytes message;
-    std::unique_ptr<CachedCertificateChain> parsed;
+    struct Entry {
+        Bytes message;
+        std::shared_ptr<const CachedCertificateChain> parsed;
+        size_t bytes{}, estimated_bytes{};
+    };
+    // Four ordinary chains cover alternating domains without scaling retained
+    // state with connection concurrency. Bound BOTH duplicated wire/DER bytes
+    // and a conservative parsed-allocation charge, independently per worker.
+    static constexpr size_t MAX_ENTRIES{4}, MAX_BYTES{65536}, MAX_ESTIMATED_BYTES{262144};
+    static_assert(MBEDTLS_ECP_WINDOW_SIZE <= 7 && MBEDTLS_ECP_MAX_BITS <= 521,
+        "Recheck the certificate cache key-allocation reserve for changed EC limits");
+    std::array<Entry, MAX_ENTRIES> entries;
+    size_t count{}, bytes{}, estimated_bytes{};
 #ifdef CLAIMER_CRYPTO_TESTING
     CertificateCacheStats stats;
 #endif
+    std::shared_ptr<const CachedCertificateChain> Find(std::span<const unsigned char> message) {
+        for (size_t index = 0; index < count; ++index) {
+            if (!std::ranges::equal(entries[index].message, message)) continue;
+            Entry hit = std::move(entries[index]);
+            for (size_t next = index + 1; next < count; ++next) entries[next - 1] = std::move(entries[next]);
+            entries[count - 1] = std::move(hit); // Most recently used, without allocating.
+            return entries[count - 1].parsed;
+        }
+        return {};
+    }
+    void Remember(std::span<const unsigned char> message, const std::shared_ptr<const CachedCertificateChain>& parsed) {
+        size_t der_bytes{}, structural_bytes{};
+        // The pinned parser's extra retained allocations are linked names and
+        // sequences. Count their public nodes, including embedded heads, with
+        // generous per-allocation padding; no private MPI fields are inspected.
+        const auto nodes = [](const auto* node) {
+            size_t size{};
+            for (; node; node = node->next) size += sizeof(*node) + 64;
+            return size;
+        };
+        for (const auto* cert = &parsed->parsed->value; cert; cert = cert->next) {
+            der_bytes += cert->raw.len;
+            structural_bytes += sizeof(*cert) + 64 + nodes(&cert->issuer) + nodes(&cert->subject) +
+                nodes(&cert->subject_alt_names) + nodes(&cert->ext_key_usage) +
+                nodes(&cert->certificate_policies) + nodes(&cert->authority_key_id.authorityCertIssuer);
+            // Reserve future public-key precomputation too: 32 KiB per key plus
+            // 32 modulus/coordinate widths comfortably covers pinned Mbed TLS
+            // RSA public MPIs and EC groups/tables (window size <= 7). This is a
+            // conservative retention charge, not a measurement of allocator RSS.
+            structural_bytes += 32768 + 32 * mbedtls_pk_get_len(&cert->pk);
+        }
+        if (message.size() + der_bytes > MAX_BYTES) return;
+        Entry candidate{Bytes(message.begin(), message.end()), parsed};
+        candidate.bytes = candidate.message.capacity() + der_bytes;
+        candidate.estimated_bytes = candidate.bytes + structural_bytes + sizeof(Entry) +
+            sizeof(CachedCertificateChain) + sizeof(CertificateChain) + 128;
+        if (candidate.bytes > MAX_BYTES || candidate.estimated_bytes > MAX_ESTIMATED_BYTES) return;
+        // Parse/metadata/key checks and all allocations finish before evicting:
+        // malformed input or failed admission cannot poison an existing entry.
+        while (count && (count == MAX_ENTRIES || bytes + candidate.bytes > MAX_BYTES ||
+                estimated_bytes + candidate.estimated_bytes > MAX_ESTIMATED_BYTES)) {
+            bytes -= entries[0].bytes; estimated_bytes -= entries[0].estimated_bytes;
+            for (size_t next = 1; next < count; ++next) entries[next - 1] = std::move(entries[next]);
+            entries[--count] = Entry{};
+        }
+        bytes += candidate.bytes; estimated_bytes += candidate.estimated_bytes;
+        entries[count++] = std::move(candidate);
+    }
 };
 CertificateCache& Certificates() { thread_local CertificateCache cache; return cache; }
 
@@ -627,31 +686,32 @@ std::vector<std::span<const unsigned char>> CertificateViews(std::span<const uns
         !reader.Empty() || !ParseCertificate(body, parsed, error)) Fail(error.empty() ? "Trailing certificate data" : error);
     return parsed.certificate_chain;
 }
-const CachedCertificateChain& CachedChain(std::span<const unsigned char> message) {
-    // One exact message per worker, bounded by the wire certificate limit.
-    // Static metadata belongs to this owned DER, never a prior trust decision.
+std::shared_ptr<const CachedCertificateChain> CachedChain(std::span<const unsigned char> message) {
+    // Exact owned messages, never hashes/pointers or prior trust decisions.
+    // The returned owner also covers oversized, uncached inputs and remains
+    // valid across eviction. CapturedProof spans still point to its own bytes.
     auto& cache = Certificates();
-    if (!cache.parsed || !std::ranges::equal(cache.message, message)) {
-#ifdef CLAIMER_CRYPTO_TESTING
-        ++cache.stats.misses;
-#endif
-        const auto views = CertificateViews(message);
-        auto candidate = std::make_unique<CertificateChain>();
-        for (auto der : views) {
-            if (mbedtls_x509_crt_parse_der(&candidate->value, der.data(), der.size()) != 0) Fail("Invalid DER certificate");
-        }
-        auto validated = std::make_unique<CachedCertificateChain>(std::move(candidate));
-        cache.message.assign(message.begin(), message.end());
-        cache.parsed = std::move(validated);
-#ifdef CLAIMER_CRYPTO_TESTING
-        ++cache.stats.metadata_builds;
-#endif
-    } else {
+    if (auto parsed = cache.Find(message)) {
 #ifdef CLAIMER_CRYPTO_TESTING
         ++cache.stats.hits;
 #endif
+        return parsed;
     }
-    return *cache.parsed;
+#ifdef CLAIMER_CRYPTO_TESTING
+    ++cache.stats.misses;
+#endif
+    const auto views = CertificateViews(message);
+    auto candidate = std::make_unique<CertificateChain>();
+    for (auto der : views) {
+        if (mbedtls_x509_crt_parse_der(&candidate->value, der.data(), der.size()) != 0) Fail("Invalid DER certificate");
+    }
+    auto validated = std::make_shared<const CachedCertificateChain>(std::move(candidate));
+#ifdef CLAIMER_CRYPTO_TESTING
+    ++cache.stats.metadata_builds;
+#endif
+    try { cache.Remember(message, validated); }
+    catch (const std::bad_alloc&) { /* Cache allocation failure does not change verification. */ }
+    return validated;
 }
 class SignatureCache {
     struct Entry { Bytes child, parent; };
@@ -919,14 +979,14 @@ namespace {
 Verification VerifyWithRoots(const ParsedProof& parsed, const PreparedContext& prepared, const mbedtls_x509_crt& roots) {
     InitializeCrypto();
     const auto& context = prepared.Get();
-    const auto& cached = CachedChain(parsed.certificate);
-    auto& chain = cached.parsed->value;
+    const auto cached = CachedChain(parsed.certificate);
+    auto& chain = cached->parsed->value;
     std::string error;
 #ifdef CLAIMER_CRYPTO_TESTING
     ++Certificates().stats.time_checks;
 #endif
-    if (!CheckSuppliedCertificateTimes(cached.metadata, context.validation_time, error)) Fail(error);
-    if (!cached.metadata.leaf_usage_valid) Fail("P2C leaf certificate is not authorized for TLS server signatures");
+    if (!CheckSuppliedCertificateTimes(cached->metadata, context.validation_time, error)) Fail(error);
+    if (!cached->metadata.leaf_usage_valid) Fail("P2C leaf certificate is not authorized for TLS server signatures");
     if (!SchemeAllowed(context.signature_algorithms_mask, parsed.certificate_verify_scheme)) Fail("Signature scheme is not allowed by bounty");
     uint32_t flags{};
     const connectcoin_mbedtls_x509_signature_cache cache{nullptr, SignatureLookup, SignatureRemember};
@@ -955,7 +1015,12 @@ Verification VerifyCaptured(const CapturedProof& proof) {
 #ifdef CLAIMER_CRYPTO_TESTING
 SignatureCacheStats SignatureCacheStatsForTesting() { return Signatures().Stats(); }
 void ClearSignatureCacheForTesting() { Signatures() = SignatureCache{}; }
-CertificateCacheStats CertificateCacheStatsForTesting() { return Certificates().stats; }
+CertificateCacheStats CertificateCacheStatsForTesting() {
+    const auto& cache = Certificates();
+    auto stats = cache.stats;
+    stats.entries = cache.count; stats.bytes = cache.bytes; stats.estimated_bytes = cache.estimated_bytes;
+    return stats;
+}
 void ClearCertificateCacheForTesting() { Certificates() = CertificateCache{}; }
 static Verification VerifyParsedForTesting(const ParsedProof& parsed, const PreparedContext& prepared, std::span<const unsigned char> roots_pem) {
     InitializeCrypto();

@@ -27,6 +27,19 @@ claimer::Context FixtureContext()
 {
     return {"example.com", std::string(64, '1'), 0, std::string(64, 'f'), 1, 7, 1800000000};
 }
+void RequireTlsReused(const claimer::TlsReuseSnapshot& before)
+{
+    const auto after = claimer::TlsReuseSnapshotForTesting();
+    Require(after.idle_clean, "TLS context retained prior session, secrets or callbacks");
+    Require(after.discarded == before.discarded, "Healthy TLS storage was discarded");
+    Require(after.resets == before.resets + 1, "Capture did not fully reset TLS on exit");
+    Require(after.setups == before.setups + (before.input_buffer == 0 ? 1 : 0), "Capture repeated TLS setup");
+    Require(after.input_buffer != 0 && after.output_buffer != 0, "TLS buffers were not retained");
+    if (before.input_buffer != 0) {
+        Require(after.input_buffer == before.input_buffer && after.output_buffer == before.output_buffer,
+                "TLS capture replaced reusable buffers");
+    }
+}
 void SocketFailureTests()
 {
     const auto classified = [](int error, bool creating, int expected) {
@@ -220,13 +233,60 @@ int main(int argc, char** argv)
             catch (const std::exception&) { rejected = true; }
             Require(rejected, "Truncated proof accepted");
         };
+        if (mode.starts_with("reuse-sequence-")) {
+            const auto compatible_mask = static_cast<uint8_t>(std::stoul(mode.substr(15)));
+            Require(compatible_mask == 1 || compatible_mask == 2, "Invalid reuse fixture mask");
+            Require(!roots.empty(), "Reuse fixtures must authenticate every successful proof");
+            for (int index = 0; index < 7; ++index) {
+                context = FixtureContext();
+                context.input_index = static_cast<uint32_t>(index);
+                if (index == 2 || index == 4) context.domain = "alternate.example.com";
+                context.signature_algorithms_mask = (index == 2 || index == 4) ? compatible_mask : 7;
+                const auto before = claimer::TlsReuseSnapshotForTesting();
+                Require(before.idle_clean, "Worker TLS was dirty before capture");
+                if (index == 4) claimer::FailNextTlsResetForTesting();
+                claimer::CaptureControl own_control;
+                if (index == 3) claimer::OnTlsClientHelloForTesting([&] { own_control.Cancel(); });
+                if (index == 5) claimer::OnTlsClientHelloForTesting([] {
+                    // Expire only after the complete ClientHello is captured,
+                    // so slow/oversubscribed hosts still exercise its fresh key
+                    // share and the partial-handshake reset after a timeout.
+                    std::this_thread::sleep_for(std::chrono::milliseconds{2050});
+                });
+                bool failed{}, cancelled{}, timed_out{};
+                try {
+                    const auto captured = claimer::CapturePreparedForTesting(claimer::PreparedContext(context),
+                        {"127.0.0.1", AF_INET, static_cast<uint16_t>(port)}, own_control,
+                        {},
+                        std::chrono::milliseconds{index == 5 ? 2000 : timeout_ms}, index == 2 || index == 6);
+                    authenticate(captured.Encoded());
+                    std::cout << index << ' ' << claimer::Hex(captured.Encoded()) << '\n';
+                } catch (const claimer::CaptureCancelled&) { cancelled = true; }
+                catch (const claimer::CaptureTimeout&) { timed_out = true; }
+                catch (const std::runtime_error&) {
+                    if (index != 1) throw;
+                    failed = true;
+                }
+                Require(failed == (index == 1) && cancelled == (index == 3) && timed_out == (index == 5),
+                        "Reuse sequence changed error/cancellation/deadline behavior");
+                if (index == 4) {
+                    const auto after = claimer::TlsReuseSnapshotForTesting();
+                    Require(after.idle_clean && after.discarded == before.discarded + 1 &&
+                            after.input_buffer == 0 && after.output_buffer == 0,
+                            "Failed reset retained an uncertain TLS context");
+                } else RequireTlsReused(before);
+            }
+            return 0;
+        }
         if (mode == "repeat") {
             claimer::ClearCertificateCacheForTesting();
             for (int index = 0; index < 2; ++index) {
+                const auto before = claimer::TlsReuseSnapshotForTesting();
                 claimer::CaptureControl own_control;
                 const auto captured = claimer::CapturePreparedForTesting(claimer::PreparedContext(context),
                     {"127.0.0.1", AF_INET, static_cast<uint16_t>(port)}, own_control, {},
                     std::chrono::milliseconds{timeout_ms});
+                RequireTlsReused(before);
                 authenticate(captured.Encoded());
                 std::cout << claimer::Hex(captured.Encoded()) << '\n';
             }
@@ -236,16 +296,21 @@ int main(int argc, char** argv)
             return 0;
         }
         if (mode == "parallel") {
-            std::vector<std::future<claimer::Bytes>> jobs;
+            std::vector<std::future<std::vector<claimer::Bytes>>> jobs;
             for (int index = 0; index < 8; ++index) jobs.push_back(std::async(std::launch::async, [&] {
-                claimer::CaptureControl own_control;
-                const auto captured = claimer::CapturePreparedForTesting(claimer::PreparedContext(context), {"127.0.0.1", AF_INET, static_cast<uint16_t>(port)},
-                    own_control, {}, std::chrono::milliseconds{timeout_ms});
-                const auto& proof = captured.Encoded();
-                authenticate(proof);
-                return proof;
+                std::vector<claimer::Bytes> proofs;
+                for (int repeat = 0; repeat < 2; ++repeat) {
+                    const auto before = claimer::TlsReuseSnapshotForTesting();
+                    claimer::CaptureControl own_control;
+                    const auto captured = claimer::CapturePreparedForTesting(claimer::PreparedContext(context), {"127.0.0.1", AF_INET, static_cast<uint16_t>(port)},
+                        own_control, {}, std::chrono::milliseconds{timeout_ms});
+                    RequireTlsReused(before);
+                    authenticate(captured.Encoded());
+                    proofs.push_back(captured.Encoded());
+                }
+                return proofs;
             }));
-            for (auto& job : jobs) std::cout << claimer::Hex(job.get()) << '\n';
+            for (auto& job : jobs) for (const auto& proof : job.get()) std::cout << claimer::Hex(proof) << '\n';
             return 0;
         }
         int starts{};

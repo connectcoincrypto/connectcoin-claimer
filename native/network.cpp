@@ -242,9 +242,78 @@ std::string TlsError(int result)
     return std::string("TLS handshake failed: ") + error;
 }
 
-struct Connection {
+// Each service worker owns its TLS storage. Only allocations/configuration
+// survive a capture: the public full-session reset destroys handshake secrets,
+// peer/session state and transforms before this object becomes idle again.
+struct WorkerTls {
     mbedtls_ssl_context ssl{};
     mbedtls_ssl_config config{};
+    std::array<uint16_t, 4> signatures{};
+    bool ready{}, in_use{};
+#ifdef CLAIMER_NETWORK_TESTING
+    size_t setups{}, resets{}, discarded{};
+    bool fail_next_reset{};
+    std::function<void()> on_client_hello;
+#endif
+    WorkerTls() {
+        mbedtls_ssl_init(&ssl);
+        mbedtls_ssl_config_init(&config);
+        const int result = mbedtls_ssl_config_defaults(&config, MBEDTLS_SSL_IS_CLIENT,
+            MBEDTLS_SSL_TRANSPORT_STREAM, MBEDTLS_SSL_PRESET_DEFAULT);
+        if (result != 0) {
+            mbedtls_ssl_config_free(&config);
+            throw std::runtime_error(TlsError(result));
+        }
+        static constexpr int suites[]{MBEDTLS_TLS1_3_AES_128_GCM_SHA256, MBEDTLS_TLS1_3_CHACHA20_POLY1305_SHA256, 0};
+        static constexpr uint16_t groups[]{29, 23, 0};
+        mbedtls_ssl_conf_min_tls_version(&config, MBEDTLS_SSL_VERSION_TLS1_3);
+        mbedtls_ssl_conf_max_tls_version(&config, MBEDTLS_SSL_VERSION_TLS1_3);
+        mbedtls_ssl_conf_tls13_key_exchange_modes(&config, MBEDTLS_SSL_TLS1_3_KEY_EXCHANGE_MODE_EPHEMERAL);
+        mbedtls_ssl_conf_ciphersuites(&config, suites);
+        mbedtls_ssl_conf_groups(&config, groups);
+        mbedtls_ssl_conf_sig_algs(&config, signatures.data());
+        // Authentication remains in the complete proof verifier with immutable
+        // roots and the supplied chain median time, never platform TLS trust.
+        mbedtls_ssl_conf_authmode(&config, MBEDTLS_SSL_VERIFY_NONE);
+    }
+    ~WorkerTls() { mbedtls_ssl_free(&ssl); mbedtls_ssl_config_free(&config); }
+    WorkerTls(const WorkerTls&) = delete;
+    WorkerTls& operator=(const WorkerTls&) = delete;
+    void Release() noexcept {
+        // No idle callback may retain a stack Connection or its CaptureControl.
+        mbedtls_ssl_set_bio(&ssl, nullptr, nullptr, nullptr, nullptr);
+        mbedtls_ssl_conf_rng(&config, nullptr, nullptr);
+        (void)mbedtls_ssl_set_hostname(&ssl, nullptr);
+        int result = ready ? mbedtls_ssl_session_reset(&ssl) : MBEDTLS_ERR_SSL_INTERNAL_ERROR;
+#ifdef CLAIMER_NETWORK_TESTING
+        if (std::exchange(fail_next_reset, false)) result = MBEDTLS_ERR_SSL_ALLOC_FAILED;
+#endif
+        if (result != 0) {
+            // Partial setup or reset allocation failure: never lend an uncertain
+            // context to the next capture. Its next setup starts from ssl_init.
+            mbedtls_ssl_free(&ssl);
+            mbedtls_ssl_init(&ssl);
+            ready = false;
+#ifdef CLAIMER_NETWORK_TESTING
+            ++discarded;
+#endif
+        } else {
+#ifdef CLAIMER_NETWORK_TESTING
+            ++resets;
+#endif
+        }
+        signatures.fill(0);
+#ifdef CLAIMER_NETWORK_TESTING
+        on_client_hello = {};
+#endif
+        in_use = false;
+    }
+};
+WorkerTls& ThreadTls() { thread_local WorkerTls tls; return tls; }
+
+struct Connection {
+    WorkerTls& tls;
+    mbedtls_ssl_context& ssl;
     const Hash challenge;
     Socket socket;
     const CaptureControl& control;
@@ -253,12 +322,35 @@ struct Connection {
     std::array<unsigned char, 16384 + 5> sent{};
     size_t sent_size{}, sent_total{}, received_total{};
     Connection(Hash value, Socket fd, const CaptureControl& cancellation, Clock::time_point end)
-        : challenge(value), socket(fd), control(cancellation), deadline(end)
+        : tls(ThreadTls()), ssl(tls.ssl), challenge(value), socket(fd), control(cancellation), deadline(end)
     {
-        mbedtls_ssl_init(&ssl);
-        mbedtls_ssl_config_init(&config);
+        if (tls.in_use) throw std::runtime_error("Nested TLS capture on one worker");
+        tls.in_use = true;
     }
-    ~Connection() { mbedtls_ssl_free(&ssl); mbedtls_ssl_config_free(&config); }
+    ~Connection() { tls.Release(); }
+    Connection(const Connection&) = delete;
+    Connection& operator=(const Connection&) = delete;
+    void Configure(const Context& context) {
+        tls.signatures.fill(0);
+        size_t count{};
+        if (context.signature_algorithms_mask & 1) tls.signatures[count++] = 0x0403;
+        if (context.signature_algorithms_mask & 2) tls.signatures[count++] = 0x0804;
+        if (context.signature_algorithms_mask & 4) tls.signatures[count++] = 0x0809;
+        mbedtls_ssl_conf_rng(&tls.config, Random, this);
+        int result{};
+        if (!tls.ready) {
+            result = mbedtls_ssl_setup(&ssl, &tls.config);
+            if (result == 0) {
+                tls.ready = true;
+#ifdef CLAIMER_NETWORK_TESTING
+                ++tls.setups;
+#endif
+            }
+        }
+        if (result == 0) result = mbedtls_ssl_set_hostname(&ssl, context.domain.c_str());
+        if (result != 0) throw std::runtime_error(TlsError(result));
+        mbedtls_ssl_set_bio(&ssl, this, Send, Receive, nullptr);
+    }
     static int Random(void* context, unsigned char* output, size_t size) noexcept
     {
         auto& self = *static_cast<Connection*>(context);
@@ -471,29 +563,8 @@ static CapturedProof CaptureImpl(const PreparedContext& prepared, const Endpoint
     SocketLease socket(control, endpoint.family);
     const auto deadline = socket.Connect(address, on_started, timeout);
     Connection connection(challenge, socket.Get(), control, deadline);
-    static constexpr int suites[]{MBEDTLS_TLS1_3_AES_128_GCM_SHA256, MBEDTLS_TLS1_3_CHACHA20_POLY1305_SHA256, 0};
-    static constexpr uint16_t groups[]{29, 23, 0};
-    std::vector<uint16_t> signatures;
-    if (context.signature_algorithms_mask & 1) signatures.push_back(0x0403);
-    if (context.signature_algorithms_mask & 2) signatures.push_back(0x0804);
-    if (context.signature_algorithms_mask & 4) signatures.push_back(0x0809);
-    signatures.push_back(0);
-    int result = mbedtls_ssl_config_defaults(&connection.config, MBEDTLS_SSL_IS_CLIENT, MBEDTLS_SSL_TRANSPORT_STREAM, MBEDTLS_SSL_PRESET_DEFAULT);
-    if (result != 0) throw std::runtime_error(TlsError(result));
-    mbedtls_ssl_conf_min_tls_version(&connection.config, MBEDTLS_SSL_VERSION_TLS1_3);
-    mbedtls_ssl_conf_max_tls_version(&connection.config, MBEDTLS_SSL_VERSION_TLS1_3);
-    mbedtls_ssl_conf_tls13_key_exchange_modes(&connection.config, MBEDTLS_SSL_TLS1_3_KEY_EXCHANGE_MODE_EPHEMERAL);
-    mbedtls_ssl_conf_ciphersuites(&connection.config, suites);
-    mbedtls_ssl_conf_groups(&connection.config, groups);
-    mbedtls_ssl_conf_sig_algs(&connection.config, signatures.data());
-    // No OS roots or wall-clock trust. VerifyProof authenticates the captured
-    // bytes later using immutable roots and the supplied chain median time.
-    mbedtls_ssl_conf_authmode(&connection.config, MBEDTLS_SSL_VERIFY_NONE);
-    mbedtls_ssl_conf_rng(&connection.config, Connection::Random, &connection);
-    result = mbedtls_ssl_setup(&connection.ssl, &connection.config);
-    if (result == 0) result = mbedtls_ssl_set_hostname(&connection.ssl, context.domain.c_str());
-    if (result != 0) throw std::runtime_error(TlsError(result));
-    mbedtls_ssl_set_bio(&connection.ssl, &connection, Connection::Send, Connection::Receive, nullptr);
+    connection.Configure(context);
+    int result{};
     Bytes proof{2};
     std::optional<CapturedProof> captured_proof;
     unsigned captured{};
@@ -519,6 +590,9 @@ static CapturedProof CaptureImpl(const PreparedContext& prepared, const Endpoint
                 if (!connection.random_set || connection.sent_size != length + 5) throw std::runtime_error("Unsupported ClientHello randomness or record layout");
                 Append(proof, connection.sent.data() + 5, length, 1);
                 connection.captured_hello = true;
+#ifdef CLAIMER_NETWORK_TESTING
+                if (connection.tls.on_client_hello) connection.tls.on_client_hello();
+#endif
             }
         }
         if (result == MBEDTLS_ERR_SSL_WANT_READ || result == MBEDTLS_ERR_SSL_WANT_WRITE) {
@@ -575,6 +649,20 @@ CapturedProof CapturePrepared(const PreparedContext& context, const Endpoint& en
     return CaptureImpl(context, endpoint, control, on_started, timeout, complete_handshake, false);
 }
 #ifdef CLAIMER_NETWORK_TESTING
+TlsReuseSnapshot TlsReuseSnapshotForTesting()
+{
+    auto& tls = ThreadTls();
+    const auto& ssl = tls.ssl;
+    const bool clean = !tls.in_use && tls.config.p_rng == nullptr && tls.config.f_rng == nullptr &&
+        std::all_of(tls.signatures.begin(), tls.signatures.end(), [](uint16_t value) { return value == 0; }) &&
+        connectcoin_p2c_test_tls_reset_clean(&ssl) != 0;
+    return {tls.setups, tls.resets, tls.discarded,
+        reinterpret_cast<std::uintptr_t>(ssl.in_buf), reinterpret_cast<std::uintptr_t>(ssl.out_buf), clean};
+}
+
+void FailNextTlsResetForTesting() { ThreadTls().fail_next_reset = true; }
+void OnTlsClientHelloForTesting(std::function<void()> callback) { ThreadTls().on_client_hello = std::move(callback); }
+
 bool SocketFlagsForTesting(bool portable)
 {
     InitializeSockets();

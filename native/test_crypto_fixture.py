@@ -108,6 +108,29 @@ def main():
     reuse_domain=verify(signed_proof("other.example",leaf,[]),root[1],False,"prepared changed hostname",prepared=True)
     verify(dataclasses.replace(good,txid="02"*32),root[1],False,"prepared changed transaction",prepared=True)
     verify(dataclasses.replace(good,input_index=1),root[1],False,"prepared changed input",prepared=True)
+    # Exact-message LRU: A,A,B,A parses only twice. A hit must refresh recency,
+    # and subsequent eviction must not invalidate a copied/moved CapturedProof.
+    alternating=[good]+[signed_proof("example.com",certificate(serial,"LRU leaf",issuer=root,dns_name="example.com"),[])
+                        for serial in range(460,464)]
+    lru_a=verify(good,root[1],True,"LRU A cold",clear=True)
+    requests[lru_a]["hold"]=True
+    lru_aa=verify(good,root[1],True,"LRU A warm")
+    lru_b=verify(alternating[1],root[1],True,"LRU B cold")
+    lru_aba=verify(good,root[1],True,"LRU A after B")
+    for envelope in alternating[2:4]: verify(envelope,root[1],True,"LRU fill")
+    lru_full=verify(alternating[4],root[1],True,"LRU evict B")
+    lru_a_kept=verify(good,root[1],True,"LRU recently used A retained")
+    lru_b_evicted=verify(alternating[1],root[1],True,"LRU B must reparse")
+    # A malformed DER message never enters the cache or displaces warm A.
+    malformed=bytearray(_certificate_message([leaf[1]])); malformed[11]=0x31
+    malformed_cases=[]
+    for _ in range(2):
+        malformed_cases.append(len(requests))
+        requests.append({"mode":"certificate","proof":malformed.hex()})
+        expected.append((False,"malformed message cannot poison LRU"))
+    malformed_restored=verify(good,root[1],True,"warm A after malformed DER")
+    parallel=verify(good,root[1],True,"parallel LRU isolation")
+    requests[parallel].update(parallel=True,alternate_proof=alternating[1].proof.hex())
     # The cache is independently bounded by entry count and owned DER bytes.
     count_cases=[]
     for serial in range(410,420):
@@ -116,6 +139,8 @@ def main():
         if not count_cases: first_count=envelope
         count_cases.append(verify(envelope,root[1],True,"entry-count eviction",clear=not count_cases))
     count_evicted=verify(first_count,root[1],True,"oldest count entry evicted")
+    held_replay=verify(good,root[1],True,"held proof survives cache clear and eviction")
+    requests[held_replay]["replay_held"]=True
     byte_cases=[]
     for serial in range(430,436):
         key,cert=certificate(serial,"Padded leaf",issuer=root,dns_name="example.com")
@@ -131,6 +156,16 @@ def main():
     huge_proof=signed_proof("example.com",huge_leaf,[])
     oversize1=verify(huge_proof,huge_root[1],True,"oversized edge bypasses cache",clear=True)
     oversize2=verify(huge_proof,huge_root[1],True,"oversized edge still reverified")
+    # Both certificate-message cache budgets independently bypass retention.
+    # These remain wire-valid and execute all verification checks on every use.
+    bypass_warm=verify(good,root[1],True,"warm A before oversized messages",clear=True)
+    padded_root=reissue(root[1],root[0],padding=12000)
+    payload_large=signed_proof("example.com",huge_leaf,[padded_root,padded_root])
+    payload_cases=[verify(payload_large,root[1],True,"certificate payload budget bypass") for _ in range(2)]
+    # Eight small certificates fit the raw-byte budget but exceed the reserved
+    # public-key/parsed-structure budget. An unused candidate remains checked.
+    structure_cases=[verify(duplicate,root[1],True,"certificate parsed-allocation budget bypass") for _ in range(2)]
+    bypass_restored=verify(good,root[1],True,"warm A survives oversized messages")
     # Every truncation of a signed proof must fail, including partial DER/CV.
     for size in range(len(good.proof)):
         verify(dataclasses.replace(good,proof=good.proof[:size]),root[1],False,f"truncated {size}")
@@ -153,6 +188,8 @@ def main():
     for value,(valid,name) in zip(results,expected):
         assert value["valid"]==valid,(name,value)
         assert value["cache_entries"]<=8 and value["cache_bytes"]<=65536,(name,value)
+        assert value["metadata_entries"]<=4 and value["metadata_bytes"]<=65536,(name,value)
+        assert value["metadata_estimated_bytes"]<=262144,(name,value)
         if name=="valid work miss": assert value["meets_target"] is False
     assert results[cold]["work_hash"]==reference.connection_work_hash
     assert results[warm]["work_hash"]==reference.connection_work_hash
@@ -179,12 +216,38 @@ def main():
     assert results[reuse_restored]["metadata_builds"]==1
     assert results[reuse_time]["work_hash"]==results[reuse_restored]["work_hash"]==reference.connection_work_hash
     assert all(results[index]["context_reused"] is False for index in (reuse_target,reuse_mask,reuse_domain))
+    assert [results[index]["metadata_builds"] for index in (lru_a,lru_aa,lru_b,lru_aba)]==[1,1,2,2]
+    assert results[lru_full]["metadata_entries"]==4
+    assert results[lru_a_kept]["metadata_builds"]==results[lru_full]["metadata_builds"]
+    assert results[lru_b_evicted]["metadata_builds"]==results[lru_a_kept]["metadata_builds"]+1
+    for index in malformed_cases:
+        assert results[index]["metadata_builds"]==results[lru_b_evicted]["metadata_builds"]
+        assert results[index]["metadata_entries"]==results[lru_b_evicted]["metadata_entries"]
+        assert results[index]["metadata_bytes"]==results[lru_b_evicted]["metadata_bytes"]
+    assert results[malformed_cases[1]]["metadata_misses"]==results[malformed_cases[0]]["metadata_misses"]+1
+    assert results[malformed_restored]["metadata_builds"]==results[lru_b_evicted]["metadata_builds"]
+    assert results[parallel]["metadata_builds"]==results[malformed_restored]["metadata_builds"]
+    assert results[parallel]["metadata_hits"]==results[malformed_restored]["metadata_hits"]+1
     assert results[count_cases[-1]]["cache_entries"]==8
+    assert results[count_cases[-1]]["metadata_entries"]==4
     assert results[count_evicted]["cache_misses"]>results[count_cases[-1]]["cache_misses"]
+    assert results[count_evicted]["metadata_builds"]==results[count_cases[-1]]["metadata_builds"]+1
+    assert results[held_replay]["metadata_builds"]==results[count_evicted]["metadata_builds"]+1
+    assert results[held_replay]["work_hash"]==reference.connection_work_hash
     assert results[byte_cases[-1]]["cache_entries"]<8
+    assert results[byte_cases[-1]]["metadata_entries"]==2
     assert results[bytes_evicted]["cache_misses"]>results[byte_cases[-1]]["cache_misses"]
+    assert results[bytes_evicted]["metadata_builds"]==results[byte_cases[-1]]["metadata_builds"]+1
     assert results[oversize1]["cache_entries"]==results[oversize2]["cache_entries"]==0
     assert results[oversize1]["cache_bytes"]==results[oversize2]["cache_bytes"]==0
     assert results[oversize2]["cache_misses"]>results[oversize1]["cache_misses"]
+    for index in payload_cases+structure_cases:
+        assert results[index]["metadata_entries"]==results[bypass_warm]["metadata_entries"]==1
+        assert results[index]["metadata_bytes"]==results[bypass_warm]["metadata_bytes"]
+        assert results[index]["metadata_estimated_bytes"]==results[bypass_warm]["metadata_estimated_bytes"]
+    assert results[payload_cases[1]]["metadata_builds"]==results[payload_cases[0]]["metadata_builds"]+1
+    assert results[structure_cases[1]]["metadata_builds"]==results[structure_cases[0]]["metadata_builds"]+1
+    assert results[bypass_restored]["metadata_builds"]==results[bypass_warm]["metadata_builds"]+4
+    assert results[bypass_restored]["metadata_hits"]==results[bypass_warm]["metadata_hits"]+1
     print(f"{len(expected)} native crypto fixture cases passed")
 if __name__=="__main__": main()
