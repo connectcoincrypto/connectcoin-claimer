@@ -424,39 +424,49 @@ export class RpcClient extends EventEmitter {
       if (beforeSend !== undefined && typeof beforeSend !== 'function') throw new Error('RPC beforeSend must be a synchronous function.');
       const waitingSignal = signal ? AbortSignal.any([this.abort.signal, signal]) : this.abort.signal;
       if (waitingSignal.aborted) throw cancelledError();
-      if (this.queuedRequests >= 32) throw new Error('Too many queued RPC requests; retry shortly.');
+      if (this.queuedRequests >= 32) throw Object.assign(new Error('Too many queued RPC requests; retry shortly.'), { code: 'RPC_QUEUE_FULL' });
       this.queuedRequests++; queued = true;
       await this.pace(method, clean, { signal: waitingSignal, reserve: false });
       if (waitingSignal.aborted) throw cancelledError();
       diagnostic.stage = 'connect';
       const socket = await waitForConnection(this.connect(), waitingSignal);
       diagnostic.stage = 'request';
+      let id, encoded;
       for (;;) {
         releaseCapacity = await this.waitForCapacity(socket, waitingSignal);
         if (waitingSignal.aborted) throw cancelledError();
         if (this.closed) throw closedError();
         if (socket.destroyed || this.socket !== socket) throw new Error('RPC connection is closed.');
         // A slot wait may outlive a quota window or receive a new server
-        // cooldown. Debit only immediately before transmission, and never
-        // occupy a global slot while waiting on one method's rate limit.
-        if (!this.quotaWait(method, clean, { reserve: true })) break;
+        // cooldown. Check without charging until ALL local write fences pass.
+        // Never occupy a global slot while waiting on one method's rate limit.
+        if (!this.quotaWait(method, clean)) {
+          if (this.nextId >= Number.MAX_SAFE_INTEGER) throw new Error('RPC request identifier space exhausted. Reopen the wallet.');
+          id = ++this.nextId;
+          encoded = JSON.stringify({ jsonrpc: '2.0', id, method, params: clean }) + '\n';
+          if (Buffer.byteLength(encoded) > 900000 || socket.writableLength + Buffer.byteLength(encoded) > 2 * 1024 * 1024) throw new Error('RPC request exceeds the wallet output buffer limit.');
+          // Revalidate the catalog/epoch AFTER every quota/capacity wait.
+          // Rejection owns no pending request, spends no quota and never
+          // tears down sibling I/O. Asynchronous fences are not permitted.
+          if (beforeSend) {
+            const result = beforeSend();
+            if (result && typeof result.then === 'function') {
+              Promise.resolve(result).catch(() => {});
+              throw new Error('RPC beforeSend must be synchronous.');
+            }
+          }
+          // The fence itself may cancel or close the client/socket.
+          if (waitingSignal.aborted) throw cancelledError();
+          if (this.closed) throw closedError();
+          if (socket.destroyed || this.socket !== socket) throw new Error('RPC connection is closed.');
+          // Debit immediately before transmission. There is no await or
+          // caller callback from this point to write, so concurrent requests
+          // cannot oversubscribe quota. A synchronous fence that changes a
+          // cooldown must wait again and revalidate, without spending quota.
+          if (!this.quotaWait(method, clean, { reserve: true })) break;
+        }
         releaseCapacity(); releaseCapacity = undefined;
         await this.pace(method, clean, { signal: waitingSignal, reserve: false });
-      }
-      if (this.nextId >= Number.MAX_SAFE_INTEGER) throw new Error('RPC request identifier space exhausted. Reopen the wallet.');
-      const id = ++this.nextId;
-      const encoded = JSON.stringify({ jsonrpc: '2.0', id, method, params: clean }) + '\n';
-      if (Buffer.byteLength(encoded) > 900000 || socket.writableLength + Buffer.byteLength(encoded) > 2 * 1024 * 1024) throw new Error('RPC request exceeds the wallet output buffer limit.');
-      if (waitingSignal.aborted) throw cancelledError();
-      // Revalidate a caller's catalog/epoch gate AFTER every quota/capacity wait.
-      // No await may occur between this synchronous fence and the actual write.
-      // Rejection here owns no pending request and never tears down sibling I/O.
-      if (beforeSend) {
-        const result = beforeSend();
-        if (result && typeof result.then === 'function') {
-          Promise.resolve(result).catch(() => {});
-          throw new Error('RPC beforeSend must be synchronous.');
-        }
       }
       return await new Promise((resolve, reject) => {
         if (waitingSignal.aborted) { reject(cancelledError()); return; }

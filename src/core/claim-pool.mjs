@@ -28,6 +28,7 @@ export class ConnectionPool {
     Object.assign(this, { helper, resourcesPath, basePath, spawnProcess, onDiagnostic, onFailure });
     this.pacesStarts = true; // Protocol 4 enforces one global clock at socket start.
     this.requests = new Map(); this.sequence = 0; this.pendingStarts = 0; this.closing = false;
+    this.admissionTarget = true; this.admissionPaused = false; this.admissionControls = 0; this.admissionRequest = Promise.resolve();
   }
   async start(options) {
     if (this.closing) throw claimAborted();
@@ -98,7 +99,8 @@ export class ConnectionPool {
     if (!this.started || this.closing || signal?.aborted) return Promise.reject(claimAborted());
     // Bound retained requests by actual configured work plus DNS. Raising the
     // user's concurrency must not turn the former 512-request guard into a stop.
-    if (this.requests.size >= Math.max(512, this.options.concurrency + 2) || this.sequence >= Number.MAX_SAFE_INTEGER) return Promise.reject(new Error('Claims helper request capacity exceeded'));
+    const controls = this.admissionControls;
+    if ((kind === 'admission' ? controls >= 32 : this.requests.size - controls >= Math.max(512, this.options.concurrency + 2)) || this.sequence >= Number.MAX_SAFE_INTEGER) return Promise.reject(new Error('Claims helper request capacity exceeded'));
     return new Promise((resolve, reject) => {
       const id = ++this.sequence;
       const request = { id, kind, body, signal, onStarted, onCapture, onResult, resolve, reject, started: false, capture: null };
@@ -106,11 +108,11 @@ export class ConnectionPool {
       // Socket pacing has its own generous watchdog, including every admission
       // ahead of this one. A stalled helper still fails without charging this
       // local queue wait to the capture/verification deadline.
-      if (kind === 'resolve') this.armDeadline(request, 45000);
+      if (kind === 'admission') { this.admissionControls++; this.armDeadline(request, 15000, 'Claims helper admission acknowledgement exceeded its deadline'); }
+      else if (kind === 'resolve') this.armDeadline(request, 45000);
       else {
         this.pendingStarts++;
-        this.armDeadline(request, 60000 + this.pendingStarts * 1000 / this.options.connectionsPerSecond,
-          'Claims helper start acknowledgement exceeded its deadline');
+        if (!this.admissionPaused) this.armStartDeadline(request);
       }
       signal?.addEventListener('abort', request.abort, { once: true });
       this.requests.set(id, request);
@@ -118,6 +120,31 @@ export class ConnectionPool {
     });
   }
   resolve(domain, options = {}) { return this.request('resolve', { domain }, options); }
+  armStartDeadline(request) {
+    this.armDeadline(request, 60000 + this.pendingStarts * 1000 / this.options.connectionsPerSecond,
+      'Claims helper start acknowledgement exceeded its deadline');
+  }
+  setAdmissionAllowed(allowed) {
+    if (typeof allowed !== 'boolean') return Promise.reject(new Error('Invalid claims admission state'));
+    if (this.failure) return Promise.reject(this.failure);
+    if (this.closing) return Promise.reject(claimAborted());
+    if (!this.started) return this.ready ? this.ready.then(() => this.setAdmissionAllowed(allowed)) : Promise.reject(claimAborted());
+    if (this.admissionTarget === allowed) return this.admissionRequest;
+    this.admissionTarget = allowed;
+    if (!allowed) {
+      this.admissionPaused = true;
+      for (const request of this.requests.values()) if (request.kind === 'attempt' && !request.started) {
+        clearTimeout(request.timer); request.timer = null;
+      }
+    }
+    // Control ACKs retain their own short watchdog while pre-start work is
+    // paused. Started captures keep their original, independent deadline.
+    this.admissionRequest = this.request('admission', { allowed }).catch(error => {
+      if (!this.closing) this.fail(error);
+      throw error;
+    });
+    return this.admissionRequest;
+  }
   attempt(context, { bountyId, successfulConnections = 0n, ...options } = {}) {
     if (typeof bountyId !== 'string' || !/^[0-9a-f]{64}:(0|[1-9][0-9]{0,9})$/.test(bountyId) || Number(bountyId.split(':')[1]) > 0xffffffff) return Promise.reject(new Error('Invalid bounty identity'));
     const publicContext = validateClaimContext(context);
@@ -126,9 +153,9 @@ export class ConnectionPool {
   receive(message) {
     if (!message || typeof message !== 'object' || Array.isArray(message)) throw new Error('Malformed claims helper response');
     if (message.type === 'ready') {
-      if (this.started || message.protocol !== 4 || message.roots !== 1 || message.security?.rsaPublicExponentMaxBits !== 64 ||
+      if (this.started || message.protocol !== 4 || message.roots !== 1 || message.security?.rsaPublicExponentMaxBits !== 64 || message.security?.admissionGate !== 1 ||
           (this.requireNative && (message.security?.provider !== 'mbedtls' || message.security?.mbedtlsVersion !== '3.6.7'))) {
-        throw new Error('Incompatible claims helper: validated observations require protocol 4 and a 64-bit RSA public-exponent limit. Update the app or run npm run build:claims.');
+        throw new Error('Incompatible claims helper: protocol 4, admission gate and a 64-bit RSA public-exponent limit are required. Update the app or run npm run build:claims.');
       }
       this.started = true; clearTimeout(this.startTimer);
       if (this.closing) this.readyReject(claimAborted()); else this.readyResolve();
@@ -141,6 +168,14 @@ export class ConnectionPool {
     if (!Number.isSafeInteger(message.id)) throw new Error('Invalid helper request identity');
     const request = this.requests.get(message.id);
     if (!request) throw new Error('Unexpected or duplicate helper response');
+    if (message.type === 'admission' && request.kind === 'admission') {
+      if (Object.keys(message).length !== 3 || typeof message.allowed !== 'boolean' || message.allowed !== request.body.allowed) throw new Error('Invalid admission gate acknowledgement');
+      if (message.allowed && this.admissionTarget) {
+        this.admissionPaused = false;
+        for (const pending of this.requests.values()) if (pending.kind === 'attempt' && !pending.started) this.armStartDeadline(pending);
+      }
+      this.finish(request, null, message); return;
+    }
     if (message.type === 'resolved' && request.kind === 'resolve') {
       if (typeof message.ok !== 'boolean') throw new Error('Invalid DNS helper result');
       this.finish(request, request.signal?.aborted ? claimAborted() : message.ok ? null : new Error('Domain resolution failed'), message); return;
@@ -162,22 +197,29 @@ export class ConnectionPool {
     const minimum = BigInt(request.body.successfulConnections) + (message.captured ? 1n : 0n);
     if (BigInt(message.successfulConnections) < (minimum > MAX_COUNTER ? MAX_COUNTER : minimum)) throw new Error('Helper connection counter moved backwards');
     if (message.type === 'capture') {
-      if (Object.hasOwn(message, 'blocked') || Object.hasOwn(message, 'retryAfterMs')) throw new Error('Invalid blocked capture observation');
+      if (Object.hasOwn(message, 'blocked') || Object.hasOwn(message, 'retryAfterMs') || Object.hasOwn(message, 'localUnavailable')) throw new Error('Invalid blocked capture observation');
       if (!request.started || request.capture) throw new Error('Unexpected or duplicate capture');
       request.capture = message; request.onCapture?.(message); return;
     }
     if (request.started && !request.capture) throw new Error('Missing helper capture observation');
     if (Object.hasOwn(message, 'blocked')) {
-      if (message.blocked !== 'budget' || message.started || message.captured || message.proof !== null ||
-          message.verified !== false || message.validationPassed !== null || message.seconds !== 0) throw new Error('Invalid blocked helper result');
+      if (message.blocked !== 'budget' || message.captured || message.proof !== null ||
+          message.verified !== false || message.validationPassed !== null || (!message.started && message.seconds !== 0)) throw new Error('Invalid blocked helper result');
     }
     if (Object.hasOwn(message, 'retryAfterMs')) throw new Error('Unexpected endpoint retry delay');
+    if (Object.hasOwn(message, 'localUnavailable') && (message.localUnavailable !== true ||
+        message.captured || message.proof !== null || message.verified !== false || message.validationPassed === true ||
+        Object.hasOwn(message, 'blocked'))) throw new Error('Invalid local-unavailable helper result');
     if (request.capture && (request.capture.captured !== message.captured || request.capture.seconds !== message.seconds ||
         request.capture.successfulConnections !== message.successfulConnections)) throw new Error('Conflicting helper capture observation');
     if (![true, false, null].includes(message.validationPassed) ||
         (message.validationPassed !== null && !message.started) ||
         (message.validationPassed === true && !message.captured) ||
-        (message.validationPassed === null && message.started && !message.cancelled)) {
+        // A sibling can exhaust the budget or exclude the endpoint while the
+        // started ACK is being written. The rechecked gate then makes no TCP
+        // call. Only these explicitly validated outcomes may be inconclusive.
+        (message.validationPassed === null && message.started && !message.cancelled &&
+          message.blocked !== 'budget' && message.localUnavailable !== true)) {
       throw new Error('Invalid helper validation observation');
     }
     if (message.proof !== null) {
@@ -190,6 +232,7 @@ export class ConnectionPool {
   }
   finish(request, error, result) {
     if (!this.requests.delete(request.id)) return;
+    if (request.kind === 'admission') this.admissionControls--;
     if (request.kind === 'attempt' && !request.started) this.pendingStarts--;
     clearTimeout(request.timer); request.signal?.removeEventListener('abort', request.abort);
     // Closing cancels every request, including callers without an AbortSignal.

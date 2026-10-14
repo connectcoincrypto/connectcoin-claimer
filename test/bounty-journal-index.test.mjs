@@ -94,6 +94,39 @@ test('fallback lookup sees newly loaded rows on a later journal page', async () 
   assert.equal(result.blocks.get(b.block_hash)[0].status, 'spent');
 });
 
+for (const type of ['added', 'matured', 'available_again', 'spent', 'pending_spend', 'window_exit']) {
+  test(`a ${type} event cannot coerce an array block hash and advance past an unapplied update`, async () => {
+    const f = fixture(), current = f.row(), cached = { ...current, status: 'pending_spend' };
+    f.previous.get(current.block_hash).push(cached);
+    f.rows.set(current.block_hash, [current]);
+    // This is a JSON-representable response. RegExp.test used to accept this
+    // array, while Set.has treated it as a different key and skipped reload.
+    f.hook = page => page === 1 ? { changes: [{ type, sequence: 1,
+      txid: current.txid, vout: 0, block_hash: [current.block_hash] }] } : {};
+    await assert.rejects(discoverBounties(f.options), /Invalid bounty change event/);
+    assert.deepEqual(f.reads, [], 'Malformed identity must be rejected before block work.');
+    assert.deepEqual(f.invalidations, [], 'Malformed identity must not cancel a retained winner.');
+    assert.strictEqual(f.previous.get(current.block_hash)[0], cached);
+    assert.equal(cached.status, 'pending_spend');
+    assert.equal(f.options.cursor, 'previous');
+  });
+}
+
+for (const includeHash of [true, false]) {
+  test(`available_again still refreshes a cached bounty with ${includeHash ? 'a string' : 'no optional'} block hash`, async () => {
+    const f = fixture(), current = f.row();
+    f.previous.get(current.block_hash).push({ ...current, status: 'pending_spend' });
+    f.rows.set(current.block_hash, [current]);
+    f.hook = page => page === 1 ? { changes: [{ type: 'available_again', sequence: 1,
+      txid: current.txid, vout: 0, ...(includeHash ? { block_hash: current.block_hash } : {}) }] } : {};
+    const result = await discoverBounties(f.options);
+    assert.deepEqual(f.reads, [current.block_hash]);
+    assert.equal(result.blocks.get(current.block_hash)[0].status, 'available');
+    assert.equal(result.cursor, 'page-2');
+    assert.equal(f.previous.get(current.block_hash)[0].status, 'pending_spend');
+  });
+}
+
 for (const changes of [
   [{ type: 'spent', sequence: -1, txid: hash(1), vout: 0 }],
   [{ type: 'spent', sequence: 1, txid: hash(1), vout: 0, block_hash: null }],

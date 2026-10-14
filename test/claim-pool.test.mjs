@@ -25,7 +25,7 @@ function fixture(t, onCommand = () => {}, options = {}) {
         const message = JSON.parse(buffer.slice(0, end)); buffer = buffer.slice(end + 1);
         commands.push(message);
         if (message.type === 'start') {
-          if (options.autoReady !== false) queueMicrotask(() => child.send({ type: 'ready', protocol: 4, roots: 1, security: { rsaPublicExponentMaxBits: 64 } }));
+          if (options.autoReady !== false) queueMicrotask(() => child.send({ type: 'ready', protocol: 4, roots: 1, security: { rsaPublicExponentMaxBits: 64, admissionGate: 1 } }));
         }
         else if (message.type === 'shutdown') { if (options.autoClose !== false) setImmediate(() => child.emit('close', 0)); }
         else onCommand(message, child);
@@ -55,7 +55,7 @@ test('explicit native helper accepts only the pinned Mbed TLS provider', async t
   const { pool, children } = fixture(t, () => {}, { autoReady: false, helper: { command: 'native-helper', args: [], native: true } });
   const ready = pool.start({});
   children[0].send({ type: 'ready', protocol: 4, roots: 1,
-    security: { provider: 'mbedtls', mbedtlsVersion: '3.6.7', rsaPublicExponentMaxBits: 64 } });
+    security: { provider: 'mbedtls', mbedtlsVersion: '3.6.7', rsaPublicExponentMaxBits: 64, admissionGate: 1 } });
   await ready;
   assert.equal(pool.started, true);
 });
@@ -65,6 +65,73 @@ function complete(command, child, overrides = {}) {
   child.send({ type: 'capture', ...value });
   child.send({ type: 'attempt', ...value, proof: '020100', verified: true });
 }
+
+test('admission pause suspends only pre-start watchdogs and resumes without counting control ACKs', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const { pool, commands, children } = fixture(t);
+  await pool.start({ connectionsPerSecond: 10, concurrency: 2 });
+  const pending = pool.attempt(context(), { bountyId });
+  const attempt = commands.at(-1);
+  const paused = pool.setAdmissionAllowed(false), pause = commands.at(-1);
+  assert.deepEqual(pause, { type: 'admission', id: attempt.id + 1, allowed: false });
+  assert.equal(pool.requests.get(attempt.id).timer, null);
+  children[0].send({ type: 'admission', id: pause.id, allowed: false }); await paused;
+  t.mock.timers.tick(3600000);
+  assert.equal(pool.failure, undefined, 'A paused queue does not exhaust the TCP/IPC start watchdog');
+  assert.equal(pool.pendingStarts, 1);
+  const resumed = pool.setAdmissionAllowed(true), resume = commands.at(-1);
+  children[0].send({ type: 'admission', id: resume.id, allowed: true }); await resumed;
+  assert.ok(pool.requests.get(attempt.id).timer);
+  complete(attempt, children[0]); await pending;
+  assert.equal(pool.pendingStarts, 0); assert.equal(pool.admissionControls, 0);
+});
+
+test('admission control cannot extend a started capture deadline', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const { pool, commands, children } = fixture(t);
+  await pool.start({});
+  const pending = assert.rejects(pool.attempt(context(), { bountyId }), /deadline/);
+  const attempt = commands.at(-1); children[0].send({ type: 'started', id: attempt.id });
+  const paused = pool.setAdmissionAllowed(false), pause = commands.at(-1);
+  children[0].send({ type: 'admission', id: pause.id, allowed: false }); await paused;
+  t.mock.timers.tick(44999); assert.equal(pool.failure, undefined);
+  t.mock.timers.tick(1); await pending;
+});
+
+test('unacknowledged admission control fails closed even with all pre-start watchdogs paused', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const { pool } = fixture(t); await pool.start({});
+  const pending = assert.rejects(pool.attempt(context(), { bountyId }), /admission acknowledgement/);
+  const paused = assert.rejects(pool.setAdmissionAllowed(false), /admission acknowledgement/);
+  t.mock.timers.tick(14999); assert.equal(pool.failure, undefined);
+  t.mock.timers.tick(1); await Promise.all([pending, paused]);
+  assert.equal(pool.child.killed, true);
+});
+
+test('a newer pause cannot be undone by a delayed resume acknowledgement', async t => {
+  const { pool, commands, children } = fixture(t); await pool.start({});
+  const pauses = [pool.setAdmissionAllowed(false), pool.setAdmissionAllowed(true), pool.setAdmissionAllowed(false)];
+  for (const command of commands.filter(row => row.type === 'admission')) {
+    children[0].send({ type: 'admission', id: command.id, allowed: command.allowed });
+    assert.equal(pool.admissionPaused, true);
+  }
+  await Promise.all(pauses); assert.equal(pool.admissionTarget, false);
+});
+
+for (const admissionGate of [undefined, false, 0, '1', 2]) test(`helper admission capability rejects ${JSON.stringify(admissionGate)}`, async t => {
+  const { pool, children } = fixture(t, () => {}, { autoReady: false });
+  const starting = assert.rejects(pool.start({}), /admission gate/);
+  children[0].send({ type: 'ready', protocol: 4, roots: 1, security: { rsaPublicExponentMaxBits: 64, admissionGate } });
+  await starting;
+});
+
+for (const mutate of [message => ({ ...message, allowed: true }), message => ({ ...message, extra: true })])
+test('admission acknowledgement must match the exact pending control request', async t => {
+  const { pool, commands, children } = fixture(t); await pool.start({});
+  const paused = assert.rejects(pool.setAdmissionAllowed(false), /admission gate acknowledgement/);
+  children[0].send(mutate(commands.at(-1))); await paused;
+  assert.equal(pool.child.killed, true);
+});
 
 test('capture frames may overtake other requests without changing each request counter snapshot', async t => {
   const pending = [];
@@ -112,6 +179,40 @@ for (const patch of [{ retryAfterMs: 0 }, { retryAfterMs: 60001 }, { retryAfterM
     await pool.start({});
     await assert.rejects(pool.attempt(context(), { bountyId }), error => error.helperFatal === true);
   });
+}
+
+for (const gate of [{ blocked: 'budget' }, { localUnavailable: true }]) {
+  test(`post-ACK admission invalidation stays inconclusive ${JSON.stringify(gate)}`, async t => {
+    const { pool } = fixture(t, (command, child) => {
+      const value = observation(command, { captured: false, validationPassed: null,
+        successfulConnections: command.successfulConnections });
+      child.send({ type: 'started', id: command.id });
+      child.send({ type: 'capture', ...value });
+      child.send({ type: 'attempt', ...value, proof: null, verified: false, ...gate });
+    });
+    await pool.start({});
+    const results = [], captures = []; let starts = 0;
+    const result = await pool.attempt(context(), { bountyId, successfulConnections: 7n,
+      onStarted: () => starts++, onCapture: value => captures.push(value), onResult: value => results.push(value) });
+    assert.equal(starts, 1); assert.equal(captures.length, 1); assert.equal(results.length, 1);
+    assert.equal(result.validationPassed, null); assert.equal(result.captured, false);
+    assert.equal(result.successfulConnections, '7'); assert.equal(result.proof, null);
+    assert.equal(pool.requests.size, 0); assert.equal(pool.failure, undefined);
+  });
+  for (const patch of [{ proof: '020100', verified: true }, { captured: true },
+    { validationPassed: true }, { successfulConnections: '6' }, { seconds: 0.2 }]) {
+    test(`post-ACK gate result rejects inconsistent evidence ${JSON.stringify({ ...gate, ...patch })}`, async t => {
+      const { pool } = fixture(t, (command, child) => {
+        const value = observation(command, { captured: false, validationPassed: null,
+          successfulConnections: command.successfulConnections });
+        child.send({ type: 'started', id: command.id });
+        child.send({ type: 'capture', ...value });
+        child.send({ type: 'attempt', ...value, proof: null, verified: false, ...gate, ...patch });
+      });
+      await pool.start({});
+      await assert.rejects(pool.attempt(context(), { bountyId, successfulConnections: 7n }), error => error.helperFatal === true);
+    });
+  }
 }
 
 test('connection-only settings reject lifetime batch options and invalid global limits', () => {
@@ -273,7 +374,7 @@ test('capture is delivered early but a valid hash miss is observed only after ve
 test('protocol 3 helpers fail closed before attempting DNS or TLS', async t => {
   const { pool, children, commands } = fixture(t, () => {}, { autoReady: false });
   const rejected = assert.rejects(pool.start({}), /protocol 4/);
-  children[0].send({ type: 'ready', protocol: 3, roots: 1, security: { rsaPublicExponentMaxBits: 64 } });
+  children[0].send({ type: 'ready', protocol: 3, roots: 1, security: { rsaPublicExponentMaxBits: 64, admissionGate: 1 } });
   await rejected;
   assert.deepEqual(commands.map(value => value.type), ['start']);
 });
@@ -329,6 +430,34 @@ for (const [message, expected, category] of [
   assert.equal(children[0].killed, false);
   assert.equal(pool.requests.size, 0);
 });
+
+for (const started of [false, true]) test(`local route limitation preserves its actual TCP start: ${started}`, async t => {
+  const { pool } = fixture(t, (command, child) => {
+    const value = observation(command, { started, captured: false, seconds: started ? 0.1 : 0,
+      successfulConnections: command.successfulConnections });
+    if (started) { child.send({ type: 'started', id: command.id }); child.send({ type: 'capture', ...value }); }
+    child.send({ type: 'attempt', ...value, proof: null, verified: false, localUnavailable: true,
+      message: 'Local network route is unavailable' });
+  });
+  await pool.start({}); let starts = 0;
+  const result = await pool.attempt(context(), { bountyId, successfulConnections: 3n, onStarted: () => starts++ });
+  assert.equal(starts, Number(started)); assert.equal(result.localUnavailable, true);
+  assert.equal(result.validationPassed, started ? false : null);
+  assert.equal(result.successfulConnections, '3'); assert.equal(pool.failure, undefined);
+});
+
+for (const overrides of [{ localUnavailable: 'true' }, { localUnavailable: false },
+  { captured: true }, { validationPassed: true }, { proof: '020100', verified: true }, { blocked: 'budget' }]) {
+  test(`local-unavailable marker cannot conceal invalid proof state ${JSON.stringify(overrides)}`, async t => {
+    const { pool } = fixture(t, (command, child) => {
+      const value = observation(command, { captured: false, successfulConnections: command.successfulConnections });
+      child.send({ type: 'started', id: command.id }); child.send({ type: 'capture', ...value });
+      child.send({ type: 'attempt', ...value, proof: null, verified: false, localUnavailable: true, ...overrides });
+    });
+    await pool.start({});
+    await assert.rejects(pool.attempt(context(), { bountyId }), error => error.helperFatal === true);
+  });
+}
 
 test('fatal helper error frames never expose arbitrary message text', async t => {
   const { pool, children } = fixture(t, (_command, child) => child.send({ type: 'error', message: 'private-peer-details: timed out' }));
@@ -479,7 +608,7 @@ test('a valid ready response racing shutdown cannot revive startup or accept new
   const { pool, children } = fixture(t, () => {}, { autoReady: false, autoClose: false });
   const starting = assert.rejects(pool.start({}), error => error.name === 'AbortError');
   const stopping = pool.close();
-  children[0].send({ type: 'ready', protocol: 4, roots: 1, security: { rsaPublicExponentMaxBits: 64 } });
+  children[0].send({ type: 'ready', protocol: 4, roots: 1, security: { rsaPublicExponentMaxBits: 64, admissionGate: 1 } });
   await starting;
   await assert.rejects(pool.resolve('example.com'), error => error.name === 'AbortError');
   assert.equal(children[0].killed, false);

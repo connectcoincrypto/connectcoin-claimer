@@ -58,7 +58,7 @@ def security_provider_versions() -> dict[str, str | int]:
 
     return {"cryptographyVersion": version, "minimumCryptographyVersion": minimum,
             "opensslVersion": backend.openssl_version_text(),
-            "rsaPublicExponentMaxBits": MAX_RSA_PUBLIC_EXPONENT_BITS}
+            "rsaPublicExponentMaxBits": MAX_RSA_PUBLIC_EXPONENT_BITS, "admissionGate": 1}
 
 
 def emit_encoded(encoded: str) -> None:

@@ -148,6 +148,46 @@ test('job cooldown and domain DNS deadline promote only when due, with bounded t
   assert.equal(scheduler.nextDue(), Infinity);
 });
 
+for (const due of [0, 2000]) {
+  test(`DNS completion preserves a remembered gate without an eligible group (deadline ${due})`, () => {
+    const exhausted = job(1), replacement = job(2);
+    const scheduler = new ClaimScheduler();
+    scheduler.rebuild(queue([exhausted]), { now: 0 });
+    scheduler.setDomainReady('alpha.example', false, { now: 0 });
+    exhausted.budgetExceeded = true;
+    scheduler.rebuild(queue([exhausted]), { now: 0 });
+    assert.equal(scheduler.groups.size, 0);
+    assert.deepEqual(scheduler.domainGates.get('alpha.example'), { ready: false, due: 0 });
+    assert.equal(scheduler.setDomainReady('alpha.example', true, { due, now: 0 }), true);
+    assert.equal(scheduler.groups.size, 0, 'finishing DNS does not revive an ineligible bounty');
+    assert.equal(scheduler.waiting.items.length, 0, 'an absent group has no timer entry');
+    scheduler.rebuild(queue([exhausted, replacement]), { now: 0 });
+    if (due) {
+      assert.equal(scheduler.next(due - 1), undefined, 'failed DNS retains its retry deadline');
+      assert.equal(scheduler.nextDue(), due);
+    }
+    assert.equal(take(scheduler, due), replacement);
+    assert.equal(exhausted.budgetExceeded, true);
+  });
+}
+
+test('late DNS callbacks cannot recreate gates for fully removed or unknown domains', () => {
+  const removed = job(1), replacement = job(2);
+  const scheduler = new ClaimScheduler();
+  scheduler.rebuild(queue([removed]), { now: 0 });
+  scheduler.setDomainReady('alpha.example', false, { now: 0 });
+  scheduler.rebuild(new Map(), { now: 0 });
+  assert.equal(scheduler.domainGates.size, 0);
+  for (let i = 0; i < 1000; i++) {
+    assert.equal(scheduler.setDomainReady(i ? `unknown${i}.example` : 'alpha.example', true, { due: 2000, now: 0 }), false);
+  }
+  assert.equal(scheduler.domainGates.size, 0);
+  assert.equal(scheduler.groups.size, 0);
+  assert.equal(scheduler.waiting.items.length, 0);
+  scheduler.rebuild(queue([replacement]), { now: 0 });
+  assert.equal(take(scheduler, 0), replacement, 'removed-domain history does not delay new work');
+});
+
 test('exact ties follow Core outpoint storage-byte order, not transport order or shuffle', () => {
   const jobs = [job(1), job(256), job(2)];
   const expected = [...jobs].sort(compareClaimPriority);

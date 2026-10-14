@@ -145,9 +145,13 @@ function failedStats() {
   for (let i = 0; i < 10; i++) stats.record(false, 10);
   return stats;
 }
+function pastBootstrap(engine) {
+  for (let i = 0; i < 32; i++) engine.connectionPolicy.probeStarted('alpha.example:7', Date.now() - (31 - i) * 250);
+}
 
 test('one pending recovery probe owns its policy across representative replacement and elapsed minutes', async t => {
   const f = fixture(t, { concurrency: 3 });
+  pastBootstrap(f.engine);
   f.engine.domainStats.set('alpha.example:7', failedStats());
   const first = row(1, 'alpha.example', '1000'), replacement = row(2, 'alpha.example', '1100');
   f.ready([first]); f.engine.start(); await settle();
@@ -294,6 +298,7 @@ test('restart after draining stop can fill fresh slots without retaining old pen
 
 test('recovery restart releases an unstarted probe but preserves cooldown after a real start', async t => {
   const f = fixture(t, { concurrency: 3 });
+  pastBootstrap(f.engine);
   f.engine.domainStats.set('alpha.example:7', failedStats());
   f.ready([row(1, 'alpha.example', '1000')]); f.engine.start(); await settle();
   t.mock.timers.tick(60000); await settle(); assert.equal(f.requests.length, 1);

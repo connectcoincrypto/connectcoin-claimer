@@ -104,10 +104,11 @@ test('recent performance uses custom recovery threshold for admission and schedu
   const zero = createEngine({ minExpectedReturn: 0 });
   for (const engine of [custom, normal, zero]) engine.domainStats.set('example.com:7', stats);
   assert.equal(custom.enqueue([row(150)]), 1);
-  assert.equal(normal.enqueue([row(150)]), 0);
+  assert.equal(normal.enqueue([row(150)]), 1, 'below-prior candidates enter bounded sampling, not normal economic work');
   assert.equal(zero.enqueue([row(150)]), 1);
-  custom.rebuild(); zero.rebuild();
+  custom.rebuild(); zero.rebuild(); normal.rebuild();
   assert.equal(custom.queue.get(key(row(150))).recoveryProbe, false);
+  assert.equal(normal.queue.get(key(row(150))).recoveryProbe, true);
   stats.record(false, 30);
   assert.ok(stats.connectionRate() < 4);
   custom.rebuild(); zero.rebuild();
@@ -119,8 +120,8 @@ test('recent performance uses custom recovery threshold for admission and schedu
   assert.equal(zero.recoveryJobs.size, 0);
   const fresh = createEngine({ minExpectedReturn: 600 });
   fresh.domainStats.set('example.com:7', stats);
-  assert.equal(fresh.enqueue([row(150)]), 1, 'recovery admission applies the custom prior threshold');
-  assert.equal(normal.enqueue([row(150)]), 0, 'instances retain independent return floors');
+  assert.equal(fresh.enqueue([row(150)]), 1, 'recovery admission samples positive candidates below the configured floor');
+  assert.equal(normal.enqueue([row(150)]), 0, 'an already admitted representative is not duplicated');
   for (let i = 0; i < 200; i++) stats.record(true, 0.01);
   assert.ok(stats.connectionRate() > 4);
   custom.rebuild();
@@ -129,7 +130,7 @@ test('recent performance uses custom recovery threshold for admission and schedu
   assert.equal(custom.nextReady()[0], key(row(150)));
 });
 
-test('below custom prior remains excluded when candidates and recovery policies are rebuilt', () => {
+test('recovery still chooses the strongest same-policy representative under a custom floor', () => {
   const custom = createEngine({ minExpectedReturn: 2000 });
   assert.equal(custom.enqueue([row(300), row(400)]), 1);
   const stats = new P2CDomainStats(); stats.record(false, 30);
@@ -146,6 +147,7 @@ test('below custom prior remains excluded when candidates and recovery policies 
 test('custom recovery dispatch succeeds after its one-minute probe gate', async t => {
   t.mock.timers.enable({ apis: ['Date', 'setTimeout', 'setInterval'], now: 1800000000000 });
   const engine = createEngine({ minExpectedReturn: 600 });
+  for (let i = 0; i < 32; i++) engine.connectionPolicy.probeStarted('example.com:7', Date.now() - (31 - i) * 250);
   t.after(() => engine.stop());
   const stats = new P2CDomainStats(); stats.record(false, 30);
   engine.domainStats.set('example.com:7', stats);

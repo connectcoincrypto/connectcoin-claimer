@@ -40,7 +40,7 @@ class ProviderSecurityTests(unittest.TestCase):
                     "cryptographyVersion": version,
                     "minimumCryptographyVersion": "50.0.1",
                     "opensslVersion": backend.openssl_version_text(),
-                    "rsaPublicExponentMaxBits": 64,
+                    "rsaPublicExponentMaxBits": 64, "admissionGate": 1,
                 })
 
 

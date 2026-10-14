@@ -158,6 +158,7 @@ UniValue PublicContext(const Context& context) {
 UniValue ReadyFrame() {
     UniValue result(UniValue::VOBJ), security(UniValue::VOBJ);
     security.pushKV("provider", "mbedtls"); security.pushKV("mbedtlsVersion", MBEDTLS_VERSION_STRING); security.pushKV("rsaPublicExponentMaxBits", 64);
+    security.pushKV("admissionGate", 1);
     result.pushKV("type", "ready"); result.pushKV("protocol", 4); result.pushKV("roots", 1); result.pushKV("security", security);
     return result;
 }
@@ -233,9 +234,9 @@ struct ClaimsService::Impl {
     std::unordered_map<int, double> unavailable_families;
     std::vector<std::thread> workers;
     size_t tls_workers{}, dns_workers{}, active_tls{}, active_dns{};
-    uint64_t last_id{}, touched{};
+    uint64_t last_id{}, touched{}, admission_revision{};
     double next_connection{};
-    bool idle{true}, closed{}, native_pipeline{};
+    bool idle{true}, closed{}, native_pipeline{}, admission_allowed{true};
     std::atomic<bool> failed{}, failure_reported{};
 
     Impl(const UniValue& options, Emit emit, ServiceDependencies dependencies) : output(std::move(emit)), deps(std::move(dependencies)) {
@@ -360,7 +361,7 @@ struct ClaimsService::Impl {
         try {
             for (;;) {
                 BeforeStartLocked(job);
-                if (position != connection_pending.begin()) {
+                if (!admission_allowed || position != connection_pending.begin()) {
                     job->connection_condition.wait(lock);
                     continue;
                 }
@@ -376,7 +377,14 @@ struct ClaimsService::Impl {
             lock.unlock();
             UniValue frame(UniValue::VOBJ); frame.pushKV("type", "started"); frame.pushKV("id", job->id); EmitFrame(frame);
             lock.lock();
-            if (closed || failed.load(std::memory_order_acquire) || job->Cancelled()) throw CaptureCancelled();
+            // The acknowledgement can block while another capture exhausts
+            // this budget or excludes its endpoint. Recheck every admission
+            // condition before spending a pacing turn and returning to TCP.
+            BeforeStartLocked(job);
+            // A pause may arrive while the started ACK is blocked on output.
+            // Preserve that one ACK but do not begin TCP or invent a sample.
+            // The socket/control stack unwinds before Attempt calls Cancel.
+            if (!admission_allowed) { RequestCancelLocked(job); throw CaptureCancelled(); }
             const auto now = Now(); next_connection = AdvanceConnectionDeadline(next_connection, now, rate, idle);
             idle = false; job->started_at = now;
         } catch (...) {
@@ -463,7 +471,7 @@ struct ClaimsService::Impl {
         std::optional<CapturedProof> native_capture;
         std::optional<std::string> proof;
         std::optional<bool> validated;
-        bool validating = false, blocked = false;
+        bool validating = false, blocked = false, local_unavailable = false;
         std::string message;
         std::shared_ptr<Score> score;
         try {
@@ -478,10 +486,16 @@ struct ClaimsService::Impl {
             }
             catch (const OutputFailure&) { throw; }
             catch (const CaptureCancelled&) { capture_error = std::current_exception(); }
+            // These gate exits can follow an already-visible started ACK but
+            // precede the actual connect call. Preserve that protocol ACK and
+            // its capture frame, without inventing a failed validation sample.
+            catch (const BudgetExhausted&) { capture_error = std::current_exception(); }
+            catch (const EndpointExcluded&) { capture_error = std::current_exception(); }
             catch (const LocalEndpointUnavailable& error) {
                 if (!job->Cancelled()) {
                     std::lock_guard lock(mutex);
                     ExcludeEndpointLocked(selected.first, error.family_unsupported);
+                    local_unavailable = true;
                     if (job->started) validated = false;
                 }
                 capture_error = std::current_exception();
@@ -507,7 +521,10 @@ struct ClaimsService::Impl {
             }
         } catch (const OutputFailure&) { throw; }
         catch (const BudgetExhausted&) { blocked = true; }
-        catch (const EndpointExcluded&) { message = "Local network endpoint is temporarily unavailable"; }
+        catch (const EndpointExcluded&) {
+            local_unavailable = !job->Cancelled();
+            message = "Local network endpoint is temporarily unavailable";
+        }
         catch (const LocalEndpointUnavailable& error) {
             message = error.family_unsupported ? "Local IP family is unsupported" : "Local network route is unavailable";
         }
@@ -522,12 +539,16 @@ struct ClaimsService::Impl {
         catch (...) { if (validating && !validated) validated = false; message = job->started ? "TLS capture or proof validation failed" : "Public DNS resolution is required"; }
         auto frame = Fields(job);
         if (frame["cancelled"].get_bool()) proof.reset();
-        if (score && validated && std::isfinite(job->seconds) && job->seconds >= 0) {
+        // An actual failed connect still counts as a failed attempt, but a
+        // conclusive local route/family limitation says nothing about remote
+        // certificate validity or endpoint quality. Keep those histories neutral.
+        if (!local_unavailable && score && validated && std::isfinite(job->seconds) && job->seconds >= 0) {
             std::lock_guard lock(mutex);
             performance.Record(score, *validated, job->seconds, deps.performance_time());
         }
         frame.pushKV("type", "attempt"); frame.pushKV("proof", proof ? UniValue(*proof) : UniValue()); frame.pushKV("verified", proof.has_value());
         frame.pushKV("validationPassed", validated ? UniValue(*validated) : UniValue());
+        if (local_unavailable) frame.pushKV("localUnavailable", true);
         if (!message.empty()) frame.pushKV("message", message);
         if (blocked) frame.pushKV("blocked", "budget");
         EmitTerminal(job, frame);
@@ -587,6 +608,34 @@ struct ClaimsService::Impl {
     void Command(const UniValue& command) {
         Require(command.isObject() && command["type"].isStr(), "Invalid protocol command");
         const auto kind = command["type"].get_str();
+        if (kind == "admission") {
+            ExactKeys(command, {"type", "id", "allowed"});
+            const auto id = ProtocolInteger(command["id"], 1, MAX_ID);
+            Require(command["allowed"].isBool(), "Invalid admission gate state");
+            const bool allowed = command["allowed"].get_bool();
+            {
+                std::lock_guard lock(mutex);
+                Require(!closed && !failed.load(std::memory_order_acquire), "Helper is shutting down");
+                Require(id > last_id, "Request IDs must increase"); last_id = admission_revision = id;
+                if (!allowed) {
+                    admission_allowed = false;
+                    for (const auto& waiting : connection_pending) waiting->connection_condition.notify_one();
+                }
+            }
+            UniValue frame(UniValue::VOBJ); frame.pushKV("type", "admission"); frame.pushKV("id", id); frame.pushKV("allowed", allowed);
+            EmitFrame(frame);
+            if (allowed) {
+                std::lock_guard lock(mutex);
+                // Resume only after a successful ACK write; output failure
+                // must not release queued sockets. A newer pause wins races.
+                if (!closed && !failed.load(std::memory_order_acquire) && admission_revision == id) {
+                    if (!admission_allowed) next_connection = std::max(next_connection, Now());
+                    admission_allowed = true;
+                    for (const auto& waiting : connection_pending) waiting->connection_condition.notify_one();
+                }
+            }
+            return;
+        }
         if (kind == "cancel") {
             ExactKeys(command, {"type", "id"}); const auto id = ProtocolInteger(command["id"], 1, MAX_ID);
             std::shared_ptr<Job> job;

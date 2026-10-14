@@ -67,7 +67,8 @@ export class ClaimsEngine {
     this.minExpectedReturn = validateMinExpectedReturn(minExpectedReturn);
     this.poolFactory = poolFactory ?? (generateProof ? () => injectedPool(generateProof) : ({ onFailure }) => new ConnectionPool({ resourcesPath, onDiagnostic, onFailure }));
     this.options = validateConnectionOptions(options);
-    this.queue = new Map(); this.completed = new Set(); this.factors = new Map(); this.successCounts = new Map();
+    this.queue = new Map(); this.completed = new Set(); this.reopenedCompletions = new Map(); this.factors = new Map(); this.successCounts = new Map();
+    this.selectionHistoryHeights = new Map();
     this.proposals = new Map(); this.pendingProofs = new Map(); this.submitting = new Set(); this.deferredBroadcasts = new Map();
     this.domainStats = new Map(); this.dns = new Map(); this.live = new Map(); this.connections = new Map();
     this.connectionPolicy = new ClaimConnectionPolicy();
@@ -76,7 +77,7 @@ export class ClaimsEngine {
     this.tasks = new Set(); this.preparing = new Set(); this.resolving = new Set(); this.controllers = new Set();
     this.waitingDns = new Set();
     this.scheduler = new ClaimScheduler({ connectionRate: job => this.connectionRate(job), isReady: job => this.ready(job), minExpectedReturn: this.minExpectedReturn });
-    this.enabled = false; this.paused = false; this.dirty = true; this.nextDiagnosticId = 0; this.nextToken = 0; this.generation = 0;
+    this.enabled = false; this.paused = false; this.catalogBlocked = false; this.dirty = true; this.nextDiagnosticId = 0; this.nextToken = 0; this.generation = 0;
     this.nextStart = 0; this.startIdle = true; this.timer = null; this.refreshTimer = null; this.coordinator = null; this.stopping = null;
     this.state = { enabled: false, status: 'off', queued: 0, completed: 0, attempts: 0, lastError: null, lastErrorCategory: null, lastErrorDiagnostic: false, lastErrorTransient: false };
     this.diagnosticRunId = 0; this.diagnosticRun = null;
@@ -179,7 +180,7 @@ export class ClaimsEngine {
   }
   eligible(job) { return !job.unavailable && !job.retired && !job.winner && !job.budgetExceeded; }
   ready(job) { return this.eligible(job) && !job.preparing &&
-    !(job.recoveryProbe && this.pendingRecovery.has(policyOf(job))); }
+    !(job.recoveryProbe && this.pendingRecovery.size); }
   drawIndex(length) {
     const value = this.randomIndex(length);
     if (!Number.isSafeInteger(value) || value < 0 || value >= length) throw new Error('Invalid claim random index');
@@ -209,9 +210,9 @@ export class ClaimsEngine {
     const healthy = new Set(), recovery = new Map();
     for (const candidate of candidates) {
       const { job } = candidate, policy = policyOf(job);
-      if (!this.eligible(job)) continue;
+      if (!this.eligible(job) || job.rawPriority <= 0n) continue;
       if (isWorthAttempting(job.rawPriority, this.connectionRate(job, rates), this.minExpectedReturn)) healthy.add(policy);
-      else if (isWorthAttempting(job.rawPriority, 5, this.minExpectedReturn)) {
+      else {
         const previous = recovery.get(policy);
         if (!previous || compareClaimPriority(job, previous.job) < 0) recovery.set(policy, candidate);
       }
@@ -244,7 +245,7 @@ export class ClaimsEngine {
     for (const [key, job] of this.queue) {
       this.updatePriority(job);
       if (this.hasActive(key) || this.pendingProofs.has(key) || job.due > Date.now()) protectedKeys.add(key);
-      else if (this.eligible(job) && (isWorthAttempting(job.rawPriority, this.connectionRate(job, rates), this.minExpectedReturn) || isWorthAttempting(job.rawPriority, 5, this.minExpectedReturn))) candidates.push({ key, job });
+      else if (this.eligible(job) && job.rawPriority > 0n) candidates.push({ key, job });
     }
     let incoming = 0;
     for (const bounty of bounties) {
@@ -252,16 +253,20 @@ export class ClaimsEngine {
       const key = keyOf(bounty);
       if (seen.has(key) || this.completed.has(key) || this.deferredBroadcasts.has(key) || this.hasActive(key)) continue;
       seen.add(key);
+      const height = bounty.block_height;
+      const knownHeight = Number.isSafeInteger(height) && height >= 0;
+      if (knownHeight && !this.selectionHistoryHeights.has(key) && this.selectionHistoryHeights.size >= 100000) continue;
       let factor = this.factors.get(key);
       if (factor === undefined) {
         if (this.factors.size >= 100000) continue;
         factor = PRIORITY_FACTOR_SCALE + this.drawIndex(PRIORITY_FACTOR_MAX - PRIORITY_FACTOR_SCALE + 1); this.factors.set(key, factor);
       }
+      if (knownHeight) this.selectionHistoryHeights.set(key, height);
       const proof = this.pendingProofs.get(key);
       const job = { bounty, factor, due: proof?.due ?? 0, failures: proof?.failures ?? 0,
         winner: Boolean(proof), diagnosticId: ++this.nextDiagnosticId, prepared: this.proposals.get(key) };
       this.updatePriority(job);
-      if (!proof && (job.budgetExceeded || (!isWorthAttempting(job.rawPriority, this.connectionRate(job, rates), this.minExpectedReturn) && !isWorthAttempting(job.rawPriority, 5, this.minExpectedReturn)))) continue;
+      if (!proof && (job.budgetExceeded || job.rawPriority <= 0n)) continue;
       candidates.push({ key, job, fresh: true }); incoming++;
     }
     let count = 0;
@@ -285,9 +290,16 @@ export class ClaimsEngine {
     }
     this.dirty = true; if (count) this.notify(); this.kick(); return count;
   }
-  retainCatalog(rows) {
+  retainCatalog(rows, { oldestHeight } = {}) {
+    if (oldestHeight !== undefined && (!Number.isSafeInteger(oldestHeight) || oldestHeight < 0)) throw new Error('Invalid claim history window');
     const keys = new Set(), masks = new Set(), domains = new Set();
-    for (const row of rows) { keys.add(keyOf(row)); masks.add(`${row.domain}:${row.signature_algorithms_mask}`); domains.add(row.domain); }
+    for (const row of rows) {
+      const key = keyOf(row);
+      keys.add(key); masks.add(`${row.domain}:${row.signature_algorithms_mask}`); domains.add(row.domain);
+      if (this.selectionHistoryHeights.has(key) && Number.isSafeInteger(row.block_height) && row.block_height >= 0) {
+        this.selectionHistoryHeights.set(key, row.block_height);
+      }
+    }
     for (const key of this.activeKeys()) {
       keys.add(key); const job = this.queue.get(key) ?? [...this.connections.values()].find(item => keyOf(item.job.bounty) === key)?.job;
       if (job) { masks.add(`${job.bounty.domain}:${job.bounty.signature_algorithms_mask}`); domains.add(job.bounty.domain); }
@@ -297,7 +309,16 @@ export class ClaimsEngine {
     for (const [key, job] of this.queue) if (!job.unavailable && this.pendingProofs.has(key)) {
       keys.add(key); masks.add(`${job.bounty.domain}:${job.bounty.signature_algorithms_mask}`); domains.add(job.bounty.domain);
     }
-    for (const map of [this.factors, this.successCounts, this.proposals, this.pendingProofs]) for (const key of map.keys()) if (!keys.has(key)) map.delete(key);
+    // Funding can disappear in a reorg and be re-mined in the next snapshot.
+    // Preserve only bounded selection/accounting metadata across that gap,
+    // never an old prepared transaction, proof, or socket admission.
+    for (const [key, height] of this.selectionHistoryHeights) {
+      if (!keys.has(key) && (oldestHeight === undefined || height < oldestHeight)) this.selectionHistoryHeights.delete(key);
+    }
+    for (const map of [this.factors, this.successCounts]) for (const key of map.keys()) {
+      if (!keys.has(key) && !this.selectionHistoryHeights.has(key)) map.delete(key);
+    }
+    for (const map of [this.proposals, this.pendingProofs]) for (const key of map.keys()) if (!keys.has(key)) map.delete(key);
     for (const key of this.domainStats.keys()) if (!masks.has(key)) this.domainStats.delete(key);
     for (const domain of this.dns.keys()) if (!domains.has(domain)) this.dns.delete(domain);
     for (const domain of this.waitingDns) if (!domains.has(domain)) this.waitingDns.delete(domain);
@@ -344,7 +365,7 @@ export class ClaimsEngine {
     this.waitingDns.clear();
     for (const controller of this.controllers) this.cancelOperation(controller, 'clear');
     this.scheduler.clear({ preserveSelection }); this.dirty = true;
-    if (!preserveSelection) { this.completed.clear(); this.deferredBroadcasts.clear(); this.factors.clear(); this.successCounts.clear(); this.proposals.clear(); this.pendingProofs.clear(); this.domainStats.clear(); this.connectionPolicy.clear(); }
+    if (!preserveSelection) { this.completed.clear(); this.reopenedCompletions.clear(); this.deferredBroadcasts.clear(); this.factors.clear(); this.successCounts.clear(); this.selectionHistoryHeights.clear(); this.proposals.clear(); this.pendingProofs.clear(); this.domainStats.clear(); this.connectionPolicy.clear(); }
     // A catalog resync keeps both activity totals. A full context reset must
     // clear both together so the UI never compares counters from different periods.
     this.notify(preserveSelection ? {} : { completed: 0, attempts: 0 });
@@ -400,12 +421,22 @@ export class ClaimsEngine {
     if (wasPaused && this.diagnosticRun) report(this.onDiagnostic, 'claims.resumed', this.diagnosticSnapshot());
     this.kick();
   }
+  setCatalogBlocked(blocked) {
+    this.catalogBlocked = Boolean(blocked);
+    const pool = this.pool, generation = this.generation;
+    const gate = pool?.setAdmissionAllowed?.(!this.catalogBlocked);
+    if (gate) void Promise.resolve(gate).catch(error => {
+      if (this.pool === pool && generation === this.generation && this.enabled && !this.paused) this.fatal(error);
+    });
+    if (this.catalogBlocked) { clearTimeout(this.timer); this.timer = null; }
+    else this.kick();
+  }
   schedule(delay) {
     if (!this.enabled || this.paused || this.stopping || !Number.isFinite(delay)) return;
     clearTimeout(this.timer); this.timer = setTimeout(() => { this.timer = null; this.kick(); }, Math.max(1, delay)); this.timer.unref?.();
   }
   kick() {
-    if (!this.enabled || this.paused || this.stopping) return;
+    if (!this.enabled || this.paused || this.catalogBlocked || this.stopping) return;
     if (this.coordinator) { this.wakeRequested = true; return; }
     if (!this.isUnlocked()) { void this.stop('locked'); this.notify({ status: 'locked' }); return; }
     clearTimeout(this.timer); this.timer = null;
@@ -419,7 +450,7 @@ export class ClaimsEngine {
     });
   }
   async pump(generation) {
-    if (!this.enabled || this.paused || generation !== this.generation) return;
+    if (!this.enabled || this.paused || this.catalogBlocked || generation !== this.generation) return;
     if (!this.pool) {
       let pool;
       const onFailure = error => queueMicrotask(() => {
@@ -431,7 +462,9 @@ export class ClaimsEngine {
       this.poolReady = pool.start(this.options);
       await this.poolReady;
     } else await this.poolReady;
-    if (!this.enabled || this.paused || generation !== this.generation) return;
+    await this.pool?.setAdmissionAllowed?.(!this.catalogBlocked);
+    if (!this.enabled || this.paused || this.catalogBlocked || generation !== this.generation) return;
+    this.refreshDnsReadiness();
     this.retrySubmissions(generation);
     for (let checked = 0; checked < this.maxQueue + 8; checked++) {
       // At least two pending starts let one slow admission be bypassed. The
@@ -456,7 +489,11 @@ export class ClaimsEngine {
         this.notify({ status: 'waiting' }); this.schedule(Math.min(this.scheduler.nextDue(), this.nextProofDue()) - Date.now()); return;
       }
       const [key, job] = selection;
-      if (!this.ready(job)) { this.scheduler.remove(key); continue; }
+      if (!this.ready(job)) {
+        if (this.eligible(job)) this.scheduler.setReady(key, false);
+        else this.scheduler.remove(key);
+        continue;
+      }
       if (!job.prepared) {
         this.prepareJob(job, generation); continue;
       }
@@ -473,15 +510,19 @@ export class ClaimsEngine {
       this.dispatch(selection, generation);
     }
   }
+  discardIdlePreparation(key) {
+    const job = this.queue.get(key);
+    // A cached transaction without a proof can be rebuilt. Never evict an
+    // admitted capture, a retained winner, or preparation/submission in flight.
+    if (!this.proposals.has(key) || this.hasActive(key) || this.pendingProofs.has(key) ||
+        job?.winner || job?.preparing || job?.submitting) return false;
+    this.proposals.delete(key);
+    if (job) { job.prepared = undefined; this.scheduler.refreshPrepared(key); }
+    return true;
+  }
   cachePrepared(key, prepared) {
     if (!this.proposals.has(key) && this.proposals.size >= 256) {
-      const old = [...this.proposals.keys()].find(candidate => !this.hasActive(candidate) && !this.pendingProofs.has(candidate) && !this.queue.get(candidate)?.winner);
-      if (!old) return false;
-      this.proposals.delete(old); const idle = this.queue.get(old);
-      if (idle) {
-        idle.prepared = undefined;
-        this.scheduler.refreshPrepared(old);
-      }
+      if (![...this.proposals.keys()].some(candidate => this.discardIdlePreparation(candidate))) return false;
     }
     this.proposals.delete(key); this.proposals.set(key, prepared); return true;
   }
@@ -509,7 +550,7 @@ export class ClaimsEngine {
     }).finally(() => {
       this.finishOperation(operation);
       job.preparing = false; job.prepareController = null; this.preparing.delete(job); this.controllers.delete(controller);
-      if (this.queue.get(key) === job && this.ready(job) && this.attemptable(job)) this.scheduler.setReady(key, true, { due: this.jobDue(job) });
+      if (this.queue.get(key) === job && this.eligible(job) && this.attemptable(job)) this.scheduler.setReady(key, this.ready(job), { due: this.jobDue(job) });
       else this.scheduler.remove(key);
     });
     void this.track(job, task);
@@ -553,16 +594,27 @@ export class ClaimsEngine {
   observeResult(request, result) {
     if (request.resultObserved) throw new Error('Duplicate connection validation observation');
     request.resultObserved = true;
+    if (Object.hasOwn(result, 'blocked') && (result.blocked !== 'budget' || result.captured ||
+        result.proof !== null || result.verified !== false || result.validationPassed !== null ||
+        (!result.started && result.seconds !== 0))) {
+      throw new Error('Invalid blocked connection observation');
+    }
+    if (Object.hasOwn(result, 'localUnavailable') && (result.localUnavailable !== true ||
+        result.captured || result.proof !== null || result.verified !== false || result.validationPassed === true || result.blocked)) {
+      throw new Error('Invalid local-unavailable connection observation');
+    }
     if (![true, false, null].includes(result.validationPassed) ||
         typeof result.seconds !== 'number' || !Number.isFinite(result.seconds) || result.seconds < 0 || result.seconds > 3600 ||
         (result.validationPassed !== null && !result.started) ||
         (result.validationPassed === true && !result.captured) ||
-        (result.validationPassed === null && result.started && !result.cancelled)) {
+        (result.validationPassed === null && result.started && !result.cancelled &&
+          result.blocked !== 'budget' && result.localUnavailable !== true)) {
       throw new Error('Invalid connection validation observation');
     }
-    // Null means no conclusive observation, e.g. cancellation before validation.
+    // Null means cancellation or admission revoked after ACK, before TCP.
     // A target miss is still true: work probability already enters rawPriority.
-    if (result.validationPassed === null) return;
+    // Local route/family limitations do not measure remote proof quality.
+    if (result.validationPassed === null || result.localUnavailable === true) return;
     const { job } = request;
     const domainMask = `${job.bounty.domain}:${job.bounty.signature_algorithms_mask}`;
     const stats = this.domainStats.get(domainMask) ?? new P2CDomainStats(); this.domainStats.set(domainMask, stats);
@@ -572,8 +624,8 @@ export class ClaimsEngine {
     const [key, job] = selection;
     const recoveryProbe = !isWorthAttempting(job.rawPriority, this.connectionRate(job), this.minExpectedReturn);
     if (recoveryProbe) {
-      if (!job.recoveryProbe || !isWorthAttempting(job.rawPriority, 5, this.minExpectedReturn)) { this.dirty = true; this.wakeRequested = true; return; }
-      if (this.pendingRecovery.has(policyOf(job))) {
+      if (!job.recoveryProbe || job.rawPriority <= 0n || !this.eligible(job)) { this.dirty = true; this.wakeRequested = true; return; }
+      if (this.pendingRecovery.size) {
         this.scheduler.setReady(key, false); return;
       }
       // A delayed TCP-start acknowledgement may belong to a different bounty
@@ -587,11 +639,16 @@ export class ClaimsEngine {
     }
     const controller = new AbortController(), token = ++this.nextToken;
     const context = validateClaimContext({ ...job.prepared.context, ...(this.getValidationTime ? { validation_time: this.getValidationTime() } : {}) });
+    if (recoveryProbe && !this.connectionPolicy.reserveProbe(policyOf(job), token)) {
+      job.probeDue = this.connectionPolicy.probeDue(policyOf(job));
+      this.scheduler.setReady(key, this.ready(job), { due: this.jobDue(job) }); return;
+    }
     const request = { job, controller, token, generation, policy: policyOf(job), started: false, observed: false, recoveryProbe };
     const operation = this.beginOperation('capture', controller);
     this.connections.set(token, request); this.controllers.add(controller); this.pendingStarts.add(token);
     if (recoveryProbe) {
-      this.pendingRecovery.set(request.policy, request); this.scheduler.setReady(key, false);
+      this.pendingRecovery.set(request.policy, request);
+      for (const representative of this.recoveryJobs.values()) this.scheduler.setReady(keyOf(representative.bounty), false);
     }
     // Reserve turns in dispatch order, not callback arrival order. A failure
     // before TCP spends no attempt/performance observation/probe cooldown, but cannot rewind turns
@@ -606,7 +663,7 @@ export class ClaimsEngine {
         this.countDiagnostic('attempts');
         request.started = true;
         if (request.recoveryProbe) {
-          job.probeDue = this.connectionPolicy.probeStarted(request.policy);
+          job.probeDue = this.connectionPolicy.probeStarted(request.policy, Date.now(), request.token);
         }
         this.releaseStart(request);
         // Never add a second JavaScript timer to the production helper's own
@@ -664,13 +721,14 @@ export class ClaimsEngine {
   }
   releaseStart(request) {
     this.pendingStarts.delete(request.token);
+    if (request.recoveryProbe) this.connectionPolicy.releaseProbe(request.token);
     const policy = request.policy;
     if (this.pendingRecovery.get(policy) !== request) return;
     this.pendingRecovery.delete(policy);
-    const representative = this.recoveryJobs.get(policy);
-    if (representative && request.generation === this.generation) {
-      // A catalog refresh may replace the reserved bounty, not its policy.
-      representative.probeDue = this.connectionPolicy.probeDue(policy);
+    if (request.generation === this.generation) for (const [key, representative] of this.recoveryJobs) {
+      // One pending ACK owns the global probe slot. Release every parked
+      // policy, using fresh global deadlines even after a catalog rebuild.
+      representative.probeDue = this.connectionPolicy.probeDue(key);
       this.scheduler.setReady(keyOf(representative.bounty), this.ready(representative), { due: this.jobDue(representative) });
     }
   }
@@ -683,15 +741,21 @@ export class ClaimsEngine {
     }
     return due;
   }
-  releaseDnsSlot() {
+  refreshDnsReadiness() {
+    if (this.resolving.size >= 2) return;
+    // Waking a domain does not reserve a DNS slot. Open every capacity waiter
+    // so removing the woken candidates cannot strand the rest indefinitely.
+    // The pump retains its two-resolution limit and cached retry deadlines.
     for (const domain of this.waitingDns) {
+      if (this.resolving.has(domain)) continue;
       this.waitingDns.delete(domain);
       // Remove a remembered closed gate even if a rebuild excluded all of its
       // candidates. Otherwise a later eligible candidate would stay stuck.
       this.scheduler.domainGates.delete(domain);
-      if (this.scheduler.setDomainReady(domain, true) && this.scheduler.groups.get(domain)?.ready.total) break;
+      this.scheduler.setDomainReady(domain, true);
     }
   }
+  releaseDnsSlot() { this.refreshDnsReadiness(); }
   retrySubmissions(generation) {
     // At most 256 cached proposals. A proof retry never spends a TLS slot or
     // resets the successful-capture budget/challenge.
@@ -745,6 +809,9 @@ export class ClaimsEngine {
     this.queue.delete(key); this.scheduler.remove(key); this.proposals.delete(key); this.pendingProofs.delete(key); this.deferredBroadcasts.delete(key);
     if (this.completed.has(key)) return false;
     this.completed.add(key); if (this.completed.size > this.maxQueue) this.completed.delete(this.completed.values().next().value);
+    const alreadyCounted = this.reopenedCompletions.get(key) === txid;
+    this.reopenedCompletions.delete(key);
+    if (alreadyCounted) { this.notify(); return false; }
     this.countDiagnostic('completed');
     this.sampleDiagnostic('claim.succeeded', { stage: 'submit', completed: this.state.completed + 1, ...details });
     this.notify({ status: this.enabled ? 'claimed' : 'off', completed: this.state.completed + 1,
@@ -757,6 +824,17 @@ export class ClaimsEngine {
     if (!match || Number(match[2]) > 0xffffffff || typeof txid !== 'string' || !/^[0-9a-f]{64}$/.test(txid) ||
         (this.deferredBroadcasts.has(key) && this.deferredBroadcasts.get(key) !== txid)) throw new Error('Invalid recovered claim receipt');
     return this.recordCompletedClaim(key, txid, { durationMs: 0, attempts: 0 });
+  }
+  canReopenConfirmedClaim(key) {
+    // Do not evict accounting metadata while its recapture is outstanding.
+    return this.reopenedCompletions.has(key) || this.reopenedCompletions.size < this.maxQueue;
+  }
+  reopenConfirmedClaim(key, txid) {
+    const match = typeof key === 'string' && /^([0-9a-f]{64}):(0|[1-9][0-9]{0,9})$/.exec(key);
+    if (!match || Number(match[2]) > 0xffffffff || typeof txid !== 'string' || !/^[0-9a-f]{64}$/.test(txid) ||
+        !this.canReopenConfirmedClaim(key)) throw new Error('Invalid orphaned claim confirmation');
+    this.reopenedCompletions.set(key, txid);
+    this.completed.delete(key); this.deferredBroadcasts.delete(key);
   }
   pauseWorker(signal) {
     if (signal.aborted) return Promise.resolve();

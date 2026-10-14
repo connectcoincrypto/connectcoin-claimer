@@ -12,7 +12,7 @@ export function validateHelperSecurity(output, expectedVersion) {
   if (report?.type !== 'ready' || report.protocol !== 4 || report.roots !== 1 ||
       report.security?.cryptographyVersion !== expectedVersion ||
       report.security?.minimumCryptographyVersion !== '50.0.1' ||
-      report.security?.rsaPublicExponentMaxBits !== 64 ||
+      report.security?.rsaPublicExponentMaxBits !== 64 || report.security?.admissionGate !== 1 ||
       typeof report.security?.opensslVersion !== 'string' ||
       !/^OpenSSL [0-9]+\.[0-9]+\.[0-9]+(?: |$)/.test(report.security.opensslVersion)) {
     throw new Error('Bundled helper has missing or outdated security metadata. Run npm run build:claims.');
@@ -25,7 +25,7 @@ export function validateNativeHelperSecurity(output) {
   try { report = JSON.parse(output); } catch { /* Reject malformed/extra output. */ }
   if (report?.type !== 'ready' || report.protocol !== 4 || report.roots !== 1 ||
       report.security?.provider !== 'mbedtls' || report.security?.mbedtlsVersion !== '3.6.7' ||
-      report.security?.rsaPublicExponentMaxBits !== 64) {
+      report.security?.rsaPublicExponentMaxBits !== 64 || report.security?.admissionGate !== 1) {
     throw new Error('Expected the pinned C++/Mbed TLS protocol-4 helper. Run npm run build:claims.');
   }
   return report.security;

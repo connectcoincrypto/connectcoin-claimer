@@ -3,10 +3,21 @@ import { validateTip } from './config.mjs';
 const HASH = /^[0-9a-f]{64}$/;
 const DOMAIN = /^(?=.{1,253}$)[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$/;
 const MAX_ROWS = 100000;
+// More than the default 10,000-event journal (100 pages), plus replay/fences.
+// This is a work budget, not evidence of invalid RPC data. Smaller server pages
+// or sustained updates fall back to a fresh, fully validated snapshot.
+const MAX_JOURNAL_PAGES = 128;
 export const bountyKey = row => `${row.txid}:${row.vout}`;
 const uint = (value, maximum = 0xffffffff) => Number.isSafeInteger(value) && value >= 0 && value <= maximum;
 const cursorValid = value => typeof value === 'string' && value.length > 0 && value.length <= 4096;
 class RescanRequired extends Error {}
+class DiscoveryBudgetExceeded extends RescanRequired {}
+export class BountyDiscoveryBusy extends Error {
+  constructor() {
+    super('The bounty snapshot is still changing; retrying discovery shortly.');
+    this.code = 'CLAIMS_SYNC_BUSY';
+  }
+}
 
 function validateRecentBlocks(response, network, count) {
   validateTip(response?.tip, network);
@@ -156,9 +167,15 @@ export async function discoverBounties({ rpc, network, lookback = 600, previous 
       }
     };
     const changes = async () => {
+      check();
+      if (journalPages >= MAX_JOURNAL_PAGES) throw new DiscoveryBudgetExceeded('Bounty journal work budget reached.');
       const from = cursor;
       const page = await query('getbountychanges', from ? { cursor: from } : {});
-      if (++journalPages > 100 || !cursorValid(page.next_cursor) || typeof page.has_more !== 'boolean' || !Array.isArray(page.changes) || page.changes.length > 10000 || (page.has_more && !page.changes.length) || (page.changes.length && page.next_cursor === from)) throw new Error('Invalid or excessive bounty journal response.');
+      journalPages++;
+      if (!cursorValid(page.next_cursor) || typeof page.has_more !== 'boolean' || !Array.isArray(page.changes) || page.changes.length > 10000 || (page.has_more && !page.changes.length) || (page.changes.length && page.next_cursor === from)) throw new Error('Invalid or excessive bounty journal response.');
+      // A reset revokes the old catalog before any following hash request can
+      // block on quota, timeout or hide the reset behind an unrelated failure.
+      if (page.changes.some(event => event?.type === 'resync_required')) throw new RescanRequired('Bounty journal requested a new snapshot.');
       cursor = page.next_cursor;
       return page;
     };
@@ -170,7 +187,7 @@ export async function discoverBounties({ rpc, network, lookback = 600, previous 
       let outpoints;
       for (const event of page.changes) {
         if (event?.type === 'resync_required') throw new RescanRequired('Bounty journal requested a new snapshot.');
-        if (!event || !['added','spent','pending_spend','available_again','matured','window_exit'].includes(event.type) || !uint(event.sequence, Number.MAX_SAFE_INTEGER) || event.sequence <= lastSequence || typeof event.txid !== 'string' || !HASH.test(event.txid) || !uint(event.vout) || (event.block_hash !== undefined && !HASH.test(event.block_hash))) throw new Error('Invalid bounty change event.');
+        if (!event || !['added','spent','pending_spend','available_again','matured','window_exit'].includes(event.type) || !uint(event.sequence, Number.MAX_SAFE_INTEGER) || event.sequence <= lastSequence || typeof event.txid !== 'string' || !HASH.test(event.txid) || !uint(event.vout) || (event.block_hash !== undefined && (typeof event.block_hash !== 'string' || !HASH.test(event.block_hash)))) throw new Error('Invalid bounty change event.');
         lastSequence = event.sequence;
         if (event.block_hash === undefined && !outpoints) {
           outpoints = new Map();
@@ -230,10 +247,10 @@ export async function discoverBounties({ rpc, network, lookback = 600, previous 
         }
         return { blocks: staged, cursor, tip, window: snapshot };
       }
-      throw new Error('The bounty window is changing too quickly. Retry discovery shortly.');
+      throw new DiscoveryBudgetExceeded('Bounty snapshot coherence work budget reached.');
     } catch (error) {
       if (!resetError(error)) throw error;
-      check(); await onReset({ reason: error.code === -32004 ? 'data-unavailable' : error.code === -32011 ? 'cursor-invalid' : 'journal-reset',
+      check(); await onReset({ reason: error instanceof DiscoveryBudgetExceeded ? 'work-budget' : error.code === -32004 ? 'data-unavailable' : error.code === -32011 ? 'cursor-invalid' : 'journal-reset',
         ...([-32004, -32011].includes(error.code) ? { code: error.code } : {}) });
       // A reset invalidates all bounty state and the cursor, not block hashes.
       // Retain only the hash anchor, requiring a fresh prefix even for an ABA
@@ -241,5 +258,7 @@ export async function discoverBounties({ rpc, network, lookback = 600, previous 
       check(); cached = new Map(); cachedWindow = null; cursor = null;
     }
   }
-  throw new Error('The bounty snapshot could not remain coherent; Automatic Claims was stopped.');
+  // Every exhausted attempt already closed admission through onReset. Preserve
+  // its proofs/counters while the caller backs off; never publish partial state.
+  throw new BountyDiscoveryBusy();
 }

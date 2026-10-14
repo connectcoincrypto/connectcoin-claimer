@@ -43,7 +43,7 @@ class IsolatedRuntimeTests(unittest.TestCase):
         self.assertEqual(result.stderr, "")
         self.assertEqual([json.loads(line) for line in result.stdout.splitlines()],
                          [{"type": "ready", "protocol": 4, "roots": 1,
-                           "security": {"rsaPublicExponentMaxBits": 64}}])
+                           "security": {"rsaPublicExponentMaxBits": 64, "admissionGate": 1}}])
 
     def test_isolated_self_test_uses_trusted_dependencies(self):
         result = self.invoke(["--self-test"])
@@ -54,7 +54,7 @@ class IsolatedRuntimeTests(unittest.TestCase):
             "security": {"cryptographyVersion": cryptography.__version__,
                          "minimumCryptographyVersion": "50.0.1",
                          "opensslVersion": backend.openssl_version_text(),
-                         "rsaPublicExponentMaxBits": 64},
+                         "rsaPublicExponentMaxBits": 64, "admissionGate": 1},
         })
 
     def test_self_test_exits_with_error_for_vulnerable_loaded_dependency(self):

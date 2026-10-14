@@ -90,6 +90,9 @@ test('repeated TCP failures replenish all global slots without introducing a dom
 });
 
 function failedStats() { const stats = new P2CDomainStats(); for (let i = 0; i < 10; i++) stats.record(false, 10); return stats; }
+function pastBootstrap(engine, policy = 'alpha.example:7') {
+  for (let i = 0; i < 32; i++) engine.connectionPolicy.probeStarted(policy, Date.now() - (31 - i) * 250);
+}
 
 test('the first failed one-second connection keeps a 15-bit 0.01 CONN bounty normally eligible', async t => {
   const { engine, attempts } = fixture(t, { options: { connectionsPerSecond: 100, concurrency: 1 } });
@@ -110,6 +113,7 @@ test('the first failed one-second connection keeps a 15-bit 0.01 CONN bounty nor
 
 test('below-floor domain gets at most one recovery TCP start per minute without resetting history', async t => {
   const { engine, attempts } = fixture(t);
+  pastBootstrap(engine);
   const stats = failedStats(); engine.domainStats.set('alpha.example:7', stats);
   const bounties = Array.from({ length: 20 }, (_, i) => row(i + 1, 'alpha.example', { amount: '1000', connection_work_target: 'f'.repeat(64) }));
   engine.enqueue(bounties); engine.start(); await settle();
@@ -126,7 +130,7 @@ test('below-floor domain gets at most one recovery TCP start per minute without 
   assert.equal(stats.completed, 11);
 });
 
-test('recovery never admits intrinsically below-floor candidates and admission remains bounded', async t => {
+test('recovery representatives and policy history remain bounded while lower-value candidates lose ranking', async t => {
   const { engine } = fixture(t, { maxQueue: 10 });
   for (let i = 0; i < 20; i++) engine.domainStats.set(`d${i}.example:7`, failedStats());
   const unhealthy = Array.from({ length: 20 }, (_, i) => row(i + 1, `d${i}.example`, { amount: '1000', connection_work_target: 'f'.repeat(64) }));
@@ -138,7 +142,8 @@ test('recovery never admits intrinsically below-floor candidates and admission r
   const policy = new ClaimConnectionPolicy();
   for (let i = 0; i < MAX_RECOVERY_POLICIES + 50; i++) policy.probeStarted(`p${i}:7`, 0);
   assert.equal(policy.probes.size, MAX_RECOVERY_POLICIES);
-  assert.equal(policy.probeDue('p0:7', 10000), 70000, 'evicted policies wait before probing again');
+  assert.equal(policy.probeDue('p0:7', 100), 250, 'eviction cannot erase the global start deadline');
+  assert.equal(policy.probeDue('p0:7', 10000), 250, 'idle time cannot rewind the global deadline');
 });
 
 test('full reset clears recovery history after connections drain', async t => {
@@ -174,6 +179,7 @@ test('inactive window expiry restores the smoothing prior through existing refre
   let clock = 0;
   const { engine, attempts } = fixture(t, { options: { connectionsPerSecond: 100, concurrency: 3 } });
   const stats = new P2CDomainStats({ now: () => clock });
+  pastBootstrap(engine);
   stats.record(false, 10); engine.domainStats.set('alpha.example:7', stats);
   const bounty = row(1, 'alpha.example', { amount: '1000', connection_work_target: 'f'.repeat(64) });
   engine.enqueue([bounty]);
@@ -222,6 +228,7 @@ test('replacing the probe bounty before its TCP acknowledgement cannot spend a s
       });
     } };
   const { engine } = fixture(t, { poolFactory: () => pool });
+  pastBootstrap(engine);
   engine.domainStats.set('alpha.example:7', failedStats());
   const first = row(1, 'alpha.example', { amount: '1000', connection_work_target: 'f'.repeat(64) });
   const replacement = row(2, 'alpha.example', { amount: '1100', connection_work_target: 'f'.repeat(64) });

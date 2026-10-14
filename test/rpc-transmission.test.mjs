@@ -69,16 +69,30 @@ test('every locally proven pre-write failure marks a broadcast notSent, not unkn
         await f.client.connect();
         Object.defineProperty(f.client.socket, 'writableLength', { value: 2 * 1024 * 1024, configurable: true });
       }
-      await assert.rejects(f.client.request('sendrawtransaction', { transaction_hex: mode === 'bad-params' ? 'bad' : transaction }), unsent);
+      await assert.rejects(f.client.request('sendrawtransaction', { transaction_hex: mode === 'bad-params' ? 'bad' : transaction }), error => {
+        unsent(error);
+        if (mode === 'queue-limit') assert.equal(error.code, 'RPC_QUEUE_FULL');
+        return true;
+      });
       assert.equal(f.requests.length, 0);
       assert.equal(f.client.pending.size, 0);
       assert.equal(f.client.capacityReservations, 0);
+      assert.equal(f.client.history.has('sendrawtransaction'), false);
       const diagnostic = f.events.find(row => ['rpc.failed', 'rpc.cancelled'].includes(row.event));
       assert.equal(diagnostic.details.sent, false);
       assert.equal(diagnostic.details.notSent, true);
       assert.equal(diagnostic.details.failureSource, 'pre-write');
     });
   }
+});
+
+test('a server cannot forge local queue exhaustion after a broadcast write', async t => {
+  const f = await fixture(t, (request, socket) => socket.write(frame({ jsonrpc: '2.0', id: request.id,
+    error: { code: 'RPC_QUEUE_FULL', message: 'Too many queued RPC requests; retry shortly.', data: { notSent: true } } })));
+  await assert.rejects(f.client.request('sendrawtransaction', { transaction_hex: transaction }), error => {
+    uncertain(error); assert.notEqual(error.code, 'RPC_QUEUE_FULL'); return true;
+  });
+  assert.equal(f.requests.length, 1); assert.equal(f.client.pending.size, 0);
 });
 
 test('real loopback connection refusal is proven unsent', async () => {
@@ -105,6 +119,26 @@ test('quota cancellation is unsent and never invokes the final transmission fenc
   controller.abort(); unsent((await next).error);
   assert.equal(f.requests.length, 1); assert.equal(fenced, false);
   assert.equal(f.client.capacityReservations, 0);
+  assert.equal(f.client.history.get('sendrawtransaction').length, 1);
+});
+
+test('48 revoked final fences consume no quota and the next legitimate broadcast is sent immediately', async t => {
+  const f = await fixture(t, (request, socket) => socket.write(frame({ jsonrpc: '2.0', id: request.id, result: { txid: hash } })),
+    { quota: 48, windowMs: 60000 });
+  for (let index = 0; index < 48; index++) {
+    await assert.rejects(f.client.request('sendrawtransaction', { transaction_hex: transaction }, { beforeSend() {
+      throw Object.assign(new Error('Catalog changed before transmission.'), { name: 'AbortError', code: 'ABORT_ERR' });
+    } }), unsent);
+    assert.equal(f.client.history.has('sendrawtransaction'), false);
+  }
+  assert.equal(f.requests.length, 0);
+  assert.equal(f.client.quotaWait('sendrawtransaction', {}), 0);
+  const result = await f.client.request('sendrawtransaction', { transaction_hex: transaction }, { signal: AbortSignal.timeout(2000) });
+  assert.equal(result.txid, hash);
+  assert.equal(f.requests.length, 1);
+  assert.equal(f.requests[0].request.params.transaction_hex, transaction);
+  assert.equal(f.client.history.get('sendrawtransaction').length, 1);
+  assert.equal(f.client.pending.size, 0); assert.equal(f.client.capacityReservations, 0);
 });
 
 test('capacity-delayed catalog reset rejects at beforeSend without disturbing written siblings', async t => {
@@ -120,6 +154,7 @@ test('capacity-delayed catalog reset rejects at beforeSend without disturbing wr
   gateOpen = false; f.answer(0);
   unsent((await broadcast).error);
   assert.equal(calls, 1); assert.equal(f.requests.length, 12);
+  assert.equal(f.client.history.has('sendrawtransaction'), false);
   assert.equal(f.client.pending.size, 11); assert.equal(f.client.capacityReservations, 0);
   assert.equal(f.client.socket.destroyed, false);
   for (let index = 1; index < 12; index++) f.answer(index);
@@ -127,21 +162,40 @@ test('capacity-delayed catalog reset rejects at beforeSend without disturbing wr
 });
 
 test('beforeSend forbids asynchronous fences and checks a fence-triggered abort before write', async t => {
-  for (const mode of ['resolved-promise', 'rejected-promise', 'throws', 'abort', 'not-function']) {
+  for (const mode of ['resolved-promise', 'rejected-promise', 'throws', 'abort', 'client-close', 'socket-close', 'not-function']) {
     await t.test(mode, async t => {
       const f = await fixture(t), controller = new AbortController();
       const beforeSend = mode === 'not-function' ? true : () => {
         if (mode === 'resolved-promise') return Promise.resolve();
         if (mode === 'rejected-promise') return Promise.reject(new Error('Fence failed asynchronously.'));
         if (mode === 'throws') throw new Error('Fence denied.');
+        if (mode === 'client-close') { f.client.close(); return; }
+        if (mode === 'socket-close') { f.client.socket.destroy(); return; }
         controller.abort();
       };
       await assert.rejects(f.client.request('sendrawtransaction', { transaction_hex: transaction },
         { beforeSend, signal: controller.signal }), unsent);
       assert.equal(f.requests.length, 0); assert.equal(f.client.pending.size, 0);
       assert.equal(f.client.capacityReservations, 0); assert.equal(f.client.queuedRequests, 0);
+      assert.equal(f.client.history.has('sendrawtransaction'), false);
     });
   }
+});
+
+test('a cooldown changed by a final fence spends no quota and requires a new fence after waiting', async t => {
+  const f = await fixture(t, (request, socket) => socket.write(frame({ jsonrpc: '2.0', id: request.id, result: { txid: hash } })));
+  let fences = 0;
+  const pending = f.client.request('sendrawtransaction', { transaction_hex: transaction }, { beforeSend() {
+    if (++fences === 1) f.client.cooldowns.set('sendrawtransaction', performance.now() + 200);
+  } });
+  await until(() => fences === 1);
+  assert.equal(f.client.history.has('sendrawtransaction'), false);
+  assert.equal(f.client.capacityReservations, 0);
+  assert.equal(f.requests.length, 0);
+  assert.equal((await pending).txid, hash);
+  assert.equal(fences, 2);
+  assert.equal(f.requests.length, 1);
+  assert.equal(f.client.history.get('sendrawtransaction').length, 1);
 });
 
 test('after-write loss and timeout stay unknown and diagnostics distinguish their origin', async t => {
@@ -159,6 +213,7 @@ test('after-write loss and timeout stay unknown and diagnostics distinguish thei
       assert.equal(failure.sent, true); assert.equal(failure.notSent, false);
       assert.equal(failure.unknownOutcome, true); assert.equal(failure.failureSource, mode);
       assert.ok(f.requests.length <= 1);
+      assert.equal(f.client.history.get('sendrawtransaction').length, 1);
     });
   }
 });
@@ -198,6 +253,7 @@ test('well-framed node replies including -27 are not reclassified as unsent or t
       assert.equal(failure.failureSource, 'rpc-reply');
       assert.equal(failure.sent, true); assert.equal(failure.notSent, false);
       assert.equal(f.requests.length, 1);
+      assert.equal(f.client.history.get('sendrawtransaction').length, 1);
     });
   }
 });

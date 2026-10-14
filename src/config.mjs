@@ -61,7 +61,14 @@ export async function readConfig(path) {
   try {
     if (!(await file.stat()).isFile()) throw new Error('Configuration must be a regular file.');
     const buffer = Buffer.alloc(16385);
-    const { bytesRead } = await file.read(buffer, 0, buffer.length, 0);
+    // A short read is not EOF: otherwise later settings may silently revert
+    // to defaults, or an invalid suffix may escape validation.
+    let bytesRead = 0;
+    while (bytesRead < buffer.length) {
+      const chunk = await file.read(buffer, bytesRead, buffer.length - bytesRead, bytesRead);
+      if (chunk.bytesRead === 0) break;
+      bytesRead += chunk.bytesRead;
+    }
     if (bytesRead > 16384) throw new Error('Configuration is too large.');
     return parseConfig(new TextDecoder('utf-8', { fatal: true }).decode(buffer.subarray(0, bytesRead)));
   } finally { await file.close(); }

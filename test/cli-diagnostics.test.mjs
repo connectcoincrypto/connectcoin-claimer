@@ -45,7 +45,8 @@ test('CLI broadcast diagnostics explain scoped reservations, recovery and quaran
     assert.match(line, /category=node-rejected code=-32020 node_code=-27/);
     assert.doesNotMatch(line, /SECRET/);
   }
-  assert.match(formatServiceEvent('broadcast', { status: 'recovered-accepted', txid }), /accepted result recovered; saved transaction bytes compacted/);
+  assert.match(formatServiceEvent('broadcast', { status: 'recovered-accepted', txid }), /accepted result recovered; exact transaction retained until block confirmation/);
+  assert.match(formatServiceEvent('broadcast', { status: 'confirmed', txid }), /block confirmation validated; saved transaction bytes compacted/);
   assert.match(formatServiceEvent('broadcast', { status: 'reconciliation-pending', txid }), /identical saved transaction retained/);
   assert.match(formatServiceEvent('broadcast', { status: 'quarantined-legacy-no-bytes', txid }), /legacy record has no saved proof.*other claims continue/);
   assert.match(formatServiceEvent('broadcast', { status: 'quarantined-address-mismatch', txid }), /saved receiving address differs.*other claims continue/);

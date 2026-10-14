@@ -58,7 +58,8 @@ const BROADCAST_NOTES = Object.freeze({
   accepted: '',
   pending: 'saved for reconciliation; only this outpoint is reserved',
   unknown: 'reply uncertain; saved for reconciliation; only this outpoint is reserved',
-  'recovered-accepted': 'accepted result recovered; saved transaction bytes compacted',
+  'recovered-accepted': 'accepted result recovered; exact transaction retained until block confirmation',
+  confirmed: 'block confirmation validated; saved transaction bytes compacted',
   'reconciliation-pending': 'still reserved; identical saved transaction retained for another check',
   'quarantined-legacy-no-bytes': 'legacy record has no saved proof; this outpoint needs review; other claims continue',
   'quarantined-address-mismatch': 'saved receiving address differs; this outpoint needs review; other claims continue',
@@ -105,7 +106,9 @@ export function formatMetricsLine(state) {
     `target reached ${metrics.targetReached ?? 0} | submitted ${state.claims?.completed ?? 0}`;
 }
 
-export async function main(args = process.argv.slice(2)) {
+export async function main(args = process.argv.slice(2), {
+  serviceFactory = options => new ClaimerService(options), helperAvailable = getClaimsHelper,
+} = {}) {
   const options = parseArguments(args);
   if (options.mode === 'help') { console.log(HELP); return 0; }
   if (options.mode === 'version') { console.log(VERSION); return 0; }
@@ -117,7 +120,7 @@ export async function main(args = process.argv.slice(2)) {
   }
   const config = await readConfig(options.configPath);
   const basePath = isSea() ? dirname(process.execPath) : resolve(dirname(fileURLToPath(import.meta.url)), '..');
-  if (!getClaimsHelper({ basePath })) throw new Error('Claims helper is missing. Keep the whole extracted package together, or run npm run build:claims.');
+  if (!helperAvailable({ basePath })) throw new Error('Claims helper is missing. Keep the whole extracted package together, or run npm run build:claims.');
   if (options.mode === 'check') { console.log('Configuration valid.'); return 0; }
   const unlock = await acquireLock(`${options.configPath}.lock`);
   let service, timer, stopping, resolveDone, exitCode = 0;
@@ -126,7 +129,22 @@ export async function main(args = process.argv.slice(2)) {
     if (stopping) return stopping;
     clearInterval(timer);
     stopping = (async () => {
-      try { await service?.stop(); }
+      try {
+        for (;;) {
+          try { await service?.stop(); break; }
+          catch (error) {
+            exitCode = 1;
+            if (!service?.heldProofs?.size) throw error;
+            // Stopping has already revoked admission and drained the network.
+            // A failed atomic write can still leave the only verified winner
+            // in memory. Keep its owner AND the process lock alive, and retry
+            // persistence only. Never unref this timer or restart claims.
+            console.error(`Cannot finish shutdown: verified proofs remain only in memory. ` +
+              `Restore writable storage; retrying in 5 seconds. Do not terminate this process. ${safeText(error.message)}`);
+            await new Promise(resolveRetry => setTimeout(resolveRetry, 5000));
+          }
+        }
+      }
       finally { resolveDone(); }
     })();
     return stopping;
@@ -135,7 +153,7 @@ export async function main(args = process.argv.slice(2)) {
   process.on('SIGINT', onSignal); process.on('SIGTERM', onSignal);
   if (process.platform === 'win32') process.on('SIGBREAK', onSignal);
   try {
-    service = new ClaimerService({ config, basePath, statePath: `${options.configPath}.state.json`, emit: (event, details = {}) => {
+    service = serviceFactory({ config, basePath, statePath: `${options.configPath}.state.json`, emit: (event, details = {}) => {
       if (event === 'error') {
         console.error(`${details.fatal ? 'Stopped' : 'Waiting/retrying'}: ${safeText(details.message)}`);
         if (details.fatal) { exitCode = 1; queueMicrotask(() => { void stop().catch(error => console.error(safeText(error.message))); }); }
@@ -158,9 +176,14 @@ export async function main(args = process.argv.slice(2)) {
     return exitCode;
   } finally {
     clearInterval(timer);
-    process.removeListener('SIGINT', onSignal); process.removeListener('SIGTERM', onSignal); process.removeListener('SIGBREAK', onSignal);
-    await service?.stop();
-    await unlock();
+    try {
+      // Startup failures must use the same preservation barrier as signals and
+      // fatal events. Keep signal handlers installed during a storage retry.
+      await stop();
+      await unlock();
+    } finally {
+      process.removeListener('SIGINT', onSignal); process.removeListener('SIGTERM', onSignal); process.removeListener('SIGBREAK', onSignal);
+    }
   }
 }
 

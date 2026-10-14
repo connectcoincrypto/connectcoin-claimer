@@ -61,6 +61,87 @@ function fixture(t, overrides = {}) {
   return { engine, attempts, submissions, preparations, resolves, starts, get constructions() { return constructions; }, get closes() { return closes; } };
 }
 
+test('recapturing an orphaned confirmed claim permits work without counting the same acceptance twice', async t => {
+  const { engine, attempts } = fixture(t);
+  const bounty = row(), id = key(bounty), txid = context(bounty).txid;
+  engine.completeRecoveredClaim(id, txid);
+  assert.equal(engine.snapshot().completed, 1);
+  engine.enqueue([bounty]); assert.equal(engine.queue.size, 0);
+  engine.reopenConfirmedClaim(id, txid);
+  engine.enqueue([bounty]); engine.start();
+  await until(() => attempts.length > 0);
+  attempts[0].finish({ captured: true, validationPassed: true, proof: '020100', verified: true });
+  await until(() => engine.completed.has(id));
+  assert.equal(engine.snapshot().completed, 1);
+  assert.equal(engine.reopenedCompletions.size, 0);
+  assert.equal(engine.pendingProofs.size, 0);
+  engine.reopenConfirmedClaim(id, txid);
+  assert.equal(engine.completeRecoveredClaim(id, hash(5000)), true, 'A different accepted transaction has its own accounting');
+  assert.equal(engine.snapshot().completed, 2);
+});
+
+test('orphan recapture accounting is bounded and survives suspension without evicting an outstanding ID', async t => {
+  const { engine } = fixture(t, { maxQueue: 1 });
+  const first = key(row(1)), second = key(row(2));
+  engine.reopenConfirmedClaim(first, hash(100));
+  assert.equal(engine.canReopenConfirmedClaim(first), true);
+  assert.equal(engine.canReopenConfirmedClaim(second), false);
+  assert.throws(() => engine.reopenConfirmedClaim(second, hash(101)), /Invalid orphaned/);
+  assert.throws(() => engine.reopenConfirmedClaim('bad', hash(100)), /Invalid orphaned/);
+  engine.clear({ preserveSelection: true });
+  assert.equal(engine.reopenedCompletions.get(first), hash(100));
+  assert.equal(engine.completeRecoveredClaim(first, hash(100)), false);
+  assert.equal(engine.snapshot().completed, 0);
+  assert.equal(engine.canReopenConfirmedClaim(second), true);
+  engine.reopenConfirmedClaim(second, hash(101)); engine.clear();
+  assert.equal(engine.reopenedCompletions.size, 0);
+});
+
+test('a funding reorg gap preserves bounded selection history without resurrecting proposals or proofs', async t => {
+  const { engine } = fixture(t);
+  const initial = { ...row(), block_height: 100, block_hash: hash(100) }, id = key(initial);
+  engine.enqueue([initial]);
+  const factor = engine.factors.get(id);
+  engine.successCounts.set(id, 3n);
+  engine.proposals.set(id, { stale: true }); engine.pendingProofs.set(id, { proof: 'old' });
+  engine.remove(initial.txid, initial.vout);
+  engine.retainCatalog([], { oldestHeight: 0 });
+  assert.equal(engine.successCounts.get(id), 3n);
+  assert.equal(engine.factors.get(id), factor);
+  assert.equal(engine.proposals.has(id), false); assert.equal(engine.pendingProofs.has(id), false);
+  engine.randomIndex = () => 1;
+  const reinserted = { ...initial, block_height: 101, block_hash: hash(101) };
+  engine.enqueue([reinserted]); engine.retainCatalog([reinserted], { oldestHeight: 0 });
+  assert.equal(engine.successCounts.get(id), 3n); assert.equal(engine.factors.get(id), factor);
+  engine.remove(initial.txid, initial.vout);
+  engine.retainCatalog([], { oldestHeight: 101 });
+  assert.equal(engine.successCounts.get(id), 3n, 'The re-mined height extends the existing metadata horizon');
+  engine.retainCatalog([], { oldestHeight: 102 });
+  assert.equal(engine.successCounts.has(id), false); assert.equal(engine.factors.has(id), false);
+});
+
+test('selection history stays bounded, ages out and clears only with its accounting session', async t => {
+  const { engine } = fixture(t);
+  for (let index = 1; index <= 100000; index++) {
+    const id = `${hash(index)}:0`;
+    engine.selectionHistoryHeights.set(id, 100); engine.factors.set(id, 1);
+  }
+  const first = key(row(1)); engine.successCounts.set(first, 77n);
+  const next = { ...row(100001), block_height: 102, block_hash: hash(102) };
+  assert.equal(engine.enqueue([next]), 0);
+  assert.equal(engine.selectionHistoryHeights.size, 100000);
+  assert.equal(engine.successCounts.get(first), 77n);
+  engine.clear({ preserveSelection: true });
+  assert.equal(engine.selectionHistoryHeights.size, 100000);
+  assert.throws(() => engine.retainCatalog([], { oldestHeight: -1 }), /Invalid claim history/);
+  assert.equal(engine.selectionHistoryHeights.size, 100000);
+  engine.retainCatalog([], { oldestHeight: 101 });
+  assert.equal(engine.selectionHistoryHeights.size, 0); assert.equal(engine.factors.size, 0);
+  assert.equal(engine.enqueue([next]), 1);
+  assert.equal(engine.selectionHistoryHeights.size, 1);
+  engine.clear(); assert.equal(engine.selectionHistoryHeights.size, 0);
+});
+
 test('simultaneous fresh winners and queued proofs share the four-submission limit', async t => {
   const sent = [], releases = [];
   let active = 0, maximum = 0;
@@ -559,3 +640,28 @@ test('releasing a DNS slot skips a removed parked domain and wakes the next vali
   assert.equal(engine.scheduler.domainAfter, null);
   assert.equal(engine.preferReward, false);
 });
+
+test('started local route failures count without degrading remote proof quality', async t => {
+  const bounty = row();
+  const { engine, attempts } = fixture(t, { options: { connectionsPerSecond: 1, concurrency: 1 } });
+  engine.enqueue([bounty]); engine.start(); await until(() => attempts.length === 1);
+  attempts[0].finish({ localUnavailable: true, message: 'Local network route is unavailable' });
+  await until(() => engine.diagnosticSnapshot().operationsFailed === 1);
+  assert.equal(engine.state.attempts, 1); assert.equal(engine.domainStats.size, 0);
+  assert.equal(engine.successCounts.get(key(bounty)) ?? 0n, 0n);
+});
+
+for (const gate of [{ blocked: 'budget' }, { localUnavailable: true }]) {
+  test(`post-ACK gate invalidation adds no proof, budget or domain sample ${JSON.stringify(gate)}`, async t => {
+    const bounty = row();
+    const { engine, attempts, submissions } = fixture(t, { options: { connectionsPerSecond: 1, concurrency: 1 } });
+    engine.enqueue([bounty]); engine.start(); await until(() => attempts.length === 1);
+    const token = [...engine.connections.keys()][0];
+    attempts[0].finish({ validationPassed: null, successfulConnections: '0', ...gate });
+    await until(() => !engine.connections.has(token));
+    assert.equal(engine.state.attempts, attempts.length); assert.equal(engine.domainStats.size, 0);
+    assert.equal(engine.successCounts.get(key(bounty)) ?? 0n, 0n);
+    assert.equal(engine.pendingProofs.size, 0); assert.equal(submissions.length, 0);
+    if (gate.blocked) assert.equal(engine.queue.get(key(bounty)).budgetExceeded, true);
+  });
+}

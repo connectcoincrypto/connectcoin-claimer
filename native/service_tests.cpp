@@ -27,6 +27,7 @@ UniValue Attempt(uint64_t id, Context context = ContextFor(), std::string count 
     value.pushKV("bountyId", std::string(64, 'a') + ":0"); value.pushKV("successfulConnections", count); return value;
 }
 UniValue Resolve(uint64_t id, std::string domain = "example.com") { UniValue value(UniValue::VOBJ); value.pushKV("type", "resolve"); value.pushKV("id", id); value.pushKV("domain", domain); return value; }
+UniValue Admission(uint64_t id, bool allowed) { UniValue value(UniValue::VOBJ); value.pushKV("type", "admission"); value.pushKV("id", id); value.pushKV("allowed", allowed); return value; }
 UniValue Cancel(uint64_t id) { UniValue value(UniValue::VOBJ); value.pushKV("type", "cancel"); value.pushKV("id", id); return value; }
 struct Fixture {
     std::mutex mutex;
@@ -395,8 +396,10 @@ void PacedGateInvalidations() {
     for (const unsigned mode : {0u, 1u, 2u}) {
         PacedGateProbe probe; PacedGateBarrier barrier;
         std::atomic<unsigned> tcp{};
+        std::atomic<unsigned> performance_reads{};
         ServiceDependencies deps;
         deps.reachability_time = [&] { return probe.Read(); };
+        deps.performance_time = [&] { ++performance_reads; return 100.0; };
         deps.resolve = [](const std::string&) { return std::vector<Endpoint>{{"8.8.8.8", 2, 443}}; };
         deps.capture = [&](const Context& context, const Endpoint&, CaptureControl& control, const std::function<void()>& started) -> Bytes {
             try { started(); }
@@ -421,7 +424,22 @@ void PacedGateInvalidations() {
         else barrier.ReleaseCapture();
         for (uint32_t id = 4; id < 10; ++id) barrier.WaitExited(id);
         Check(tcp == 1, "Invalidations unwind waiters before the gate owner can pass TCP");
-        fixture.service->Command(Cancel(3)); barrier.ReleaseOutput();
+        // The owner is not waiting on a CV: it is blocked inside its started
+        // acknowledgement. Notifications alone cannot revoke this TCP turn.
+        // Release without cancelling it so the post-ACK admission recheck is
+        // required for captured/imported exhaustion AND endpoint exclusion.
+        barrier.ReleaseOutput();
+        const auto owner_capture = fixture.Wait("capture", 3);
+        const auto owner = fixture.Wait("attempt", 3);
+        Check(owner["started"].isTrue() && owner["cancelled"].isFalse() && owner["captured"].isFalse() &&
+              owner["validationPassed"].isNull() && owner["proof"].isNull() && owner["verified"].isFalse(),
+              "Post-ACK invalidation preserves its started ACK but cannot invent TCP, proof, or failed validation");
+        Check(owner_capture["started"].isTrue() && owner_capture["captured"].isFalse() &&
+              owner_capture["cancelled"].isFalse() && owner_capture["successfulConnections"].get_str() == owner["successfulConnections"].get_str() &&
+              owner["successfulConnections"].get_str() == (mode == 2 ? "2" : "3"),
+              "Post-ACK capture and terminal share one unchanged budget snapshot");
+        if (mode == 2) Check(owner["localUnavailable"].isTrue() && owner["blocked"].isNull(), "Post-ACK endpoint exclusion remains a neutral local outcome");
+        else Check(owner["blocked"].get_str() == "budget" && owner["localUnavailable"].isNull(), "Post-ACK exhaustion retains the budget outcome");
         for (uint64_t id = 4; id < (mode == 1 ? 11 : 10); ++id) {
             const auto result = fixture.Wait("attempt", id);
             Check(result["started"].isFalse() && result["validationPassed"].isNull() && result["seconds"].get_real() == 0, "Invalidated waiter spends no attempt or performance sample");
@@ -430,10 +448,13 @@ void PacedGateInvalidations() {
         }
         barrier.ReleaseCapture();
         const auto result = fixture.Wait("attempt", 2);
-        const auto owner = fixture.Wait("attempt", 3);
-        Check(owner["cancelled"].isTrue() && owner["captured"].isFalse(), "Retained gate owner cannot pass TCP after cancellation");
         Check(tcp == 1 && !fixture.service->Failed(), "Invalidated waiters never open another socket");
         Check(result["successfulConnections"].get_str() == (mode == 2 ? "2" : mode == 1 ? "4" : "3"), "Already-running captures retain their exact budget observation");
+        Check(fixture.verifications == (mode == 2 ? 0 : 1), "Only the actual captured proof enters verification");
+        // One performance-clock read per selection, plus one only for the
+        // actual valid capture. Neither pre-ACK nor post-ACK invalidation may
+        // record a failed MA sample; local route failure also remains neutral.
+        Check(performance_reads == (mode == 2 ? 8u : mode == 1 ? 10u : 9u), "Invalidated gate admission never records endpoint performance");
     }
 }
 void PacedGateThroughputAndCounters() {
@@ -457,6 +478,84 @@ void PacedGateThroughputAndCounters() {
     Check(std::chrono::steady_clock::now() - begin < 2s, "Gate handoff must sustain 800/s demand without a 10 ms-per-turn delay");
     std::lock_guard lock(mutex); std::sort(starts.begin(), starts.end());
     Check(starts.size() == 64 && starts.back() - starts.front() >= 65ms, "Concurrent socket gate preserves the configured pacing phase");
+}
+void AdmissionPausePreservesCaptureAndCancelsWaiters() {
+    PacedGateProbe probe; PacedGateBarrier barrier; std::atomic<unsigned> tcp{};
+    ServiceDependencies deps;
+    deps.reachability_time = [&] { return probe.Read(); };
+    deps.resolve = [](const std::string&) { return std::vector<Endpoint>{{"8.8.8.8", 2, 443}}; };
+    deps.capture = [&](const Context& context, const Endpoint&, CaptureControl&, const std::function<void()>& started) {
+        started(); ++tcp;
+        if (context.input_index == 2) barrier.HoldCapture();
+        return Bytes{2, 1};
+    };
+    Fixture fixture(2, deps, 800); ReleasePacedGate cleanup{barrier}; fixture.Ready();
+    fixture.service->Command(PacedAttempt(2)); barrier.WaitHeld(true);
+    fixture.service->Command(Admission(3, false)); Check(fixture.Wait("admission", 3)["allowed"].isFalse(), "Pause ACK confirms closed admission");
+    const auto before = probe.Count(); fixture.service->Command(PacedAttempt(4)); probe.Wait(before + 3);
+    Check(tcp == 1, "Paused pre-start waiter cannot reach TCP");
+    fixture.service->Command(Cancel(4));
+    const auto cancelled = fixture.Wait("attempt", 4);
+    Check(cancelled["started"].isFalse() && cancelled["cancelled"].isTrue() && cancelled["validationPassed"].isNull(), "Paused waiter cancels without inventing an observation");
+    barrier.ReleaseCapture(); const auto active = fixture.Wait("attempt", 2);
+    Check(active["captured"].isTrue() && active["validationPassed"].isTrue() && active["successfulConnections"].get_str() == "1", "Already-started capture survives pause with one budget increment");
+    const auto waiting = probe.Count(); fixture.service->Command(PacedAttempt(5)); probe.Wait(waiting + 3);
+    Check(tcp == 1, "Pause remains in effect after an active capture completes");
+    fixture.service->Command(Admission(6, true)); fixture.Wait("admission", 6);
+    const auto resumed = fixture.Wait("attempt", 5);
+    Check(tcp == 2 && resumed["successfulConnections"].get_str() == "2" && resumed["validationPassed"].isTrue(), "Resume preserves cumulative capture accounting");
+    fixture.service->Command(Admission(7, false));
+    const auto closing = probe.Count(); fixture.service->Command(PacedAttempt(8)); probe.Wait(closing + 3);
+    fixture.service->Close(); const auto closed = fixture.Wait("attempt", 8);
+    Check(closed["started"].isFalse() && closed["cancelled"].isTrue() && tcp == 2, "Close wakes a paused FIFO without network work");
+}
+void AdmissionPauseDuringStartedAck() {
+    PacedGateProbe probe; PacedGateBarrier barrier; std::atomic<unsigned> tcp{}; std::exception_ptr command_error;
+    ServiceDependencies deps;
+    deps.reachability_time = [&] { return probe.Read(); };
+    deps.resolve = [](const std::string&) { return std::vector<Endpoint>{{"8.8.8.8", 2, 443}}; };
+    deps.capture = [&](const Context&, const Endpoint&, CaptureControl&, const std::function<void()>& started) { started(); ++tcp; return Bytes{2, 1}; };
+    Fixture fixture(2, deps, 800, [&](const UniValue& frame) {
+        if (frame["type"].get_str() == "started" && frame["id"].getInt<uint64_t>() == 2) barrier.HoldOutput();
+    });
+    ReleasePacedGate cleanup{barrier}; fixture.Ready(); fixture.service->Command(PacedAttempt(2)); barrier.WaitHeld();
+    auto checked = probe.Count(); fixture.service->Command(PacedAttempt(3)); probe.Wait(checked + 3);
+    checked = probe.Count();
+    cleanup.closing = std::thread([&] { try { fixture.service->Command(Admission(4, false)); } catch (...) { command_error = std::current_exception(); } });
+    // The pause wakes the second waiter under the admission mutex. This proves
+    // the state changed before releasing the first request's blocked writer.
+    probe.Wait(checked + 1); barrier.ReleaseOutput(); cleanup.closing.join();
+    if (command_error) std::rethrow_exception(command_error);
+    fixture.Wait("admission", 4); const auto result = fixture.Wait("attempt", 2); const auto capture = fixture.Wait("capture", 2);
+    Check(result["started"].isTrue() && result["captured"].isFalse() && result["cancelled"].isTrue() && result["validationPassed"].isNull() && result["proof"].isNull(), "Post-ACK pause retains ACK but no TCP/proof/sample");
+    Check(capture["successfulConnections"].get_str() == "0" && result["successfulConnections"].get_str() == "0" && tcp == 0 && fixture.verifications == 0, "ACK race never fabricates a capture or verification");
+    fixture.service->Command(Cancel(3)); fixture.Wait("attempt", 3);
+    fixture.service->Command(Admission(5, true)); fixture.service->Command(PacedAttempt(6)); fixture.Wait("attempt", 6);
+    Check(tcp == 1 && !fixture.service->Failed(), "A paused ACK race does not poison the resumed service");
+}
+void AdmissionValidationAndFailedResume() {
+    PacedGateProbe probe; std::atomic<unsigned> tcp{};
+    ServiceDependencies deps;
+    deps.reachability_time = [&] { return probe.Read(); };
+    deps.resolve = [](const std::string&) { return std::vector<Endpoint>{{"8.8.8.8", 2, 443}}; };
+    deps.capture = [&](const Context&, const Endpoint&, CaptureControl&, const std::function<void()>& started) { started(); ++tcp; return Bytes{2, 1}; };
+    Fixture fixture(2, deps, 800, [](const UniValue& frame) {
+        if (frame["type"].get_str() == "admission" && frame["allowed"].isTrue()) throw std::runtime_error("Controlled resume ACK failure");
+    });
+    fixture.Ready();
+    Rejects([&] { fixture.service->Command(Json("{\"type\":\"admission\",\"id\":2,\"allowed\":1}")); });
+    fixture.service->Command(Admission(2, false));
+    Rejects([&] { fixture.service->Command(Admission(2, false)); });
+    auto context = ContextFor(); context.connection_work_target = std::string(64, 'f');
+    fixture.service->Command(PacedAttempt(3, context, "3"));
+    const auto blocked = fixture.Wait("attempt", 3);
+    Check(blocked["blocked"].get_str() == "budget" && blocked["started"].isFalse(), "Paused admission still enforces exhausted budgets");
+    // A different outpoint's budget is not exhausted.
+    auto pending = PacedAttempt(4); pending.pushKV("bountyId", std::string(64, 'b') + ":0");
+    const auto checked = probe.Count(); fixture.service->Command(pending); probe.Wait(checked + 3);
+    Rejects([&] { fixture.service->Command(Admission(5, true)); });
+    fixture.service->Close(); const auto result = fixture.Wait("attempt", 4);
+    Check(fixture.service->Failed() && tcp == 0 && result["started"].isFalse() && result["successfulConnections"].get_str() == "0", "Failed resume ACK never opens the native gate");
 }
 void SuccessfulAndMissedProof() {
     Fixture fixture; fixture.Ready(); fixture.service->Command(Attempt(2));
@@ -774,6 +873,7 @@ void UnreachableEndpointIsExcludedAcrossMasksAndDomains() {
     Fixture fixture(1, deps); fixture.Ready(); fixture.service->Command(Attempt(2));
     const auto failed = fixture.Wait("attempt", 2);
     Check(failed["started"].isTrue() && failed["validationPassed"].isFalse() && failed["captured"].isFalse(), "Actual unreachable TCP remains a failed attempt");
+    Check(failed["localUnavailable"].isTrue() && failed["proof"].isNull(), "Local route failure cannot become a remote quality observation or proof");
     Check(failed["successfulConnections"].get_str() == "0", "Unreachable route spends no successful capture budget");
     for (uint64_t id = 3; id < 10; ++id) {
         fixture.service->Command(Attempt(id, ContextFor(id % 2 ? 6 : 7)));
@@ -798,6 +898,7 @@ void UnsupportedFamilyAndTimedRecovery() {
     Fixture fixture(1, deps); fixture.Ready(); fixture.service->Command(Attempt(2));
     const auto failed = fixture.Wait("attempt", 2);
     Check(failed["started"].isFalse() && failed["validationPassed"].isNull(), "Unsupported socket family spends no TCP counter");
+    Check(failed["localUnavailable"].isTrue(), "Pre-TCP local family limitation is explicitly neutral");
     now = 159;
     fixture.service->Command(Attempt(3)); Check(fixture.Wait("attempt", 3)["started"].isFalse(), "Cached exclusion prevents capture");
     fixture.service->Command(Resolve(4)); Check(fixture.Wait("resolved", 4)["ok"].isFalse(), "All excluded tells controller to back off, not spin");
@@ -820,12 +921,16 @@ void RouteRecoveryAndOrdinaryFailures() {
     now = 69; fixture.service->Command(Resolve(3)); Check(fixture.Wait("resolved", 3)["ok"].isFalse(), "Single unreachable endpoint excluded");
     fixture.service->Command(Attempt(4)); const auto blocked = fixture.Wait("attempt", 4);
     Check(blocked["started"].isFalse() && blocked["validationPassed"].isNull() && captures == 1, "Exclusion itself is not another failure or TCP attempt");
+    Check(blocked["localUnavailable"].isTrue(), "Cached local exclusion has the same neutral quality marker");
     now = 70; reachable = true;
     fixture.service->Command(Resolve(5)); Check(fixture.Wait("resolved", 5)["ok"].isTrue(), "Route exclusion expires without new DNS");
     fixture.service->Command(Attempt(6)); Check(fixture.Wait("attempt", 6)["validationPassed"].isTrue() && captures == 2, "Recovered IP is probed again");
     deps.capture = [&](const Context&, const Endpoint&, CaptureControl&, const std::function<void()>& started) -> Bytes { ++captures; started(); throw CaptureTimeout(); };
     Fixture ordinary(1, deps); ordinary.Ready();
-    for (uint64_t id = 2; id < 6; ++id) { ordinary.service->Command(Attempt(id)); Check(ordinary.Wait("attempt", id)["started"].isTrue(), "Timeout does not declare a family or route impossible"); }
+    for (uint64_t id = 2; id < 6; ++id) {
+        ordinary.service->Command(Attempt(id)); const auto value = ordinary.Wait("attempt", id);
+        Check(value["started"].isTrue() && value["validationPassed"].isFalse() && value["localUnavailable"].isNull(), "Ordinary timeout remains a failed quality observation, not a local exclusion");
+    }
     Check(captures == 6, "Normal transient failures keep ordinary selection policy");
 }
 void QueuedEndpointRecheckedAndCancellationDoesNotExclude() {
@@ -1003,8 +1108,47 @@ void PerformanceSurvivesSameIpDnsRefreshAndKeepsBudgets() {
     budget.service->Command(Attempt(3, context)); const auto blocked = budget.Wait("attempt", 3);
     Check(blocked["blocked"].get_str() == "budget" && blocked["successfulConnections"].get_str() == "3" && blocked["started"].isFalse(), "Expired IP window cannot reopen bounty budget or erase lifetime counter");
 }
+void LocalRouteFailureDoesNotPenalizeRecoveredEndpoint() {
+    std::atomic<double> reachability_now{0};
+    std::atomic<int> first{}, other{};
+    ServiceDependencies deps;
+    deps.reachability_time = [&] { return reachability_now.load(); };
+    deps.capture = [&](const Context&, const Endpoint& endpoint, CaptureControl&, const std::function<void()>& started) -> Bytes {
+        if (endpoint.ip == "8.8.8.8") {
+            if (++first == 1) { started(); std::this_thread::sleep_for(1s); throw LocalEndpointUnavailable(false); }
+        } else ++other;
+        // Inspect selection without creating further performance samples.
+        throw CaptureCancelled();
+    };
+    Fixture fixture(1, deps); fixture.Ready(); fixture.service->Command(Attempt(2));
+    const auto failure = fixture.Wait("attempt", 2);
+    Check(failure["started"].isTrue() && failure["validationPassed"].isFalse() && failure["localUnavailable"].isTrue(), "Actual local route failure retains start/failure accounting");
+    Check(failure["successfulConnections"].get_str() == "0" && failure["seconds"].get_real() >= 0.9, "Local limitation consumes elapsed time, not a successful capture budget");
+    reachability_now = 60;
+    for (uint64_t id = 3; id < 103; ++id) {
+        fixture.service->Command(Attempt(id)); const auto frame = fixture.Wait("attempt", id);
+        Check(frame["started"].isFalse() && frame["validationPassed"].isNull() && frame["successfulConnections"].get_str() == "0", "Selection-only recovery cannot invent attempts or successes");
+    }
+    Check(first == 51 && other == 50 && fixture.verifications == 0, "Recovered route immediately retains equal prior/rotation credit, not a one-second failure penalty");
+}
 } // namespace
 int main() {
-    try { Parsing(); BufferedFrameBoundaries(); InteractiveInputUnwind(); InteractiveFrameCancellation(); NativePreparedContextReuse(); BudgetAndPacing(); PacedGateWaitsCancelAndClose(); PacedGateInvalidations(); PacedGateThroughputAndCounters(); PrecomputedBudgetBoundaries(); SuccessfulAndMissedProof(); ConcurrentCaptureSnapshotsRemainImmutable(); FailuresAndDnsCache(); CancelQueuedAndActive(); CancelWhileVerifying(); BudgetAcrossRequestsAndIds(); BudgetCountsInvalidCapturesAndMonotonicReports(); EndpointSelectionBoundAndRoundRobin(); OutputFailureStopsBeforeTcp(); TerminalReplenishmentAtCapacity(); QueuedCancellationReplenishmentAndBudgetRetirement(); CancellationExceptionPublishesItsFlag(); TerminalOutputFailureRetiresOnce(); UnreachableEndpointIsExcludedAcrossMasksAndDomains(); UnsupportedFamilyAndTimedRecovery(); RouteRecoveryAndOrdinaryFailures(); QueuedEndpointRecheckedAndCancellationDoesNotExclude(); PerformanceMinuteBoundariesAndGaps(); PerformancePriorAndFiniteRates(); PerformanceCacheBoundsAndSmoothedExpiry(); PerformanceSurvivesSameIpDnsRefreshAndKeepsBudgets(); std::cout << "31 offline service test groups passed\n"; return 0; }
+    try {
+        Parsing(); BufferedFrameBoundaries(); InteractiveInputUnwind(); InteractiveFrameCancellation();
+        NativePreparedContextReuse(); BudgetAndPacing(); PacedGateWaitsCancelAndClose(); PacedGateInvalidations();
+        PacedGateThroughputAndCounters(); AdmissionPausePreservesCaptureAndCancelsWaiters();
+        AdmissionPauseDuringStartedAck(); AdmissionValidationAndFailedResume(); PrecomputedBudgetBoundaries();
+        SuccessfulAndMissedProof(); ConcurrentCaptureSnapshotsRemainImmutable(); FailuresAndDnsCache();
+        CancelQueuedAndActive(); CancelWhileVerifying(); BudgetAcrossRequestsAndIds();
+        BudgetCountsInvalidCapturesAndMonotonicReports(); EndpointSelectionBoundAndRoundRobin();
+        OutputFailureStopsBeforeTcp(); TerminalReplenishmentAtCapacity();
+        QueuedCancellationReplenishmentAndBudgetRetirement(); CancellationExceptionPublishesItsFlag();
+        TerminalOutputFailureRetiresOnce(); UnreachableEndpointIsExcludedAcrossMasksAndDomains();
+        UnsupportedFamilyAndTimedRecovery(); RouteRecoveryAndOrdinaryFailures();
+        QueuedEndpointRecheckedAndCancellationDoesNotExclude(); PerformanceMinuteBoundariesAndGaps();
+        PerformancePriorAndFiniteRates(); PerformanceCacheBoundsAndSmoothedExpiry();
+        PerformanceSurvivesSameIpDnsRefreshAndKeepsBudgets(); LocalRouteFailureDoesNotPenalizeRecoveredEndpoint();
+        std::cout << "35 offline service test groups passed\n"; return 0;
+    }
     catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }

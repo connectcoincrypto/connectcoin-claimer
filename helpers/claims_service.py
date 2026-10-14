@@ -136,6 +136,8 @@ class ClaimsService:
         self.next_connection = 0.0
         self.connection_idle = True
         self.closed = False
+        self.admission_allowed = True
+        self.admission_revision = 0
         # Two resolver slots cannot occupy the TLS capacity. The same executor
         # serves all domains/bounties for the entire unlocked claims session.
         self.executor = ThreadPoolExecutor(max_workers=self.concurrency + 2, thread_name_prefix="connectwallet-p2c")
@@ -157,6 +159,28 @@ class ClaimsService:
         if not isinstance(command, dict) or not isinstance(command.get("type"), str):
             raise ValueError("invalid protocol command")
         kind = command["type"]
+        if kind == "admission":
+            _keys(command, ("type", "id", "allowed"))
+            identifier = _integer(command["id"], 1, (1 << 53) - 1)
+            if type(command["allowed"]) is not bool:
+                raise ValueError("invalid admission gate state")
+            with self.condition:
+                if self.closed or identifier <= self.last_id:
+                    raise ValueError("invalid admission command lifecycle")
+                self.last_id = self.admission_revision = identifier
+                if not command["allowed"]:
+                    self.admission_allowed = False
+                    self.condition.notify_all()
+            self.emit({"type": "admission", "id": identifier, "allowed": command["allowed"]})
+            if command["allowed"]:
+                with self.condition:
+                    if not self.closed and self.admission_revision == identifier:
+                        if not self.admission_allowed:
+                            now = time.monotonic()
+                            self.next_connection = max(self.next_connection, now)
+                        self.admission_allowed = True
+                        self.condition.notify_all()
+            return
         if kind == "cancel":
             _keys(command, ("type", "id"))
             identifier = _integer(command["id"], 1, (1 << 53) - 1)
@@ -291,11 +315,15 @@ class ClaimsService:
 
     def _before_start(self, job):
         with self.condition:
-            if self.closed or job.control.cancelled():
-                raise CaptureCancelled("TLS capture cancelled")
-            budget = self.budgets[job.bounty_id]
-            if budget.successes == MAX_UINT64 or budget.successes * (budget.target + 1) > (1 << 257):
-                raise BudgetExhausted()
+            while True:
+                if self.closed or job.control.cancelled():
+                    raise CaptureCancelled("TLS capture cancelled")
+                budget = self.budgets[job.bounty_id]
+                if budget.successes == MAX_UINT64 or budget.successes * (budget.target + 1) > (1 << 257):
+                    raise BudgetExhausted()
+                if self.admission_allowed:
+                    return
+                self.condition.wait()
 
     def _started(self, job):
         with self.condition:
@@ -328,8 +356,11 @@ class ClaimsService:
             time.sleep(min(delay, 0.010))
         self._started(job)
         with self.condition:
-            if self.closed or job.control.cancelled():
+            if not self.admission_allowed:
+                # Keep a reported ACK, but never connect after a racing pause.
+                job.control.cancel()
                 raise CaptureCancelled("TLS capture cancelled")
+            self._before_start(job)
             now = time.monotonic()
             if self.connection_idle:
                 self.next_connection = max(self.next_connection, now)
@@ -411,6 +442,8 @@ class ClaimsService:
                 job.captured = True
             except CaptureCancelled:
                 raise
+            except BudgetExhausted:
+                raise
             except Exception:
                 # Snapshot a conclusive connection failure before emitting the
                 # capture frame: cancellation afterwards must not erase it.
@@ -430,6 +463,7 @@ class ClaimsService:
                         budget = self.budgets[job.bounty_id]
                         if job.captured:
                             budget.successes = min(MAX_UINT64, budget.successes + 1)
+                            self.condition.notify_all()
                         job.successful_connections = budget.successes
                     # No bookkeeping lock spans JSON encoding or a pipe write.
                     # This remains synchronous and precedes proof verification.
@@ -524,7 +558,7 @@ def run_service(stream, emit, parse_context, roots_path: str | Path):
     service = ClaimsService(start["options"], emit, parse_context, roots_path)
     try:
         service.emit({"type": "ready", "protocol": 4, "roots": 1,
-                      "security": {"rsaPublicExponentMaxBits": MAX_RSA_PUBLIC_EXPONENT_BITS}})
+                      "security": {"rsaPublicExponentMaxBits": MAX_RSA_PUBLIC_EXPONENT_BITS, "admissionGate": 1}})
         while True:
             command = read_frame(stream)
             if command is None: break

@@ -246,11 +246,17 @@ export class ClaimScheduler {
   setDomainReady(name, ready, { due = 0, now = Date.now() } = {}) {
     deadline(now);
     const gate = { ready: Boolean(ready), due: deadline(due) };
-    // Gates are remembered only for tracked domains, keeping state bounded.
+    // A rebuild can temporarily omit every eligible job of a tracked domain
+    // while its DNS request is still in flight. Complete that remembered gate
+    // even without a current group, or new bounties inherit a permanent pause.
+    // Never create state for an absent domain: rebuild prunes removed domains.
     const group = this.groups.get(name);
-    if (!group) return false;
-    this.domainGates.set(name, gate); group.gate = gate;
-    this.armDomain(group, now); this.refreshGroup(group, now);
+    if (!group && !this.domainGates.has(name)) return false;
+    this.domainGates.set(name, gate);
+    if (group) {
+      group.gate = gate;
+      this.armDomain(group, now); this.refreshGroup(group, now);
+    }
     return true;
   }
   remove(key, { now = Date.now() } = {}) {

@@ -63,7 +63,7 @@ function persistentPoolFixture(t) {
     child.stdin.on('data', data => {
       const command = JSON.parse(data.toString());
       if (command.type === 'start') queueMicrotask(() => child.stdout.write(JSON.stringify({
-        type: 'ready', protocol: 4, roots: 1, security: { rsaPublicExponentMaxBits: 64 },
+        type: 'ready', protocol: 4, roots: 1, security: { rsaPublicExponentMaxBits: 64, admissionGate: 1 },
       }) + '\n'));
       else if (command.type === 'shutdown') setImmediate(() => child.emit('close', 0));
       else commands.push(command);

@@ -8,11 +8,12 @@ import { validateNativeHelperSecurity } from '../scripts/helper-security.mjs';
 
 test('native packaging requires the exact provider and policy attestation', () => {
   const report = { type: 'ready', protocol: 4, roots: 1,
-    security: { provider: 'mbedtls', mbedtlsVersion: '3.6.7', rsaPublicExponentMaxBits: 64 } };
+    security: { provider: 'mbedtls', mbedtlsVersion: '3.6.7', rsaPublicExponentMaxBits: 64, admissionGate: 1 } };
   assert.doesNotThrow(() => validateNativeHelperSecurity(JSON.stringify(report)));
   for (const bad of [null, {}, { ...report, protocol: 3 }, { ...report, roots: 2 },
     { ...report, security: { ...report.security, provider: 'cryptography' } },
     { ...report, security: { ...report.security, mbedtlsVersion: '3.6.6' } },
+    ...[undefined, true, 0].map(admissionGate => ({ ...report, security: { ...report.security, admissionGate } })),
     { ...report, security: { ...report.security, rsaPublicExponentMaxBits: 65 } }]) {
     assert.throws(() => validateNativeHelperSecurity(JSON.stringify(bad)));
   }

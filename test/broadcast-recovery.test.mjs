@@ -4,7 +4,8 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { BroadcastJournal, MAX_REPLAY_HEX, transactionDigest } from '../src/broadcast-journal.mjs';
-import { validateSavedClaim, validateObservedClaim, deferredBroadcast } from '../src/broadcast-recovery.mjs';
+import { validateSavedClaim, validateObservedClaim, validateConfirmation, deferredBroadcast } from '../src/broadcast-recovery.mjs';
+import { GENESIS } from '../src/core/config.mjs';
 import { prepareClaim, attachClaimProof, parseTransaction, serializeTransaction, transactionIdFromRaw } from '../src/core/transaction.mjs';
 import { encodeAddress } from '../src/core/crypto.mjs';
 
@@ -79,6 +80,16 @@ test('saved and observed validators reject malformed witness framing and wrong c
   }
 });
 
+test('observed alternate proof also rechecks work when a validated bounty target is available', () => {
+  const original = fixture(), alternate = fixture(Buffer.from([1]));
+  assert.equal(validateObservedClaim(original.record, alternate.signed.hex, config, { target: 'ff'.repeat(32) }), alternate.signed.hex);
+  assert.throws(() => validateObservedClaim(original.record, alternate.signed.hex, config, { target: '00'.repeat(32) }), /work target/);
+  for (const target of [null, 0, '', 'f'.repeat(63), 'FF'.repeat(32)]) {
+    assert.throws(() => validateObservedClaim(original.record, alternate.signed.hex, config, { target }), /Invalid observed claim work target/);
+  }
+  assert.equal(original.record.transactionHex, original.signed.hex);
+});
+
 test('replay enforces the one-input one-payout claim shape even with a recomputed identity', () => {
   const { signed, record } = fixture(), original = parseTransaction(signed.hex);
   const variants = [tx => { tx.version = 3; }, tx => { tx.locktime = 1; }, tx => { tx.inputs[0].sequence--; },
@@ -95,11 +106,11 @@ test('replay enforces the one-input one-payout claim shape even with a recompute
   }
 });
 
-test('journal v2 round-trips immutable replay bytes and compacts only an accepted receipt', async t => {
+test('journal v3 retains immutable ACK bytes and compacts only a confirmed receipt', async t => {
   const { path, journal } = await journalFixture(t), { record } = fixture();
   await journal.update(record.outpoint, record);
   const disk = JSON.parse(await readFile(path, 'utf8'));
-  assert.equal(disk.version, 2); assert.equal(disk.records[0].transactionHex, record.transactionHex);
+  assert.equal(disk.version, 3); assert.equal(disk.records[0].transactionHex, record.transactionHex);
   const loaded = new BroadcastJournal(path); await loaded.load();
   assert.equal(validateSavedClaim(loaded.unresolved()[0], config), record.transactionHex);
   await loaded.update(record.outpoint, { txid: record.txid, receivingAddress, status: 'unknown' });
@@ -110,10 +121,19 @@ test('journal v2 round-trips immutable replay bytes and compacts only an accepte
   await assert.rejects(loaded.update(record.outpoint, { ...record, receivingAddress: encodeAddress(publicKey, 'testnet4') }), /cannot be replaced/);
   await loaded.update(record.outpoint, { txid: record.txid, receivingAddress, status: 'accepted' });
   assert.equal(loaded.unresolved().length, 0);
-  assert.equal(loaded.entries()[0].transactionHex, undefined); assert.equal(loaded.entries()[0].transactionHash, undefined);
+  assert.equal(loaded.entries()[0].transactionHex, record.transactionHex);
+  assert.equal(loaded.awaitingConfirmation().length, 1);
   await assert.rejects(loaded.update(record.outpoint, record), /cannot become pending/);
   const accepted = new BroadcastJournal(path); await accepted.load();
   assert.equal(accepted.entries()[0].status, 'accepted'); assert.equal(accepted.unresolved().length, 0);
+  assert.equal(accepted.entries()[0].transactionHex, record.transactionHex);
+  await accepted.update(record.outpoint, { txid: record.txid, receivingAddress, status: 'confirmed', blockHash: 'f'.repeat(64), blockHeight: 123 });
+  assert.equal(accepted.awaitingConfirmation().length, 0);
+  assert.equal(accepted.entries()[0].transactionHex, undefined);
+  assert.equal(accepted.entries()[0].blockHeight, 123);
+  await assert.rejects(accepted.update(record.outpoint, record), /confirmed claim cannot become pending/);
+  const confirmed = new BroadcastJournal(path); await confirmed.load();
+  assert.equal(confirmed.entries()[0].status, 'confirmed');
 });
 
 test('legacy journal records load without fabricated replay bytes and migrate without losing reservations', async t => {
@@ -124,7 +144,7 @@ test('legacy journal records load without fabricated replay bytes and migrate wi
   assert.equal(journal.unresolved()[0].transactionHex, undefined);
   await journal.update(record.outpoint, { txid: record.txid, receivingAddress, status: 'unknown' });
   const disk = JSON.parse(await readFile(path, 'utf8'));
-  assert.equal(disk.version, 2); assert.equal(disk.records[0].outpoint, record.outpoint);
+  assert.equal(disk.version, 3); assert.equal(disk.records[0].outpoint, record.outpoint);
   assert.equal(disk.records[0].transactionHex, undefined);
   assert.throws(() => validateSavedClaim(journal.unresolved()[0], config));
   assert.equal(validateObservedClaim(legacy, transactionHex, config), transactionHex);
@@ -153,4 +173,69 @@ test('deferred ownership marker retains the exact transaction identity and origi
   const txid = fixture().record.txid, error = deferredBroadcast(txid, cause);
   assert.equal(error.broadcastDeferred, true); assert.equal(error.txid, txid); assert.strictEqual(error.cause, cause);
   assert.equal(error.helperFatal, undefined);
+});
+
+test('only coherent block metadata confirms a claim; a pending lookup or ACK cannot compact it', () => {
+  const tip = { height: 100, hash: 'a'.repeat(64), mediantime: 1700000000, chain: 'main', genesis_hash: GENESIS.main };
+  const result = { tip, status: 'confirmed', block_hash: tip.hash, block_height: 100, transaction: { blockhash: tip.hash } };
+  assert.deepEqual(validateConfirmation(result, config), { blockHash: tip.hash, blockHeight: 100 });
+  assert.equal(validateConfirmation({ tip, status: 'pending' }, config), null);
+  assert.equal(validateConfirmation({ tip }, config), null);
+  for (const changed of [
+    { status: 'accepted' }, { status: 'pending' }, { block_height: 101 }, { block_height: -1 },
+    { block_height: '100' }, { block_hash: 'b'.repeat(64) }, { block_hash: 'invalid' },
+    { transaction: { blockhash: 'b'.repeat(64) } }, { tip: { ...tip, chain: 'testnet4' } },
+    ...[0, -1, '1', 0.5].map(confirmations => ({ transaction: { confirmations } })),
+  ]) assert.throws(() => validateConfirmation({ ...result, ...changed }, config));
+  assert.throws(() => validateConfirmation({ ...result, block_height: 99 }, config,
+    { blocks: [{ height: 99, hash: 'c'.repeat(64) }] }), { code: -32011 });
+});
+
+test('a confirmation at height zero must match the validated network genesis even outside the local window', () => {
+  const tip = { height: 1000, hash: 'a'.repeat(64), mediantime: 1700000000, chain: 'main', genesis_hash: GENESIS.main };
+  const window = { blocks: [{ height: 1000, hash: tip.hash }] };
+  const result = { tip, status: 'confirmed', block_height: 0, block_hash: GENESIS.main };
+  assert.deepEqual(validateConfirmation(result, config, window), { blockHeight: 0, blockHash: GENESIS.main });
+  assert.throws(() => validateConfirmation({ ...result, block_hash: 'b'.repeat(64) }, config, window));
+});
+
+for (const status of [undefined, 'pending']) test(`unconfirmed receipt ${status ?? 'legacy'} cannot carry contradictory transaction location`, () => {
+  const tip = { height: 100, hash: 'a'.repeat(64), mediantime: 1700000000, chain: 'main', genesis_hash: GENESIS.main };
+  assert.equal(validateConfirmation({ tip, status, transaction: { confirmations: 0 } }, config), null);
+  for (const transaction of [
+    { blockhash: tip.hash }, { blockhash: null },
+    ...[1, -1, '0', null, false, 0.5, NaN, Infinity].map(confirmations => ({ confirmations })),
+  ]) assert.throws(() => validateConfirmation({ tip, status, transaction }, config));
+});
+
+test('v3 rejects malformed confirmation and cannot resurrect or replace accepted witness bytes', async t => {
+  const { path, journal } = await journalFixture(t), { record } = fixture();
+  await journal.update(record.outpoint, { ...record, status: 'accepted' });
+  await assert.rejects(journal.update(record.outpoint, { ...fixture(Buffer.from([1])).record, status: 'accepted' }), /witness cannot be replaced/);
+  for (const row of [
+    { ...record, status: 'confirmed' },
+    { ...record, status: 'confirmed', blockHash: 'a'.repeat(64), blockHeight: 1 },
+    { ...record, status: 'accepted', blockHash: 'a'.repeat(64), blockHeight: 1 },
+    { outpoint: record.outpoint, txid: record.txid, receivingAddress, status: 'confirmed', updatedAt: 1, blockHash: 'bad', blockHeight: 1 },
+  ]) {
+    await writeFile(path, JSON.stringify({ version: 3, records: [row] }));
+    await assert.rejects(new BroadcastJournal(path).load());
+  }
+});
+
+test('journal reserves worst-case witness capacity before capture and frees it only after confirmed compaction', async t => {
+  const { path } = await journalFixture(t), { record } = fixture();
+  const raw = 'ab'.repeat(MAX_REPLAY_HEX / 2);
+  const records = Array.from({ length: 62 }, (_, vout) => ({ ...record, outpoint: `${bounty.txid}:${vout}`,
+    status: 'accepted', transactionHex: raw, transactionHash: transactionDigest(raw) }));
+  await writeFile(path, JSON.stringify({ version: 3, records }, null, 2) + '\n');
+  const journal = new BroadcastJournal(path); await journal.load();
+  assert.equal(journal.canRetainAdditionalProofs(1), true);
+  assert.equal(journal.canRetainAdditionalProofs(2), false);
+  assert.equal(journal.canRetainAdditionalProofs(-1), false);
+  assert.equal(journal.canRetainAdditionalProofs(0.5), false);
+  await journal.update(records[0].outpoint, { txid: record.txid, receivingAddress, status: 'confirmed', blockHash: 'a'.repeat(64), blockHeight: 10 });
+  assert.equal(journal.canRetainAdditionalProofs(2), true);
+  assert.equal(journal.canRetainAdditionalProofs(3), false);
+  assert.equal(journal.awaitingConfirmation().length, 61);
 });

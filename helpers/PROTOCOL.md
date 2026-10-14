@@ -2,13 +2,31 @@
 
 The initial `start` and `ready` frames require `protocol: 4`. The ready frame
 retains `roots: 1` and must include
-`security: {"rsaPublicExponentMaxBits": 64}`. The desktop rejects a missing or
-different limit before sending DNS/claim requests and asks for a helper rebuild.
+`security: {"rsaPublicExponentMaxBits": 64, "admissionGate": 1}`. The desktop
+rejects missing or different capabilities before sending DNS/claim requests and
+asks for a helper rebuild.
 One-shot claims and RSA probes use the suffix `--require-rsa-exponent-64`;
 older helpers reject it before processing input or starting network work.
 Proof encoding and the probe's fixed response fields are unchanged. Protocols
 1–3 are rejected before starting work; older helpers do not provide validated
 attempt outcomes and cannot be used for EMA observations.
+
+Admission control uses exactly `{"type":"admission","id":N,"allowed":false}`
+or `allowed:true`, with the same increasing safe-integer request-ID sequence as
+DNS and attempts. The helper replies with the same three fields. A pause takes
+effect before its acknowledgement and prevents queued attempts from starting
+TCP without cancelling captures already admitted. A resume takes effect only
+after its acknowledgement is written successfully; an older resume cannot undo
+a newer pause. Pauses preserve budgets, validated outcomes and FIFO waiters;
+resumption retains future rate deadlines but earns no idle connection credit.
+Pre-start watchdogs pause with admission, while active-capture deadlines remain
+unchanged. Admission acknowledgements have a separate 15-second deadline;
+failure closes the helper rather than leaving admission state uncertain.
+
+If a pause races a blocked `started` output, that acknowledgement remains counted
+once, but the helper cancels before TCP: `started:true`, `cancelled:true`,
+`captured:false`, `validationPassed:null` and no successful-capture
+increment. This is not a failed proof or a performance observation.
 
 An attempt emits `started` after reserving its start, immediately before the
 actual TCP-start pacing gate, then `capture` when that capture finishes and one
@@ -25,8 +43,10 @@ Every terminal `attempt` result includes required `validationPassed`:
   whether the connection work hash meets the real target.
 - `false`: a started TCP/TLS capture failed without local cancellation, or a
   completed capture failed proof parsing or cryptographic validation.
-- `null`: the attempt did not start, or local cancellation left capture or
-  validation unfinished. Cancellation before verification begins is `null`.
+- `null`: the attempt did not start, local cancellation left capture or
+  validation unfinished, or the final pre-TCP check found budget exhaustion or
+  local endpoint exclusion after the `started` acknowledgement. Cancellation
+  before verification begins is `null`.
 
 Validation runs with the maximum work target, then the actual target is checked
 separately. `verified` still means a winning proof is returned. A cancelled
@@ -41,9 +61,12 @@ TLS 1.3, including server/client Finished, and attempt an authenticated
 `close_notify`; this best-effort teardown adds at most 200 ms and drains at most
 64 KiB. Teardown failure does not discard a completed capture.
 
-The existing `blocked: "budget"` result is a no-start outcome, requiring
-`started: false`, `captured: false`, `seconds: 0`, `validationPassed: null`,
-`proof: null` and `verified: false`. No per-domain/IP cooldown response is
+The existing `blocked: "budget"` result requires `captured: false`,
+`validationPassed: null`, `proof: null` and `verified: false`. Normally it has
+`started: false` and `seconds: 0`; if a sibling exhausts the budget while its
+`started` acknowledgement is being written, that acknowledgement remains counted
+once and the final pre-TCP check returns the same neutral budget outcome with
+`started: true`. No per-domain/IP cooldown response is
 supported: `blocked: "endpoint"` and `retryAfterMs` are rejected. The helper
 uses a weighted rotation of resolved public IPs, independently per domain and
 signature-policy mask, without imposing additional transport backoff. It learns

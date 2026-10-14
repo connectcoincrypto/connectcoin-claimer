@@ -63,6 +63,8 @@ fee_rate=1500
   earned per second of connection effort**, not a minimum number of connections.
   Default `1000`; `0` disables this economic floor. Uses work probability,
   payout after fee, and the domain/signature-policy smoothed recent valid-proof/time ratio.
+  Positive, valid candidates below this floor receive only the bounded bootstrap/
+  recovery sampling described below, not ordinary full-rate connection work.
 - `rpc_host`, `rpc_port`: the public plaintext TCP JSON-RPC endpoint, **not**
   Core's administrative HTTP RPC. No RPC username/password is needed. Mainnet
   identity/genesis are checked; another network is rejected.
@@ -187,7 +189,9 @@ counters, successful-capture budgets or claims. This is a fixed-window ratio wit
 a smoothing base, not an exponential moving average or a wall-clock start rate.
 Failed conclusive attempts
 contribute time but no valid proof; cancellation without a validation result is
-not an observation. All certificate and proof validations still run.
+not an observation. Explicit local route/family failures retain their actual
+attempt counters but do not penalize remote domain or endpoint quality. Ordinary
+timeouts still contribute failed observations. All certificate and proof validations still run.
 
 The current minute and the previous 59 minutes are retained. This is a
 minute-granularity window: a sample expires approximately 59–60 minutes after
@@ -200,8 +204,29 @@ failed attempt lasting 1 second changes an otherwise empty history to **2.5/s**,
 not zero; one lasting 0.2 seconds gives approximately **4.167/s**. The base does
 not expire, accumulate on reads or create imaginary valid proofs. Repeated
 failures can still bring expected return below the configured economic floor;
-the existing one-per-minute recovery probes remain applicable in that case.
+bounded bootstrap/recovery probes remain applicable in that case, including
+when a fresh candidate is below the floor even at the 5/s base estimate.
 The native 99% performance / 1% rotation weighting is unchanged.
+
+Sampling selects at most one representative per domain/signature-mask policy.
+Each retained sampling episode allows up to **32 starts**, at least **250 ms**
+apart, then at most one start per **60 seconds** for that policy. All sampled
+policies share a **global maximum of four starts per second**, with one pending
+start acknowledgement at a time and no accumulated idle/burst credit. Ordinary
+economically eligible work keeps the configured transport rate/concurrency and
+does not wait for another policy's sampling acknowledgement. The existing queue
+bound, positive authenticated payout, capture budget, local validation, lifecycle,
+catalog reset, and broadcast-journal guards still apply.
+
+Only an actual helper `started` acknowledgement consumes a sampling turn;
+dispatch, preparation, DNS, cancellation, or failure before that acknowledgement
+do not. The helper may conservatively retain its acknowledged start counter if
+a concurrent budget/endpoint invalidation vetoes TCP immediately after the ACK;
+such a result never invents a capture, proof, or remote-quality observation.
+Sampler state is bounded to 256 policies. Catalog cleanup or eviction may begin
+a new sampling episode on re-entry, but never resets the global 250 ms deadline.
+Real validated observations alone determine promotion to ordinary economic work;
+sampling does not inflate the smoothing base or any actual success counter.
 
 The numeric buckets occupy 1,440 bytes per allocated history, plus metadata.
 Native endpoint histories are allocated lazily and bounded to 8,192 histories
@@ -238,19 +263,28 @@ the native wall-time estimate is not a production CPU measurement.
 
 ## Shutdown, crash recovery and uncertain broadcasts
 
-Before a broadcast, the application durably writes a version-2 public
+Before a broadcast, the application durably writes a version-3 public
 `claimer.conf.state.json` journal containing the outpoint, transaction ID,
 receiving address, status, **exact serialized claim transaction including its
 public proof witness**, and a SHA-256 digest of those bytes. It never contains
 seeds or private keys. Keep this file: it preserves winning proofs across lost
 RPC replies and restarts. Verified winners waiting at clean shutdown are also
 saved. The journal has explicit size/record limits and fails closed on storage
-errors rather than silently dropping records.
+errors rather than silently dropping records. New capture preparations reserve
+worst-case witness capacity in advance; when outstanding confirmations fill
+that budget, new work waits while reconciliation can compact confirmed records.
+If a competing mempool spend arrives while a verified winner is still waiting
+for its first submission, the winner is transferred to this journal before its
+queue entry is invalidated. No transmission is permitted while that spend is
+pending. The original in-memory proof stays owned until the atomic write
+succeeds, including during storage-failure shutdown.
 
 A `pending` (saved without a recorded accepted outcome) or `unknown` (possibly
 sent without a conclusive reply) record reserves **only that outpoint**;
 unrelated claims can continue. Neither status proves that no transmission took
-place. Recovery first queries
+place. A definite node policy rejection also retains the original winning proof
+in the journal as `pending`; a later pending-spend/catalog change cannot discard
+it and force recapture. Recovery first queries
 `gettransaction` for the saved ID and validates returned transaction identity,
 input, receiving output and proof binding. If it is absent from the index,
 absence is **not** treated as rejection: the client may retransmit only the
@@ -259,13 +293,77 @@ and proof structure/binding. It never creates a competing replacement claim.
 The receiving node still applies its current full validation and fee policy.
 Reconciliation is bounded, uses the normal RPC quotas and retries with delay.
 
-Once acceptance is observed or acknowledged, the record becomes `accepted` and
-its transaction/proof bytes are removed; the compact outpoint/ID reservation
-remains. A later timeout, quota response or node rejection cannot release an
+Once acceptance is observed or acknowledged, the record becomes `accepted` but
+retains its exact transaction/proof bytes: an ACK is not block confirmation.
+Recovery checks the transaction using the same bounded RPC lane. If an accepted
+transaction disappears and a coherent catalog reports its input available
+again, only those identical bytes can be retransmitted. A signed claim that has
+aged out of the bounded discovery window can also be replayed normally; an
+explicit spent/unavailable row blocks replay for every saved status (including
+previous rejections), but absence from that window is
+not proof of a spent input. A replay never credits
+another completed claim. Only validated block-confirmation metadata and the
+matching transaction permit transition to `confirmed` and compacting the
+saved bytes; the outpoint/ID reservation remains. Transaction IDs exclude the
+witness, so a node-observed proof can differ from our saved proof while still
+matching the same input, payout and challenge. The observed proof must pass
+the receipt's identity/structure/binding checks; it never replaces the original
+bytes for retransmission. Work is also checked against the bounty target while
+that metadata remains available; the full node remains the consensus validator.
+A later timeout, quota response or node rejection cannot release an
 outpoint whose earlier broadcast is still uncertain. Invalid saved data or
 malformed transaction identity still stops the service.
 
-Version-1 journals remain readable. A legacy unresolved record without saved
+After an atomic journal replacement, subsequent writes always start from the
+newly published state, even if the final POSIX directory flush fails. Such a
+failure is still reported, not treated as a successful durable write. This
+prevents a queued write from erasing the newly saved proof or downgrading an
+accepted record; it does not guarantee persistence across power loss when the
+storage system fails to flush.
+
+Recovery reads the complete bounded journal through EOF before validating or
+publishing any records. Short filesystem reads are continued; trailing corrupt
+data, interrupted reads and growth beyond the 8 MiB limit remain errors and
+never authorize replay from a partially read state.
+
+Receipt metadata must agree with the observed transaction: an optional reported
+transaction ID cannot contradict its saved ID, and an unconfirmed receipt cannot
+carry a block hash or nonzero confirmations. A confirmation at height zero must
+match the network's pinned genesis, even when that block is outside the current
+discovery window. Inconsistent replies never compact the saved proof or credit
+a completed claim. Well-formed location conflicts between the RPC index and its
+backend (for example, the backend mines or orphans a transaction first) retain
+the owner and retry through normal bounded reconciliation instead of stopping
+the service; malformed identity or field types still fail closed.
+
+Receipt reads are fenced against catalog resets, including while a confirmation
+waits for durable storage. An old reply cannot compact a witness or authorize a
+replay against a replacement catalog. After legitimate compaction, a complete
+catalog may reopen a confirmed outpoint only when it is available again and its
+confirming block is demonstrably orphaned. Merely aging outside the hash window
+does not qualify; a lower tip proves rollback only after that confirmation was
+previously anchored locally. The compact journal marker is removed atomically
+before recapture is admitted. Original unconfirmed proofs are never removed by
+this path. Bounded accounting metadata prevents crediting the same transaction
+twice when its proof must be recaptured after compaction.
+
+Within the current 600-block horizon, a funding transaction temporarily absent
+after a reorganization retains only its selection factor and successful-capture
+budget. Re-mining that same output does not restart its budget; old proposals
+and proofs are not restored through this accounting history. History uses the
+existing 100,000-factor bound and expires with the discovery horizon.
+
+If the first durable write fails, the service halts without broadcasting but
+retains an explicit in-memory owner of the verified winner. If shutdown cannot
+save that proof, the CLI stays alive with claims stopped and the instance lock
+held, warns that the proof is still only in memory, and retries persistence
+every five seconds. This also covers fatal events and startup failures; repeated
+stop signals share the same drain instead of forcing an unsafe exit. Restore
+writable storage without terminating the process. After recovery it exits with
+an error status, not a false success. This cannot protect against forced process
+termination or power loss before any durable write succeeds.
+
+Version-1 and version-2 journals remain readable. A legacy record without saved
 transaction bytes can be recognized by an RPC lookup, but cannot be replayed
 if absent; only that outpoint remains quarantined for review. A saved claim for
 a different receiving address is also quarantined, never redirected. Keep a
