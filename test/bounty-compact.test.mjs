@@ -251,8 +251,206 @@ test('journal invalidation revokes previous ACK/count context and replays a fres
   const row = rowAt(f.current.blocks[2]); f.rows.set(row.block_hash, [row]);
   const result = await discoverBounties({ ...f.options, ...optionsFrom(first) });
   assert.equal(f.calls[1].params.cursor, undefined); assert.equal(f.calls[1].params.known_state, undefined);
-  assert.equal(f.reads.length, 600); assert.ok(f.reads.includes(row.block_hash));
-  assert.deepEqual(result.blocks.get(row.block_hash), [row]); assert.equal(result.window.blockCounts, undefined);
+  assert.equal(f.calls[1].params.known_tip, undefined);
+  assert.deepEqual(f.calls.filter(call => call.method === 'getrecentblockhashes').map(call => call.params), [{ include_bounty_counts: true }]);
+  assert.deepEqual(f.reads, [row.block_hash]);
+  assert.deepEqual(result.blocks.get(row.block_hash), [row]); assert.equal(Object.keys(result.window.blockCounts).length, 600);
+  assert.equal(result.window.blockCounts[row.block_hash], 1);
+});
+
+for (const resetKind of ['cursor-invalid', 'data-unavailable', 'resync_required']) test(`mass expiry with ${resetKind} rebuilds fresh counts without opening empty block streams`, async () => {
+  const f = fixture(), oldBlock = f.current.blocks.at(-1), retained = f.current.blocks[50];
+  const expired = Array.from({ length: 500 }, (_, id) => rowAt(oldBlock, 700, id));
+  const remaining = Array.from({ length: 284 }, (_, id) => rowAt(retained, 700, 1000 + id));
+  f.rows.set(oldBlock.hash, expired); f.rows.set(retained.hash, remaining);
+  const first = await discoverBounties(f.options), saved = structuredClone(first.blocks);
+  f.calls.length = 0; f.reads.length = 0; f.current = windowAt(701);
+  f.rows.set(oldBlock.hash, [{ ...expired[0], status: 'spent', spending_txid: hash(900) }, ...expired.slice(1)]);
+  // These final states were not announced to this reset journal. The complete
+  // positive-count stream, not just event rows, must recover all of them.
+  f.rows.set(retained.hash, remaining.map((row, index) => ({ ...row,
+    ...(index < 2 ? { status: index ? 'pending_spend' : 'spent', spending_txid: hash(901 + index) } : {}) })));
+  let reset = false;
+  f.before = method => {
+    if (!reset && method === 'getbountychanges' && resetKind !== 'resync_required') {
+      reset = true; throw Object.assign(new Error('Reset'), { code: resetKind === 'cursor-invalid' ? -32011 : -32004 });
+    }
+  };
+  f.after = (method, params, response) => {
+    if (!reset && method === 'getbountychanges') {
+      reset = true; return { ...response, changes: [{ type: 'resync_required' }] };
+    }
+    return response;
+  };
+  const result = await discoverBounties({ ...f.options, ...optionsFrom(first) });
+  assert.deepEqual(f.reads, [retained.hash]); assert.equal(result.blocks.size, 600);
+  assert.equal(result.blocks.has(oldBlock.hash), false); assert.equal(result.window.blockCounts[oldBlock.hash], undefined);
+  assert.equal(result.blocks.get(retained.hash).length, 284);
+  assert.deepEqual(result.blocks.get(retained.hash).map(row => row.status), ['spent', 'pending_spend', ...Array(282).fill('available')]);
+  assert.ok(result.blocks.get(retained.hash).every(row => row.confirmations === 52));
+  assert.equal(Object.keys(result.window.blockCounts).length, 600);
+  assert.equal(result.window.blockCounts[retained.hash], 284);
+  assert.deepEqual(f.calls.filter(call => call.method === 'getrecentblockhashes').map(call => call.params), [{ include_bounty_counts: true }]);
+  assert.equal(f.calls[1].params.cursor, undefined); assert.equal(f.calls[1].params.known_tip, undefined);
+  assert.equal(f.calls[1].params.known_state, undefined);
+  assert.equal(f.calls.at(-1).method, 'getbountychanges'); assert.equal(f.calls.at(-1).params.cursor, '0');
+  assert.deepEqual(first.blocks, saved, 'No partial recovery mutates the caller catalog.');
+});
+
+test('a missing cursor cannot bind the old hash suffix or reuse old zero counts', async () => {
+  const f = fixture(), first = await discoverBounties(f.options), row = rowAt(f.current.blocks[2]);
+  f.rows.set(row.block_hash, [row]); f.calls.length = 0;
+  const result = await discoverBounties({ ...f.options, ...optionsFrom(first), cursor: null });
+  assert.equal(f.calls[0].params.known_tip, undefined); assert.equal(f.calls[0].params.known_state, undefined);
+  assert.deepEqual(f.reads, [row.block_hash]); assert.deepEqual(result.blocks.get(row.block_hash), [row]);
+  assert.equal(result.window.blockCounts[row.block_hash], 1);
+  assert.equal(first.window.blockCounts[row.block_hash], 0); assert.deepEqual(first.blocks.get(row.block_hash), []);
+});
+
+test('a same-tip reset still replays spending changes after its replacement stream', async () => {
+  const f = fixture(), row = rowAt(f.current.blocks[2]); f.rows.set(row.block_hash, [row]);
+  const first = await discoverBounties(f.options); f.calls.length = 0; f.reads.length = 0;
+  let reset = false;
+  f.before = () => { if (!reset) { reset = true; throw Object.assign(new Error('Reset'), { code: -32011 }); } };
+  const spent = { ...row, status: 'spent', spending_txid: hash(901) };
+  f.afterRead = () => { f.pages.push([eventAt(spent, 1, f.current.tip, 'spent')]); };
+  const result = await discoverBounties({ ...f.options, ...optionsFrom(first) });
+  assert.equal(result.cursor, '1'); assert.deepEqual(result.blocks.get(row.block_hash), [spent]);
+  assert.deepEqual(f.reads, [row.block_hash]); assert.ok(f.invalidations.some(value => value.txid === row.txid));
+  assert.deepEqual(first.blocks.get(row.block_hash), [row]);
+});
+
+for (const race of ['new-block', 'reorg', 'rollback']) test(`a ${race} during the reset manifest preserves canonical counts and the final replay fence`, async () => {
+  const f = fixture(), oldRow = rowAt(f.current.blocks[0]), retained = rowAt(f.current.blocks[50], 700, 2);
+  f.rows.set(oldRow.block_hash, [oldRow]); f.rows.set(retained.block_hash, [retained]);
+  const first = await discoverBounties(f.options); f.calls.length = 0; f.reads.length = 0;
+  let reset = false, raced = false, newRow;
+  f.before = () => { if (!reset) { reset = true; throw Object.assign(new Error('Reset'), { code: -32011 }); } };
+  f.after = (method, params, response) => {
+    if (method === 'getrecentblockhashes' && !raced) {
+      raced = true;
+      if (race === 'new-block') f.current = windowAt(701);
+      else if (race === 'reorg') {
+        f.current = windowAt(); f.current.tip.hash = hash(99999); f.current.blocks[0].hash = f.current.tip.hash;
+      } else f.current = windowAt(699);
+      const block = race === 'rollback' ? f.current.blocks.at(-1) : f.current.blocks[0];
+      newRow = rowAt(block, f.current.tip.height, 3); f.rows.set(block.hash, [newRow]);
+      f.pages.push([eventAt(newRow, 1, f.current.tip, 'added')]);
+    }
+    return response;
+  };
+  const result = await discoverBounties({ ...f.options, ...optionsFrom(first) });
+  assert.deepEqual(result.tip, f.current.tip); assert.equal(result.cursor, '1');
+  assert.deepEqual(result.blocks.get(newRow.block_hash), [newRow]);
+  assert.equal(result.blocks.size, 600); assert.equal(Object.keys(result.window.blockCounts).length, 600);
+  assert.ok(f.reads.every(blockHash => (f.rows.get(blockHash) ?? []).length > 0), 'No empty streams may be inferred from a lost manifest.');
+  assert.equal(f.calls.at(-1).method, 'getbountychanges'); assert.equal(f.calls.at(-1).params.cursor, '1');
+  assert.equal(f.calls.filter(call => call.method === 'getrecentblockhashes')[0].params.count, undefined);
+  if (race !== 'new-block') {
+    assert.equal(result.blocks.has(oldRow.block_hash), false); assert.equal(result.window.blockCounts[oldRow.block_hash], undefined);
+    assert.ok(f.invalidations.some(value => value.txid === oldRow.txid));
+  }
+  assert.deepEqual(first.blocks.get(oldRow.block_hash), [oldRow]);
+});
+
+test('a manifest already newer than the reset watermark retains its full counts through replay', async () => {
+  const f = fixture(), row = rowAt(f.current.blocks[50]); f.rows.set(row.block_hash, [row]);
+  const first = await discoverBounties(f.options); f.calls.length = 0; f.reads.length = 0;
+  let reset = false, advanced = false, added;
+  f.before = method => {
+    if (!reset) { reset = true; throw Object.assign(new Error('Reset'), { code: -32011 }); }
+    if (method === 'getrecentblockhashes' && !advanced) {
+      advanced = true; f.current = windowAt(701); added = rowAt(f.current.blocks[0], 701, 2); f.rows.set(added.block_hash, [added]);
+      f.pages.push([eventAt(added, 1, f.current.tip, 'added')]);
+    }
+  };
+  const result = await discoverBounties({ ...f.options, ...optionsFrom(first) });
+  assert.deepEqual(result.tip, f.current.tip); assert.equal(result.cursor, '1'); assert.equal(Object.keys(result.window.blockCounts).length, 600);
+  assert.deepEqual(f.reads, [row.block_hash, added.block_hash]); assert.deepEqual(result.blocks.get(added.block_hash), [added]);
+  assert.equal(f.calls[1].params.known_tip, undefined);
+  assert.deepEqual(f.calls.filter(call => call.method === 'getrecentblockhashes').map(call => call.params.count), [undefined, 5]);
+  assert.equal(f.calls.at(-1).method, 'getbountychanges');
+});
+
+test('a reset can recover a complete disjoint window without requiring an obsolete ancestor', async () => {
+  const f = fixture(), first = await discoverBounties(f.options); f.calls.length = 0;
+  f.current = windowAt(1400); const row = rowAt(f.current.blocks[20], 1400); f.rows.set(row.block_hash, [row]);
+  let reset = false;
+  f.before = () => { if (!reset) { reset = true; throw Object.assign(new Error('Reset'), { code: -32011 }); } };
+  const result = await discoverBounties({ ...f.options, ...optionsFrom(first) });
+  assert.deepEqual(result.tip, f.current.tip); assert.deepEqual(f.reads, [row.block_hash]);
+  assert.deepEqual(result.blocks.get(row.block_hash), [row]); assert.equal(Object.keys(result.window.blockCounts).length, 600);
+  assert.equal(f.calls.filter(call => call.method === 'getrecentblockhashes').length, 1);
+  assert.equal(result.blocks.has(first.tip.hash), false);
+});
+
+test('epoch cancellation during the reset manifest stops streams and publication', async () => {
+  const f = fixture(), first = await discoverBounties(f.options); f.calls.length = 0;
+  let reset = false, cancelled = false;
+  f.before = () => { if (!reset) { reset = true; throw Object.assign(new Error('Reset'), { code: -32011 }); } };
+  f.after = (method, params, response) => { if (method === 'getrecentblockhashes') cancelled = true; return response; };
+  await assert.rejects(discoverBounties({ ...f.options, ...optionsFrom(first),
+    check: () => { if (cancelled) throw Object.assign(new Error('Epoch changed'), { name: 'AbortError' }); },
+  }), { name: 'AbortError' });
+  assert.deepEqual(f.reads, []); assert.equal(f.calls.at(-1).method, 'getrecentblockhashes');
+  assert.equal(first.cursor, '0'); assert.equal(first.blocks.size, 600);
+});
+
+for (const count of [0, 2]) test(`fresh reset count ${count} still rejects a contradictory complete stream or journal row`, async () => {
+  const f = fixture(), first = await discoverBounties(f.options), row = rowAt(f.current.blocks[2]);
+  f.rows.set(row.block_hash, [row]); f.calls.length = 0;
+  let reset = false, manifest = false;
+  f.before = () => { if (!reset) { reset = true; throw Object.assign(new Error('Reset'), { code: -32011 }); } };
+  f.after = (method, params, response) => {
+    if (method === 'getrecentblockhashes') {
+      manifest = true; response.blocks.find(block => block.hash === row.block_hash).bounty_count = count;
+    } else if (manifest && count === 0) {
+      // A zero may avoid its stream, but cannot conceal a later contradictory
+      // row from the mandatory journal replay fence.
+      return { tip: f.current.tip, next_cursor: '1', has_more: false, bounty_deltas: 1,
+        changes: [eventAt(row, 1, f.current.tip, 'added')] };
+    }
+    return response;
+  };
+  await assert.rejects(discoverBounties({ ...f.options, ...optionsFrom(first) }), /empty block|immutable block count/);
+  assert.equal(first.window.blockCounts[row.block_hash], 0); assert.deepEqual(first.blocks.get(row.block_hash), []);
+});
+
+for (const legacy of ['missing', 'reject']) test(`a reset on an RPC with ${legacy} count support still loads every unknown-count block`, async () => {
+  const f = fixture(), first = await discoverBounties(f.options), row = rowAt(f.current.blocks[2]);
+  f.rows.set(row.block_hash, [row]); f.calls.length = 0;
+  let reset = false;
+  f.before = (method, params) => {
+    if (!reset) { reset = true; throw Object.assign(new Error('Reset'), { code: -32011 }); }
+    if (legacy === 'reject' && method === 'getrecentblockhashes' && params.include_bounty_counts) throw Object.assign(new Error('Unsupported'), { code: -32602 });
+  };
+  f.after = (method, params, response) => {
+    if (method === 'getrecentblockhashes') { delete response.bounty_counts; for (const block of response.blocks) delete block.bounty_count; }
+    return response;
+  };
+  const result = await discoverBounties({ ...f.options, ...optionsFrom(first) });
+  assert.equal(f.reads.length, 600); assert.deepEqual(result.blocks.get(row.block_hash), [row]);
+  assert.equal(result.window.blockCounts, undefined);
+  assert.equal(f.calls.filter(call => call.method === 'getrecentblockhashes').length, legacy === 'reject' ? 2 : 1);
+  assert.equal(f.calls.at(-1).method, 'getbountychanges');
+});
+
+const invalidResetManifest = {
+  short: page => { page.blocks.pop(); },
+  missing_capability: page => { delete page.bounty_counts; },
+  invalid_count: page => { page.blocks[100].bounty_count = -1; },
+  old_same_hash_time: page => { page.tip.mediantime++; },
+  same_hash_ancestry: page => { page.blocks[100].hash = hash(99999); },
+  same_hash_height: page => { const a = page.blocks[100].hash; page.blocks[100].hash = page.blocks[101].hash; page.blocks[101].hash = a; },
+};
+for (const [kind, mutate] of Object.entries(invalidResetManifest)) test(`reset manifest ${kind} fails closed without a weaker fallback or partial publication`, async () => {
+  const f = fixture(), first = await discoverBounties(f.options); f.calls.length = 0;
+  let reset = false;
+  f.before = () => { if (!reset) { reset = true; throw Object.assign(new Error('Reset'), { code: -32011 }); } };
+  f.after = (method, params, response) => { if (method === 'getrecentblockhashes') mutate(response); return response; };
+  await assert.rejects(discoverBounties({ ...f.options, ...optionsFrom(first) }));
+  assert.equal(f.calls.filter(call => call.method === 'getrecentblockhashes').length, 1); assert.deepEqual(f.reads, []);
+  assert.equal(first.cursor, '0'); assert.equal(Object.keys(first.window.blockCounts).length, 600);
 });
 
 const hiddenFailures = {

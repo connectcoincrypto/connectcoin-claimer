@@ -417,7 +417,16 @@ export async function discoverBounties({ rpc, network, lookback = 600, previous 
     const resetError = error => error instanceof RescanRequired || [-32004, -32011].includes(error.code);
     const readWindow = async (expectedTip, inline) => {
       if (!snapshot || !sameTip(snapshot.tip, expectedTip)) {
-        snapshot = inline?.window ?? await refreshRecentWindow(query, snapshot ?? knownWindow, network);
+        // A revoked/missing cursor also revokes all cached count authority. A
+        // retained hash anchor or a short journal suffix cannot replace the
+        // complete current count manifest needed to rebuild the snapshot.
+        const rebuilding = !snapshot;
+        snapshot = snapshot
+          ? inline?.window ?? await refreshRecentWindow(query, snapshot, network)
+          : await refreshRecentWindow(query, null, network);
+        // Check the retained hash/height ancestry, but do not merge its revoked
+        // counts into the new manifest (including when the hash is unchanged).
+        if (rebuilding && knownWindow) joinRecentWindow(snapshot, validatedWindow(knownWindow, network), network);
         // A racing response may have a different tip, but the same hash must
         // never contradict the triggering journal/fence's header metadata.
         sameTip(expectedTip, snapshot.tip);
@@ -457,7 +466,9 @@ export async function discoverBounties({ rpc, network, lookback = 600, previous 
       if (journalPages >= MAX_JOURNAL_PAGES) throw new DiscoveryBudgetExceeded('Bounty journal work budget reached.');
       const from = cursor;
       const params = from ? { cursor: from } : {};
-      let page, inline, base = requestDeltas && requestBlocks ? snapshot ?? knownWindow : null;
+      // Only a complete, cursor-backed snapshot may bind a compact response.
+      // After a reset knownWindow retains hashes, never authoritative counts.
+      let page, inline, base = requestDeltas && requestBlocks ? snapshot : null;
       const validatePage = value => {
         validateTip(value?.tip, network);
         if (!cursorValid(value.next_cursor) || typeof value.has_more !== 'boolean' || !Array.isArray(value.changes) || value.changes.length > 10000 ||
@@ -666,9 +677,10 @@ export async function discoverBounties({ rpc, network, lookback = 600, previous 
       if (!resetError(error)) throw error;
       check(); await onReset({ reason: error instanceof DiscoveryBudgetExceeded ? 'work-budget' : error.code === -32004 ? 'data-unavailable' : error.code === -32011 ? 'cursor-invalid' : 'journal-reset',
         ...([-32004, -32011].includes(error.code) ? { code: error.code } : {}) });
-      // A reset invalidates all bounty state and the cursor, not block hashes.
-      // Retain only the hash anchor, requiring a fresh prefix even for an ABA
-      // reorg to the same tip, and reload every required bounty stream.
+      // Retain only the hash anchor for contradictory-header checks. Rebuild
+      // from a complete current manifest, including fresh acknowledged counts,
+      // even at the same tip. Stream every positive/unknown-count block and
+      // replay the journal fence; never reuse counts from before the reset.
       check(); cached = new Map(); cachedWindow = null; cursor = null;
       if (knownWindow) knownWindow = validatedWindow(knownWindow, network);
     }

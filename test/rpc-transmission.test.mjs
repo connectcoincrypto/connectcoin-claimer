@@ -201,9 +201,13 @@ test('a cooldown changed by a final fence spends no quota and requires a new fen
 test('after-write loss and timeout stay unknown and diagnostics distinguish their origin', async t => {
   for (const mode of ['socket-close', 'request-timeout', 'socket-write', 'client-close']) {
     await t.test(mode, async t => {
-      const f = await fixture(t, (_request, socket) => { if (mode === 'socket-close') socket.destroy(); }, { timeoutMs: 100 });
+      const f = await fixture(t, (_request, socket) => { if (mode === 'socket-close') socket.destroy(); }, { timeoutMs: 5000 });
+      // Establish the fixture before testing an after-write failure. A short
+      // connection deadline can legitimately fail before transmission under
+      // CPU contention, which is a different (notSent) case covered above.
+      await f.client.connect();
+      if (mode === 'request-timeout') f.client.timeoutMs = 100;
       if (mode === 'socket-write') {
-        await f.client.connect();
         t.mock.method(f.client.socket, 'write', () => { throw new Error('Synchronous write failure'); });
       }
       const pending = observed(f.client.request('sendrawtransaction', { transaction_hex: transaction }));

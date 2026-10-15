@@ -116,7 +116,7 @@ test('a rollback before a 600-block history exists can reuse the cached genesis 
 });
 
 for (const height of [0, 1, 3, 4, 5]) {
-  test(`count=5 accepts the exact genesis-bounded length at height ${height}`, async () => {
+  test(`${height === 0 ? 'reset manifest' : 'count=5'} accepts the exact genesis-bounded length at height ${height}`, async () => {
     const f = fixture(makeWindow(Math.max(0, height - 1))), previous = f.warm();
     // At genesis, a journal reset forces revalidation even with an unchanged tip.
     f.current = makeWindow(height);
@@ -124,7 +124,7 @@ for (const height of [0, 1, 3, 4, 5]) {
       if (method === 'getbountychanges' && count === 1) throw Object.assign(new Error('expired cursor'), { code: -32011 });
     };
     const result = await discoverBounties({ ...f.options, ...previous });
-    assert.deepEqual(f.counts(), [5]);
+    assert.deepEqual(f.counts(), [height === 0 ? 600 : 5]);
     assertComplete(result, f.current);
     assert.equal(result.window.blocks.at(-1).hash, GENESIS.main);
   });
@@ -227,7 +227,7 @@ test('a tip change between the five and hundred responses never mixes their bran
   assert.equal(f.published.some(window => window.blocks.some(block => first.blocks.slice(0, 10).some(old => old.hash === block.hash))), false);
 });
 
-test('a journal reset retains hash anchors but re-reads every bounty stream after an ABA tip', async () => {
+test('a journal reset obtains a full manifest and unknown-count streams after an ABA tip', async () => {
   const f = fixture(), item = bounty(f.current.blocks[10]); f.rows.set(item.block_hash, [item]);
   const previous = f.warm(); let resetSent = false;
   f.rows.set(item.block_hash, [{ ...item, status: 'spent' }]);
@@ -240,8 +240,7 @@ test('a journal reset retains hash anchors but re-reads every bounty stream afte
   };
   const result = await discoverBounties({ ...f.options, ...previous });
   assertComplete(result, f.current);
-  assert.ok(f.counts().every(count => count === 5));
-  assert.ok(f.counts().length >= 1, 'An unchanged tip after a journal reset still requires a fresh hash query.');
+  assert.deepEqual(f.counts(), [600], 'An unchanged tip after a journal reset still requires a complete fresh manifest.');
   assert.equal(f.resets.length, 1);
   assert.equal(f.reads.length, 600, 'Hash reuse must never become bounty-state reuse after reset.');
   assert.equal(new Set(f.reads).size, 600);

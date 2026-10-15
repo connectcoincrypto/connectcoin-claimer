@@ -170,7 +170,9 @@ test('v2 journal reset discards old request bindings before rebuilding a complet
   f.before = () => { if (first) { first = false; throw Object.assign(new Error('Cursor reset'), { code: -32011 }); } };
   const result = await discoverBounties({ ...f.options, ...f.warm() });
   assert.equal(result.blocks.size, 600); assert.equal(f.calls[1].params.cursor, undefined);
-  assert.equal(f.calls[1].params.known_state, undefined); assert.ok(f.resets.length);
+  assert.equal(f.calls[1].params.known_state, undefined); assert.equal(f.calls[1].params.known_tip, undefined); assert.ok(f.resets.length);
+  assert.deepEqual(f.calls.filter(call => call.method === 'getrecentblockhashes').map(call => call.params), [{ include_bounty_counts: true }]);
+  assert.equal(Object.keys(result.window.blockCounts).length, 600); assert.deepEqual(f.reads, []);
 });
 
 test('v2 parameter fallback retries the same cursor and is remembered only in supplied epoch capabilities', async () => {

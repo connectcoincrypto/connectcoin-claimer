@@ -144,8 +144,14 @@ working directory. Source runs default to `./claimer.conf`.
   ancestry is rejected, and a rollback that lacks the oldest required blocks
   also escalates. Each response is reconciled independently, never joined to
   another partial response from a different tip. Journal resets discard all
-  cached bounty state and reload the block streams; only validated hashes may
-  remain as anchors for a fresh query. Startup without a cache and RPC reconnects
+  cached bounty state and count authority, then obtain a complete current,
+  validated hash/count manifest after a new journal watermark. Retained hashes
+  only check consistency; old counts or a short suffix cannot replace that
+  manifest. Fresh acknowledged zero counts avoid empty streams; positive or
+  unknown counts still require complete block streams and journal replay. RPCs
+  without count support retain the full-stream fallback. This complete manifest
+  is for initialization/reset recovery, not every ordinary new block.
+  Startup without a cache and RPC reconnects
   fetch the full hash list; reconnects retain the existing cursor and block
   contents for incremental recovery when that cursor remains valid. The RPC
   server must support the optional `getrecentblockhashes` `count` parameter for
