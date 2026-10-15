@@ -111,8 +111,11 @@ working directory. Source runs default to `./claimer.conf`.
   reuses the cursor and block cache rather than redownloading every block.
   The validated canonical hash list is also cached: an unchanged tip requires
   no `getrecentblockhashes` download. Discovery still replays all journal pages
-  (including mempool changes), then checks a small `getchaintip` response before
-  publication. A changed tip, including a same-height reorganization, requests
+  (including mempool changes). The last complete page supplies an atomic
+  tip-and-cursor fence; any later hash or block read requires another replay
+  before publication. An unchanged warm cycle therefore needs one journal
+  request, without a redundant second poll or `getchaintip` request.
+  A changed tip not covered by an inline block delta, including a same-height reorganization, requests
   the latest 5 hashes, then 100, then 600 as needed to find a matching cached
   hash **and height** and reconstruct the complete window. Contradictory
   ancestry is rejected, and a rollback that lacks the oldest required blocks
@@ -268,12 +271,25 @@ After the initial bounded snapshot, the claimer requests
 complete changed bounty and its publication tip, not the other bounties from
 its block. Cached rows are replaced only after validating the full payload,
 immutable identity, canonical block, status, spender and pagination fences.
-New blocks still require a complete initial stream; ordinary status updates
-to already loaded blocks do not. Confirmation counts advance with the tip.
+With a validated cached window the request also includes `known_tip` (height
+and hash). A server advertising `block_deltas: 1` may return up to five new,
+contiguous block hashes and their authoritative total P2C bounty counts in the
+same indexed publication. Only an explicit zero count permits installing an
+empty block without a stream; missing counts, unsupported extensions, gaps
+and reorganizations never imply emptiness. A positive count still requires a
+complete initial stream and subsequent journal replay. Ordinary status updates
+to already loaded blocks do not reread them. Confirmation counts advance with
+the published tip. Authoritative totals remain attached to the immutable local
+window across pages and cycles: later rows and complete streams must agree
+with them. Reorganizations discard displaced counts; journal resets discard
+all count authority before rebuilding the catalog.
 
 Journal gaps, reorganizations and inconsistent snapshots still trigger the
 existing coherent resynchronization. Older servers fall back to block reads
-without skipping their journal cursor. Cached state is published atomically:
+without skipping their journal cursor: parameter rejection first retries
+without `known_tip`, retaining bounty deltas, then negotiates the legacy
+schema if necessary. Malformed data and transport errors never negotiate
+compatibility. Cached state is published atomically:
 a failed page cannot consume its cursor or partially install updates.
 
 ## Shutdown, crash recovery and uncertain broadcasts

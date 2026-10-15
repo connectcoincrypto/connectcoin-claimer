@@ -71,7 +71,8 @@ test('many same-block updates use row-sized traffic and zero block rereads', asy
     }
     assert.equal(f.reads.length, deltas ? 0 : 20);
     assert.equal(f.count('getrecentblockhashes'), 0);
-    assert.equal(f.count('getbountychanges'), 40);
+    assert.equal(f.count('getbountychanges'), deltas ? 20 : 40);
+    assert.equal(f.count('getchaintip'), 0);
     totals.push(f.bytes);
   }
   assert.ok(totals[1] < totals[0] / 100, 'Incremental traffic must be proportional to changed rows, not the 4,000-row block.');
@@ -90,7 +91,7 @@ test('ordered delta pages apply final publication rows and preserve the old publ
   assert.deepEqual(original, [a, b]);
   assert.notStrictEqual(result.blocks.get(a.block_hash), original);
   assert.equal(result.cursor, '3'); assert.deepEqual(f.reads, []);
-  assert.deepEqual(f.calls.filter(call => call.method === 'getbountychanges').map(call => call.params.cursor), ['0', '1', '2', '3']);
+  assert.deepEqual(f.calls.filter(call => call.method === 'getbountychanges').map(call => call.params.cursor), ['0', '1', '2']);
   assert.deepEqual(f.invalidations.map(value => value.reason), ['pending_spend', 'spent']);
 });
 
@@ -241,8 +242,24 @@ test('legacy parameter rejection retries the exact cursor and retains whole-bloc
   };
   const result = await discoverBounties({ ...f.options, ...previous });
   assert.deepEqual(f.calls.filter(call => call.method === 'getbountychanges').map(call => call.params),
-    [{ cursor: '0', include_bounties: true }, { cursor: '0' }, { cursor: '1' }]);
+    [{ cursor: '0', include_bounties: true, known_tip: { height: 700, hash: f.current.tip.hash } },
+      { cursor: '0', include_bounties: true }, { cursor: '0' }, { cursor: '1' }]);
   assert.deepEqual(f.reads, [row.block_hash]); assert.deepEqual(result.blocks.get(row.block_hash), [pending]);
+});
+
+test('known-tip rejection preserves full bounty deltas and retries the same cursor without block reload', async () => {
+  const f = fixture(), row = bountyAt(f.current.blocks[2]), previous = f.warm();
+  const pending = { ...row, status: 'pending_spend', spending_txid: hash(900) };
+  f.queued.push([changed(pending, 1, f.current.tip)]);
+  f.hook = (method, count, params) => {
+    if (params.known_tip) throw Object.assign(new Error('Old optional schema'), { code: -32602 });
+  };
+  const result = await discoverBounties({ ...f.options, ...previous });
+  assert.deepEqual(result.blocks.get(row.block_hash), [pending]); assert.deepEqual(f.reads, []);
+  assert.deepEqual(f.calls.map(call => call.params), [
+    { cursor: '0', include_bounties: true, known_tip: { height: 700, hash: f.current.tip.hash } },
+    { cursor: '0', include_bounties: true },
+  ]);
 });
 
 for (const code of [-32001, -32002, -32601, 'ECONNRESET']) test(`real RPC failure ${code} never falls back to legacy`, async () => {
@@ -272,7 +289,7 @@ test('a rollback between journal and hash reads resets before applying displaced
 test('a journal reset revokes delta staging before a fresh stream failure', async () => {
   const f = fixture(), row = bountyAt(f.current.blocks[2]); f.rows.set(row.block_hash, [row]);
   const previous = f.warm(), pending = { ...row, status: 'pending_spend', spending_txid: hash(900) };
-  f.queued.push([changed(pending, 1, f.current.tip)]);
+  f.queued.push([changed(pending, 1, f.current.tip)], []);
   f.hook = (method, count) => {
     if (method === 'getbountychanges' && count === 2) throw Object.assign(new Error('Reset'), { code: -32011 });
     if (method === 'getblockbounties') { assert.equal(f.resets.length, 1); throw new Error('Stream failed'); }

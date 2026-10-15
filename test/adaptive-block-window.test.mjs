@@ -72,7 +72,7 @@ test('a new tip downloads five hashes and stitches the full cached tail', async 
   assert.deepEqual(f.counts(), [5]);
   assertComplete(result, f.current);
   assert.deepEqual(f.reads, [f.current.tip.hash]);
-  assert.equal(f.calls.at(-1).method, 'getchaintip');
+  assert.equal(f.calls.at(-1).method, 'getbountychanges');
 });
 
 for (const [depth, expected] of [[3, [5]], [4, [5]], [5, [5, 100]], [99, [5, 100]], [100, [5, 100, 600]], [450, [5, 100, 600]]]) {

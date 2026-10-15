@@ -61,17 +61,18 @@ function fixture(initial = makeWindow()) {
   };
 }
 
-test('cold discovery downloads one complete window and closes with the lightweight tip', async t => {
+test('cold discovery downloads one complete window and closes with a post-stream journal fence', async t => {
   const f = fixture(), oldWindowBytes = Buffer.byteLength(JSON.stringify(f.current));
   const result = await discoverBounties(f.options);
   assert.equal(f.count('getrecentblockhashes'), 1);
-  assert.equal(f.count('getchaintip'), 1);
+  assert.equal(f.count('getchaintip'), 0);
+  assert.equal(f.count('getbountychanges'), 2);
   assert.equal(f.reads.length, 600);
   assert.deepEqual(result.window, f.current);
   assert.equal(result.blocks.size, 600);
   assert.ok(f.bytes < 2 * oldWindowBytes * 0.55, 'One full window plus small fences should roughly halve cold metadata traffic.');
   assert.equal(f.calls[0].method, 'getbountychanges', 'The pre-transfer watermark remains mandatory.');
-  assert.equal(f.calls.at(-1).method, 'getchaintip');
+  assert.equal(f.calls.at(-1).method, 'getbountychanges');
   t.diagnostic(`Metadata bytes: full window=${oldWindowBytes}, old two-window baseline=${2 * oldWindowBytes}, cold optimized=${f.bytes}.`);
 });
 
@@ -79,8 +80,8 @@ test('an unchanged validated window downloads no block list or block streams on 
   const f = fixture(), previous = f.warm(), oldWindowBytes = Buffer.byteLength(JSON.stringify(f.current));
   const result = await discoverBounties({ ...f.options, ...previous });
   assert.equal(f.count('getrecentblockhashes'), 0);
-  assert.equal(f.count('getchaintip'), 1);
-  assert.equal(f.count('getbountychanges'), 2, 'Cached hashes never replace journal replay.');
+  assert.equal(f.count('getchaintip'), 0);
+  assert.equal(f.count('getbountychanges'), 1, 'One complete page is a coherent tip+cursor fence.');
   assert.equal(f.reads.length, 0);
   assert.deepEqual(result.window, f.current);
   assert.ok(f.bytes < oldWindowBytes * 0.02, 'Warm RPC metadata should be small compared with one 600-block list.');
@@ -152,17 +153,18 @@ test('matching height and hash with contradictory median time fails closed', asy
   await assert.rejects(discoverBounties({ ...f.options, ...previous }), /inconsistent metadata/i);
 });
 
-for (const reorg of [false, true]) test(`a ${reorg ? 'reorg' : 'new block'} after journal replay is detected by the final tip fence`, async () => {
+for (const reorg of [false, true]) test(`a ${reorg ? 'reorg' : 'new block'} during block reads is detected by the replay fence`, async () => {
   const f = fixture(), previous = f.warm();
+  previous.previous.delete(f.current.blocks[2].hash);
   f.hook = (method, count) => {
-    if (method === 'getchaintip' && count === 1) {
+    if (method === 'getbountychanges' && count === 2) {
       f.current = reorg ? makeWindow(700, new Map([[700, hash(888800)]])) : makeWindow(701);
       const added = row(f.current.blocks[0]); f.rows.set(added.block_hash, [added]);
     }
   };
   const result = await discoverBounties({ ...f.options, ...previous });
   assert.equal(f.count('getrecentblockhashes'), 1);
-  assert.ok(f.count('getchaintip') >= 2, 'The replacement window needs its own final tip check.');
+  assert.equal(f.count('getchaintip'), 0, 'The final complete page supplies its own atomic tip.');
   assert.ok(f.count('getbountychanges') >= 3, 'Replay must continue after the replacement window is loaded.');
   assert.deepEqual(result.tip, f.current.tip);
   assert.equal(result.blocks.get(result.tip.hash).length, 1);
@@ -171,8 +173,8 @@ for (const reorg of [false, true]) test(`a ${reorg ? 'reorg' : 'new block'} afte
 test('a spent change arriving while a newly detected block is read is replayed before publication', async () => {
   const f = fixture(), bounty = row(f.current.blocks[1]); f.rows.set(bounty.block_hash, [bounty]);
   const previous = f.warm(); let changed = false, emitted = false;
+  f.current = makeWindow(701);
   f.hook = (method, count) => {
-    if (method === 'getchaintip' && count === 1) f.current = makeWindow(701);
     if (method === 'getbountychanges' && changed && !emitted) {
       emitted = true;
       return { tip: f.current.tip, next_cursor: 'spent-change', has_more: false,
@@ -230,10 +232,10 @@ for (const code of [-32004, -32011, 'resync_required']) test(`journal reset ${co
   assert.deepEqual(result.window, f.current);
 });
 
-for (const method of ['getbountychanges', 'getrecentblockhashes', 'getchaintip']) test(`a malformed ${method} tip still fails closed`, async () => {
+for (const method of ['getbountychanges', 'getrecentblockhashes', 'journal-replay']) test(`a malformed ${method} tip still fails closed`, async () => {
   const f = fixture();
-  f.hook = name => {
-    if (name !== method) return;
+  f.hook = (name, count) => {
+    if (method === 'journal-replay' ? name !== 'getbountychanges' || count !== 2 : name !== method) return;
     const tip = { ...f.current.tip, genesis_hash: hash(123) };
     if (name === 'getrecentblockhashes') return { ...f.current, tip };
     if (name === 'getbountychanges') return { tip, next_cursor: 'malformed', has_more: false, changes: [] };
@@ -350,7 +352,10 @@ test('a rollback to a lower chain height rejects displaced-tip rows as reorgs', 
 
 for (const field of ['mediantime', 'height']) test(`contradictory ${field} for the same hash at the final fence is rejected`, async () => {
   const f = fixture(), previous = f.warm();
-  f.hook = method => method === 'getchaintip' ? { ...f.current.tip, [field]: f.current.tip[field] + 1 } : undefined;
+  previous.previous.delete(f.current.blocks[2].hash);
+  f.hook = (method, count) => method === 'getbountychanges' && count === 2 ? {
+    tip: { ...f.current.tip, [field]: f.current.tip[field] + 1 }, next_cursor: 'bad-fence', has_more: false, changes: [],
+  } : undefined;
   await assert.rejects(discoverBounties({ ...f.options, ...previous }), /inconsistent metadata/i);
   assert.equal(previous.cursor, 'previous');
   assert.deepEqual(previous.previousWindow, f.current);

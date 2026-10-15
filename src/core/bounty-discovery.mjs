@@ -40,12 +40,34 @@ function windowFrom(response, network, lookback) {
   return response.blocks.slice(0, lookback);
 }
 
-function validatedWindow(response, network) {
+function validatedWindow(response, network, retainedCounts) {
   windowFrom(response, network, 600);
+  const counts = {}, canonical = new Set(response.blocks.map(block => block.hash));
+  if (retainedCounts !== undefined) {
+    if (!retainedCounts || Array.isArray(retainedCounts) || typeof retainedCounts !== 'object' ||
+        ![null, Object.prototype].includes(Object.getPrototypeOf(retainedCounts))) throw new Error('Invalid cached block counts.');
+    for (const hash of Reflect.ownKeys(retainedCounts)) {
+      const descriptor = Object.getOwnPropertyDescriptor(retainedCounts, hash);
+      if (typeof hash !== 'string' || !HASH.test(hash) || !canonical.has(hash) || !Object.hasOwn(descriptor, 'value') ||
+          !uint(descriptor.value, MAX_ROWS)) throw new Error('Invalid cached block count.');
+      counts[hash] = descriptor.value;
+    }
+  }
   // Only publish a complete, privately owned immutable snapshot. Callers must
   // retain it together with the processed journal cursor, never a partial read.
   return Object.freeze({ window: 600, tip: Object.freeze({ ...response.tip }),
-    blocks: Object.freeze(response.blocks.map(({ height, hash }) => Object.freeze({ height, hash }))) });
+    blocks: Object.freeze(response.blocks.map(({ height, hash }) => Object.freeze({ height, hash }))),
+    ...(Object.keys(counts).length ? { blockCounts: Object.freeze(counts) } : {}) });
+}
+
+function retainedBlockCounts(known, blocks, additions = []) {
+  const hashes = new Set(blocks.map(block => block.hash));
+  const counts = Object.fromEntries(Object.entries(known?.blockCounts ?? {}).filter(([hash]) => hashes.has(hash)));
+  for (const [hash, count] of additions) {
+    if (counts[hash] !== undefined && counts[hash] !== count) throw new Error('Inconsistent immutable block count.');
+    if (hashes.has(hash)) counts[hash] = count;
+  }
+  return counts;
 }
 
 function sameTip(left, right) {
@@ -74,14 +96,14 @@ function joinRecentWindow(response, known, network) {
     if (anchor >= 0 && knownHashes.has(block.height) && knownHashes.get(block.height) !== block.hash) throw new Error('Inconsistent recent-block ancestry.');
   }
   const size = Math.min(600, response.tip.height + 1);
-  if (response.blocks.length === size) return validatedWindow(response, network);
+  if (response.blocks.length === size) return validatedWindow(response, network, retainedBlockCounts(known, response.blocks));
   if (anchor < 0) return null;
   const anchorHeight = response.blocks[anchor].height;
   const blocks = [...response.blocks.slice(0, anchor), ...known.blocks.filter(block => block.height <= anchorHeight)].slice(0, size);
   // A rollback can find an anchor while still lacking the oldest required
   // blocks. Escalate rather than silently publishing an incomplete window.
   if (blocks.length !== size) return null;
-  return validatedWindow({ window: 600, tip: response.tip, blocks }, network);
+  return validatedWindow({ window: 600, tip: response.tip, blocks }, network, retainedBlockCounts(known, blocks));
 }
 
 async function refreshRecentWindow(query, known, network) {
@@ -103,6 +125,32 @@ async function refreshRecentWindow(query, known, network) {
     if (joined) return joined;
   }
   throw new Error('RPC did not provide the complete recent-block window.');
+}
+
+function validateBlockDelta(page, known, network) {
+  if (page.block_deltas === undefined) {
+    if (Object.hasOwn(page, 'block_delta')) throw new Error('Invalid block delta capability.');
+    return null;
+  }
+  if (page.block_deltas !== 1 || page.bounty_deltas !== 1 || !known || !Object.hasOwn(page, 'block_delta')) throw new Error('Invalid block delta capability.');
+  const delta = page.block_delta;
+  if (delta === null) {
+    if (sameTip(known.tip, page.tip)) throw new Error('Missing canonical block delta.');
+    return null;
+  }
+  if (!delta || Array.isArray(delta) || delta.base_height !== known.tip.height || delta.base_hash !== known.tip.hash ||
+      !Array.isArray(delta.blocks) || delta.blocks.length > 5 || delta.blocks.length !== page.tip.height - known.tip.height) throw new Error('Invalid block delta base or sequence.');
+  sameTip(known.tip, page.tip);
+  const counts = new Map(), hashes = new Set(known.blocks.map(block => block.hash));
+  for (const [index, block] of delta.blocks.entries()) {
+    if (!block || Array.isArray(block) || block.height !== known.tip.height + index + 1 ||
+        typeof block.hash !== 'string' || !HASH.test(block.hash) || hashes.has(block.hash) ||
+        !uint(block.bounty_count, MAX_ROWS)) throw new Error('Invalid block delta metadata.');
+    hashes.add(block.hash); counts.set(block.hash, block.bounty_count);
+  }
+  const blocks = [...delta.blocks.slice().reverse(), ...known.blocks].slice(0, Math.min(600, page.tip.height + 1));
+  const window = validatedWindow({ window: 600, tip: page.tip, blocks }, network, retainedBlockCounts(known, blocks, counts));
+  return { window, counts };
 }
 
 function validateBountyRow(row, tip, hash, height, delta = false) {
@@ -141,22 +189,32 @@ export async function readBountyBlock({ rpc, network, hash, height, check = () =
 export async function discoverBounties({ rpc, network, lookback = 600, previous = new Map(), previousWindow = null, cursor = null, check = () => {}, onInvalidate = () => {}, onWindow = () => {}, onReset = async () => {}, readBlock }) {
   if (!Number.isInteger(lookback) || lookback < 1 || lookback > 600) throw new Error('Invalid bounty lookback.');
   let cached = new Map(previous);
-  let knownWindow = previousWindow ? validatedWindow(previousWindow, network) : null;
+  // blockCounts is local snapshot metadata, explicitly copied from our prior
+  // publication. Raw getrecentblockhashes extras never confer count authority.
+  let knownWindow = previousWindow ? validatedWindow(previousWindow, network, previousWindow.blockCounts) : null;
   let cachedWindow = cursor ? knownWindow : null;
-  let requestDeltas = true;
+  let requestDeltas = true, requestBlocks = true;
   if (!cursor) { check(); await onReset({ reason: 'initial' }); check(); cached = new Map(); }
   for (let restart = 0; restart < 4; restart++) {
     check();
     const staged = new Map(cached), dirty = new Set(), deltaBlocks = new Map();
+    const expectedCounts = new Map(Object.entries(cachedWindow?.blockCounts ?? {}));
     const budget = { count: 0, limit: MAX_ROWS };
-    for (const rows of staged.values()) { budget.count += rows.length; if (budget.count > MAX_ROWS) throw new Error('Recent bounty data exceeds the wallet resource limit.'); }
-    let wanted = [], desired = new Set(), snapshot = cachedWindow, journalPages = 0, lastSequence = -1;
-    const query = async (method, params = {}) => { check(); const value = await rpc.request(method, params); check(); validateTip(value?.tip, network); return value; };
-    const currentTip = async () => { check(); const value = await rpc.request('getchaintip'); check(); return validateTip(value, network); };
+    for (const [hash, rows] of staged) {
+      if (expectedCounts.has(hash) && rows.length !== expectedCounts.get(hash)) throw new Error('Cached bounty block contradicts its immutable count.');
+      budget.count += rows.length; if (budget.count > MAX_ROWS) throw new Error('Recent bounty data exceeds the wallet resource limit.');
+    }
+    let wanted = [], desired = new Set(), snapshot = cachedWindow, journalPages = 0, lastSequence = -1, readsSincePage = true;
+    const pageBlocks = new WeakMap();
+    const query = async (method, params = {}) => {
+      check();
+      if (method === 'getrecentblockhashes') readsSincePage = true;
+      const value = await rpc.request(method, params); check(); validateTip(value?.tip, network); return value;
+    };
     const resetError = error => error instanceof RescanRequired || [-32004, -32011].includes(error.code);
-    const readWindow = async expectedTip => {
+    const readWindow = async (expectedTip, inline) => {
       if (!snapshot || !sameTip(snapshot.tip, expectedTip)) {
-        snapshot = await refreshRecentWindow(query, snapshot ?? knownWindow, network);
+        snapshot = inline?.window ?? await refreshRecentWindow(query, snapshot ?? knownWindow, network);
         // A racing response may have a different tip, but the same hash must
         // never contradict the triggering journal/fence's header metadata.
         sameTip(expectedTip, snapshot.tip);
@@ -165,6 +223,12 @@ export async function discoverBounties({ rpc, network, lookback = 600, previous 
       wanted = windowFrom(snapshot, network, lookback); desired = new Set(wanted.map(block => block.hash));
       onWindow(snapshot);
       const canonical = new Map(snapshot.blocks.map(block => [block.height, block.hash]));
+      const canonicalHashes = new Set(canonical.values());
+      for (const hash of expectedCounts.keys()) if (!canonicalHashes.has(hash)) expectedCounts.delete(hash);
+      for (const [hash, count] of Object.entries(snapshot.blockCounts ?? {})) {
+        if (expectedCounts.has(hash) && expectedCounts.get(hash) !== count) throw new Error('Inconsistent immutable block count.');
+        expectedCounts.set(hash, count);
+      }
       const oldest = snapshot.blocks.at(-1).height;
       for (const [hash, rows] of staged) if (!desired.has(hash)) {
         for (const row of rows) {
@@ -175,20 +239,32 @@ export async function discoverBounties({ rpc, network, lookback = 600, previous 
         }
         budget.count -= rows.length; staged.delete(hash); dirty.delete(hash); deltaBlocks.delete(hash);
       }
+      for (const [hash, count] of inline?.counts ?? []) if (count === 0 && desired.has(hash)) {
+        if (staged.get(hash)?.length || dirty.has(hash)) throw new Error('Inconsistent empty bounty block.');
+        // This zero covers every P2C row in the same authoritative index
+        // publication as the journal page, not just its available bounties.
+        if (!staged.has(hash)) staged.set(hash, []);
+      }
     };
     const changes = async () => {
       check();
       if (journalPages >= MAX_JOURNAL_PAGES) throw new DiscoveryBudgetExceeded('Bounty journal work budget reached.');
       const from = cursor;
       const params = from ? { cursor: from } : {};
-      let page;
-      try { page = await query('getbountychanges', requestDeltas ? { ...params, include_bounties: true } : params); }
-      catch (error) {
-        if (!requestDeltas || error.code !== -32602) throw error;
-        // Old servers reject the opt-in parameter. Retry this exact watermark;
-        // transport, cursor and backend errors never negotiate compatibility.
-        requestDeltas = false;
-        page = await query('getbountychanges', params);
+      let page, base = requestDeltas && requestBlocks ? snapshot ?? knownWindow : null;
+      for (;;) {
+        const expanded = requestDeltas ? { ...params, include_bounties: true } : params;
+        try {
+          page = await query('getbountychanges', base ? { ...expanded,
+            known_tip: { height: base.tip.height, hash: base.tip.hash } } : expanded);
+          break;
+        } catch (error) {
+          if (!requestDeltas || error.code !== -32602) throw error;
+          // Negotiate one optional extension at a time, at this exact cursor.
+          // Transport/backend failures are never compatibility signals.
+          if (base) { requestBlocks = false; base = null; }
+          else { requestDeltas = false; requestBlocks = false; }
+        }
       }
       journalPages++;
       if (!cursorValid(page.next_cursor) || typeof page.has_more !== 'boolean' || !Array.isArray(page.changes) || page.changes.length > 10000 || (page.has_more && !page.changes.length) || (page.changes.length && page.next_cursor === from)) throw new Error('Invalid or excessive bounty journal response.');
@@ -197,13 +273,19 @@ export async function discoverBounties({ rpc, network, lookback = 600, previous 
       if (page.changes.some(event => event?.type === 'resync_required')) throw new RescanRequired('Bounty journal requested a new snapshot.');
       if (page.bounty_deltas !== undefined && page.bounty_deltas !== 1) throw new Error('Invalid bounty delta capability.');
       if (page.bounty_deltas === undefined) requestDeltas = false;
+      const inline = validateBlockDelta(page, base, network);
+      if (base && page.block_deltas === undefined) requestBlocks = false;
+      if (inline) pageBlocks.set(page, inline);
       cursor = page.next_cursor;
+      // A complete page is itself an atomic tip+cursor fence. Hash/stream I/O
+      // after this response revokes it until another page has been replayed.
+      readsSincePage = false;
       return page;
     };
     const apply = async page => {
       // Expanded rows are checked against the current canonical window, while
       // their confirmations are checked against their original publication tip.
-      if (page.bounty_deltas === 1 && !sameTip(snapshot.tip, page.tip)) await readWindow(page.tip);
+      if (!sameTip(snapshot.tip, page.tip)) await readWindow(page.tip, pageBlocks.get(page));
       const canonical = page.bounty_deltas === 1 ? new Map(snapshot.blocks.map(block => [block.height, block.hash])) : null;
       const heights = page.bounty_deltas === 1 ? new Map(snapshot.blocks.map(block => [block.hash, block.height])) : null;
       // Most pages are empty or already identify the affected block. Only
@@ -236,6 +318,7 @@ export async function discoverBounties({ rpc, network, lookback = 600, previous 
           if (typeof row?.block_hash !== 'string' || !HASH.test(row.block_hash) ||
               (event.block_hash !== undefined && event.block_hash !== row.block_hash)) throw new Error('Invalid bounty delta identity.');
           validateBountyRow(row, event.tip, row.block_hash, heights.get(row.block_hash), true);
+          if (expectedCounts.get(row.block_hash) === 0) throw new Error('Bounty delta contradicts an empty block.');
           if (row.txid !== event.txid || row.vout !== event.vout) throw new Error('Invalid bounty delta identity.');
           // A reorg racing the page/window request must rescan, rather than
           // applying rows from a displaced block or advancing past them.
@@ -254,6 +337,7 @@ export async function discoverBounties({ rpc, network, lookback = 600, previous 
             const key = bountyKey(row), index = block.positions.get(key), existing = index === undefined ? undefined : block.rows[index];
             if (existing && IMMUTABLE_BOUNTY_FIELDS.some(field => existing[field] !== row[field])) throw new Error('Inconsistent immutable bounty metadata.');
             if (!existing) {
+              if (expectedCounts.has(row.block_hash) && block.rows.length >= expectedCounts.get(row.block_hash)) throw new Error('Bounty delta exceeds its immutable block count.');
               if (budget.count >= MAX_ROWS) throw new Error('Recent bounty data exceeds the wallet resource limit; no partial snapshot was applied.');
               budget.count++; block.positions.set(key, block.rows.length); block.rows.push(structuredClone(row));
               outpoints?.set(key, row.block_hash);
@@ -278,6 +362,7 @@ export async function discoverBounties({ rpc, network, lookback = 600, previous 
       // before new blocks can push them out of the recent window. Reverse only
       // the work queue; keep the validated window and journal order unchanged.
       const pending = wanted.filter(block => !staged.has(block.hash) || dirty.has(block.hash)).reverse();
+      if (pending.length) readsSincePage = true;
       let position = 0, failure;
       const current = () => { check(); if (failure) throw failure; };
       const workers = Array.from({ length: Math.min(4, pending.length) }, async () => {
@@ -287,6 +372,7 @@ export async function discoverBounties({ rpc, network, lookback = 600, previous 
           if (old) { budget.count -= old.length; staged.delete(block.hash); }
           try {
             const rows = await readBlock(block.hash, { height: block.height, check: current, budget });
+            if (expectedCounts.has(block.hash) && rows.length !== expectedCounts.get(block.hash)) throw new Error('Bounty stream contradicts its immutable block count.');
             current(); staged.set(block.hash, rows); dirty.delete(block.hash); deltaBlocks.delete(block.hash);
             for (const row of rows) if (row.status !== 'available') onInvalidate(row);
           } catch (error) { failure ??= error; throw error; }
@@ -300,18 +386,17 @@ export async function discoverBounties({ rpc, network, lookback = 600, previous 
       // Capture a watermark BEFORE streaming any blocks. Replay begins there,
       // not at the streams' final cursors, so changes during transfer cannot vanish.
       let page = await changes();
-      await readWindow(page.tip); await apply(page);
+      await readWindow(page.tip, pageBlocks.get(page)); await apply(page);
       while (page.has_more) { page = await changes(); await apply(page); }
       for (let pass = 0; pass < 32; pass++) {
         await loadDirty();
-        do { page = await changes(); await apply(page); } while (page.has_more);
-        if (dirty.size) continue;
-        // Mempool changes are replayed even when the chain tip stays unchanged.
-        // The final lightweight tip fence also catches a block/reorg arriving
-        // AFTER that replay. A changed tip refreshes the canonical window by
-        // anchoring a small prefix, escalating only when necessary.
-        const tip = await currentTip();
-        if (!sameTip(snapshot.tip, tip)) { await readWindow(tip); continue; }
+        if (readsSincePage) do { page = await changes(); await apply(page); } while (page.has_more);
+        if (dirty.size || readsSincePage) continue;
+        // All pages and any intervening hash/block reads are covered by this
+        // final page. Later server changes remain after its cursor for the next
+        // cycle; a second empty poll/tip request adds no stronger atomicity.
+        if (!sameTip(snapshot.tip, page.tip)) throw new RescanRequired('Bounty page and canonical window differ.');
+        const tip = snapshot.tip;
         if (wanted.some(block => !staged.has(block.hash))) continue;
         check();
         const outpoints = new Set();
@@ -340,6 +425,7 @@ export async function discoverBounties({ rpc, network, lookback = 600, previous 
       // Retain only the hash anchor, requiring a fresh prefix even for an ABA
       // reorg to the same tip, and reload every required bounty stream.
       check(); cached = new Map(); cachedWindow = null; cursor = null;
+      if (knownWindow) knownWindow = validatedWindow(knownWindow, network);
     }
   }
   // Every exhausted attempt already closed admission through onReset. Preserve

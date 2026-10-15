@@ -112,6 +112,39 @@ test('recent block count is an optional strict bounded integer without getters o
   assert.throws(() => validateRpcParams('getrecentblockhashes', { count: 5, limit: 5 }), /Unexpected/);
 });
 
+test('known tip requires bounty opt-in and an exact plain nested height/hash pair', () => {
+  for (const height of [0, 700, Number.MAX_SAFE_INTEGER]) {
+    const known_tip = { height, hash };
+    assert.deepEqual(validateRpcParams('getbountychanges', { include_bounties: true, known_tip }), { include_bounties: true, known_tip });
+  }
+  for (const known_tip of [null, [], {}, { height: 1 }, { hash }, { height: -1, hash },
+    { height: 1.5, hash }, { height: '1', hash }, { height: Infinity, hash },
+    { height: Number.MAX_SAFE_INTEGER + 1, hash }, { height: 1, hash: hash.toUpperCase() },
+    { height: 1, hash: [hash] }, { height: 1, hash, password: 'secret' },
+    Object.create({ height: 1, hash }), { height: 1, hash, [Symbol('secret')]: 'secret' },
+    { get height() { assert.fail('Nested height getter ran'); }, hash },
+    { height: 1, get hash() { assert.fail('Nested hash getter ran'); } }]) {
+    assert.throws(() => validateRpcParams('getbountychanges', { include_bounties: true, known_tip }), /Invalid RPC known tip/);
+  }
+  for (const include_bounties of [false, undefined]) {
+    const params = { known_tip: { height: 1, hash }, ...(include_bounties === undefined ? {} : { include_bounties }) };
+    assert.throws(() => validateRpcParams('getbountychanges', params), /Invalid RPC known tip/);
+  }
+  assert.throws(() => validateRpcParams('getbountychanges', { include_bounties: true,
+    get known_tip() { assert.fail('Outer getter ran'); } }), /plain data/);
+});
+
+test('known tip is copied deeply before the real RPC client queues transmission', async () => {
+  const server = await mock((request, socket) => socket.write(line(response(request, request.params))));
+  try {
+    const params = { include_bounties: true, known_tip: { height: 700, hash } };
+    const pending = server.client.request('getbountychanges', params);
+    params.known_tip.height = 701; params.known_tip.hash = 'b'.repeat(64); params.known_tip.password = 'secret';
+    assert.deepEqual(await pending, { include_bounties: true, known_tip: { height: 700, hash } });
+    assert.deepEqual(server.requests[0].params, { include_bounties: true, known_tip: { height: 700, hash } });
+  } finally { await server.close(); }
+});
+
 test('recent block count is transmitted by the real RPC client and copied before queueing', async () => {
   const server = await mock((request, socket) => socket.write(line(response(request, { count: request.params.count }))));
   try {
