@@ -681,24 +681,39 @@ void EndpointSelectionBoundAndRoundRobin() {
     for (size_t i = 0; i < seen.size(); ++i) Check(seen[i] == "8.8.8." + std::to_string(i % 32 + 1), "First 32 endpoints retain exact equal-weight round robin");
 }
 void OutputFailureStopsBeforeTcp() {
-    std::atomic<int> tcp{}, entered{}, starts{}, errors{};
-    std::mutex mutex; std::condition_variable condition; bool resolved = false;
+    std::atomic<int> tcp{}, starts{};
+    std::mutex mutex; std::condition_variable condition;
+    int entered = 0, errors = 0;
+    bool resolved = false, failure_injected = false;
     ServiceDependencies deps; deps.resolve = [](const std::string&) { return std::vector<Endpoint>{{"8.8.8.8", 2, 443}}; };
-    deps.capture = [&](const Context&, const Endpoint&, CaptureControl&, const std::function<void()>& started) { ++entered; condition.notify_all(); started(); ++tcp; return Bytes{2, 1}; };
+    deps.capture = [&](const Context&, const Endpoint&, CaptureControl&, const std::function<void()>& started) {
+        // Publish under the waiter's mutex: an atomic counter alone can still
+        // lose the notification between predicate evaluation and waiting.
+        { std::lock_guard lock(mutex); ++entered; }
+        condition.notify_all();
+        started(); ++tcp; return Bytes{2, 1};
+    };
     deps.verify = [](const Bytes&, const Context&) { return Verification{}; };
     ClaimsService service(Json("{\"connectionsPerSecond\":100,\"concurrency\":8}"), [&](const std::string& text) {
         const auto frame = Json(text);
         if (frame["type"].get_str() == "started" && ++starts == 1) {
             std::unique_lock lock(mutex);
             Check(condition.wait_for(lock, 2s, [&] { return entered == 8; }), "All workers enter before output failure");
+            failure_injected = true;
             throw std::runtime_error("Broken writer");
         }
-        if (frame["type"].get_str() == "error") ++errors;
+        if (frame["type"].get_str() == "error") { { std::lock_guard lock(mutex); ++errors; } condition.notify_all(); }
         if (frame["type"].get_str() == "resolved") { std::lock_guard lock(mutex); resolved = true; condition.notify_all(); }
     }, deps);
     service.Command(Resolve(1)); { std::unique_lock lock(mutex); Check(condition.wait_for(lock, 3s, [&] { return resolved; }), "DNS fixture"); }
     for (uint64_t id = 2; id < 10; ++id) service.Command(Attempt(id));
-    for (int i = 0; i < 1000 && !service.Failed(); ++i) std::this_thread::sleep_for(1ms);
+    // Wait for the fatal publication instead of a shorter competing poll.
+    // Fatal() publishes Failed() before emitting this diagnostic frame.
+    {
+        std::unique_lock lock(mutex);
+        Check(condition.wait_for(lock, 3s, [&] { return errors != 0; }), "Failed writer must publish its fatal error");
+        Check(failure_injected, "Fatal error must follow the injected writer failure, not a fixture timeout");
+    }
     Check(service.Failed(), "Failed start acknowledgement must fail helper"); service.Close();
     Check(tcp == 0 && starts == 1 && errors == 1 && entered == 8, "One failed acknowledgement must block all successor TCP starts and emit one fatal error");
 }
