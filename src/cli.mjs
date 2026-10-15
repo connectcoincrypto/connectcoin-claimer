@@ -45,7 +45,7 @@ export function parseArguments(args, { packaged = isSea(), cwd = process.cwd(), 
 }
 const safeText = value => String(value ?? '').replace(/[\x00-\x1f\x7f-\x9f]/g, ' ').slice(0, 1500);
 const RPC_METHODS = new Set(['getchaintip', 'getrecentblockhashes', 'getblockbounties', 'getaddressbalance',
-  'getaddresshistory', 'getaddressutxos', 'getaddresschanges', 'gettransaction', 'gettransactions',
+  'getaddresshistory', 'getaddressutxos', 'getaddresschanges', 'gettransaction', 'gettransactionstatus', 'gettransactions',
   'sendrawtransaction', 'getbountychanges', 'subscribebounties', 'subscribeaddress', 'subscribetip', 'unsubscribe']);
 const RPC_STAGES = new Set(['connect', 'request', 'stream']);
 const RPC_SOURCES = new Set(['pre-write', 'rpc-reply', 'request-timeout', 'stream-timeout', 'stream-deadline',

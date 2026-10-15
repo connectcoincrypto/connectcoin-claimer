@@ -24,7 +24,7 @@ const PROCESS_SIGNALS = new Set([
 ]);
 const METHODS = new Set([
   'getchaintip', 'getrecentblockhashes', 'getblockbounties', 'getaddressbalance',
-  'getaddresshistory', 'getaddressutxos', 'getaddresschanges', 'gettransaction', 'gettransactions', 'sendrawtransaction',
+  'getaddresshistory', 'getaddressutxos', 'getaddresschanges', 'gettransaction', 'gettransactionstatus', 'gettransactions', 'sendrawtransaction',
   'getbountychanges', 'subscribebounties', 'subscribeaddress', 'subscribetip', 'unsubscribe',
 ]);
 const OS_CODES = new Set([

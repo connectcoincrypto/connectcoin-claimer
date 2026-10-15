@@ -43,18 +43,37 @@ export function validateConfirmation(result, { network }, window) {
   return { blockHash: result.block_hash, blockHeight: result.block_height };
 }
 
+/** An indexed receipt contains no witness. Its identity must bind to the saved
+ * transaction, whose bytes are independently checked before this read. */
+export function validateClaimStatus(result, record, config, window) {
+  const tip = validateTip(result?.tip, config.network);
+  if (typeof result?.txid !== 'string' || !/^[0-9a-f]{64}$/.test(result.txid) || result.txid !== record.txid) {
+    throw new Error('Claim receipt reports a conflicting transaction identity.');
+  }
+  if (!['pending', 'confirmed'].includes(result.status) || !Number.isSafeInteger(result.confirmations) || result.confirmations < 0) {
+    throw new Error('Invalid claim confirmation metadata.');
+  }
+  const confirmation = validateConfirmation({ ...result, transaction: {
+    confirmations: result.confirmations, ...(result.status === 'confirmed' ? { blockhash: result.block_hash } : {}),
+  } }, config, window);
+  if (confirmation && result.confirmations !== tip.height - confirmation.blockHeight + 1) {
+    throw Object.assign(new Error('Claim confirmation count disagrees with its indexed tip.'), { code: -32011 });
+  }
+  return confirmation;
+}
+
 /** Integrity/binding of bytes ALREADY verified before the original durable write.
  * This is retransmission, never proof generation or a replacement transaction.
  * The receiving node still applies its full current validation and fee policy.
  */
-export function validateSavedClaim(record, { network, receivingAddress }) {
+export function validateSavedClaim(record, { network, receivingAddress }, { target } = {}) {
   if (record.receivingAddress !== receivingAddress) throw new Error('Saved claim belongs to another configured receiving address.');
   const raw = record.transactionHex;
   if (typeof raw !== 'string' || raw.length > MAX_REPLAY_HEX || !/^(?:[0-9a-f]{2})+$/.test(raw) ||
       transactionDigest(raw) !== record.transactionHash || transactionIdFromRaw(raw) !== record.txid) {
     throw new Error('Saved claim bytes do not match their durable identity.');
   }
-  validateObservedClaim(record, raw, { network, receivingAddress });
+  validateObservedClaim(record, raw, { network, receivingAddress }, { target });
   return raw;
 }
 

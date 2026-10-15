@@ -38,15 +38,16 @@ for (const recovery of ['drain', 'disconnect', 'restart']) {
           const request = JSON.parse(buffer.slice(0, end)); buffer = buffer.slice(end + 1); requests.push(request);
           const send = body => socket.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, ...body }) + '\n');
           if (request.method === 'getchaintip') send({ result: tip });
+          else if (request.method === 'gettransactionstatus') {
+            assert.equal(request.params.txid, signed?.txid);
+            send(accepted ? { result: { tip, txid: signed.txid, status: 'pending', confirmations: 0 } }
+              : { error: { code: -32004, message: 'Not indexed' } });
+          }
           else if (request.method === 'gettransaction') {
-            if (request.params.txid === signed?.txid) {
-              send(accepted ? { result: { tip, status: 'pending', transaction: { txid: signed.txid, hex: signed.hex, confirmations: 0 } } }
-                : { error: { code: -32004, message: 'Not indexed' } });
-            } else {
-              assert.ok(parents.has(request.params.txid));
-              const reply = () => send({ result: { tip, transaction: { hex: parents.get(request.params.txid) } } });
-              if (hold && request.params.txid !== bounty.txid) waiting.push(reply); else reply();
-            }
+            assert.notEqual(request.params.txid, signed?.txid, 'Confirmation polling must never fetch the claim witness.');
+            assert.ok(parents.has(request.params.txid));
+            const reply = () => send({ result: { tip, transaction: { hex: parents.get(request.params.txid) } } });
+            if (hold && request.params.txid !== bounty.txid) waiting.push(reply); else reply();
           } else {
             assert.equal(request.method, 'sendrawtransaction'); assert.equal(request.params.transaction_hex, signed.hex);
             accepted = true; send({ result: { txid: signed.txid } });

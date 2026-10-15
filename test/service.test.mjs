@@ -25,7 +25,7 @@ class FakeRpc extends EventEmitter {
   async request(method, params, options) {
     this.calls.push({ method, params });
     if (this.respond) return this.respond(method, params, options);
-    if (method === 'gettransaction' && params.txid === CLAIM) throw Object.assign(new Error('not found'), { code: -32004 });
+    if (method === 'gettransactionstatus') throw Object.assign(new Error('not found'), { code: -32004 });
     if (method === 'gettransaction') return { tip, transaction: { hex: 'funding-hex' } };
     if (method === 'sendrawtransaction') return { txid: CLAIM };
     throw new Error(`Unexpected fake method: ${method}`);
@@ -252,10 +252,10 @@ test('accepted unconfirmed claim survives eviction and restart, replaying identi
   let completed = 0, indexed = false;
   fresh.engine.completeRecoveredClaim = () => completed++;
   fresh.rpc.respond = async (method, params, options) => {
-    if (method === 'gettransaction') {
+    if (method === 'gettransactionstatus') {
       assert.equal(params.txid, CLAIM);
       if (!indexed) throw Object.assign(new Error('Not indexed'), { code: -32004 });
-      return { tip, status: 'confirmed', block_hash: BLOCK, block_height: 100, transaction: { hex: 'ab'.repeat(50) } };
+      return { tip, status: 'confirmed', block_hash: BLOCK, block_height: 100, txid: CLAIM, confirmations: 1 };
     }
     assert.equal(method, 'sendrawtransaction'); options.beforeSend();
     assert.equal(params.transaction_hex, 'ab'.repeat(50)); return { txid: CLAIM };
@@ -423,9 +423,9 @@ test('malformed later catalog row cannot partially reopen an earlier confirmed c
 test('ACK recovery validates confirmation and retains its witness on malformed metadata', async t => {
   const { service, rpc } = await fixture(t);
   await service.start(); await service.submit(await service.prepare(bounty), 'proof');
-  rpc.respond = async () => ({ tip, status: 'confirmed', block_hash: 'bad', block_height: 100, transaction: { hex: 'ab'.repeat(50) } });
+  rpc.respond = async () => ({ tip, status: 'confirmed', block_hash: 'bad', block_height: 100, txid: CLAIM, confirmations: 1 });
   service.recoveryDue.clear();
-  await assert.rejects(service.reconcileBroadcasts(), /Invalid claim confirmation/);
+  await assert.rejects(service.reconcileBroadcasts(), /Invalid claim (confirmation|transaction location)/);
   assert.equal(service.journal.entries()[0].status, 'accepted');
   assert.equal(service.journal.entries()[0].transactionHex, 'ab'.repeat(50));
 });
@@ -435,7 +435,7 @@ test('reopened ACK replay rechecks catalog after RPC queueing and never loses it
   await service.start(); await service.submit(await service.prepare(bounty), 'proof');
   let transmitted = 0;
   rpc.respond = async (method, params, options) => {
-    if (method === 'gettransaction') throw Object.assign(new Error('Not indexed'), { code: -32004 });
+    if (method === 'gettransactionstatus') throw Object.assign(new Error('Not indexed'), { code: -32004 });
     service.outpoints.set(`${HASH}:0`, { ...bounty, status: 'pending_spend' });
     options.beforeSend(); transmitted++; return { txid: CLAIM };
   };
@@ -470,8 +470,8 @@ test('pending ACK lookup neither rewrites its durable witness nor repeats broadc
   service.journal.update = (...args) => { writes++; return update(...args); };
   engine.completeRecoveredClaim = () => completed++;
   rpc.respond = async method => {
-    assert.equal(method, 'gettransaction');
-    return { tip, status: 'pending', transaction: { hex: 'ab'.repeat(50) } };
+    assert.equal(method, 'gettransactionstatus');
+    return { tip, status: 'pending', txid: CLAIM, confirmations: 0 };
   };
   for (let i = 0; i < 3; i++) { service.recoveryDue.clear(); await service.reconcileBroadcasts(); }
   assert.equal(writes, 0); assert.equal(completed, 0);
@@ -505,20 +505,52 @@ async function observedClaimFixture(t) {
   return { ...setup, key, original, alternate };
 }
 
-test('same-txid alternate observed witness preserves replay bytes until canonical confirmation', async t => {
+test('an older RPC without compact status retains the proof and never falls back to gettransaction', async t => {
+  const { service, rpc, engine } = await fixture(t);
+  await service.start(); await service.submit(await service.prepare(bounty), 'proof');
+  const before = service.journal.entries()[0];
+  let completed = 0, queried = 0;
+  engine.completeRecoveredClaim = () => completed++;
+  rpc.respond = async method => {
+    assert.equal(method, 'gettransactionstatus'); queried++;
+    throw Object.assign(new Error('Method not found'), { code: -32601 });
+  };
+  service.recoveryDue.clear(); await service.reconcileBroadcasts();
+  assert.equal(queried, 1); assert.equal(completed, 0); assert.equal(service.running, true);
+  assert.deepEqual(service.journal.entries(), [before]);
+  assert.equal(service.reserved.has(before.outpoint), true);
+});
+
+test('compact status cannot accept a different transaction identity or corrupt durable witness', async t => {
+  const { service, rpc, original } = await observedClaimFixture(t);
+  rpc.respond = async method => {
+    assert.equal(method, 'gettransactionstatus');
+    return { tip, txid: 'ff'.repeat(32), status: 'confirmed', block_hash: BLOCK, block_height: 100, confirmations: 1 };
+  };
+  await assert.rejects(service.reconcileBroadcasts(), /conflicting transaction identity/);
+  assert.equal(service.journal.entries()[0].transactionHex, original.hex);
+  const entries = service.journal.awaitingConfirmation.bind(service.journal);
+  service.journal.awaitingConfirmation = () => entries().map(row => ({ ...row, transactionHash: '00'.repeat(32) }));
+  rpc.respond = async () => assert.fail('Invalid stored digest must fail before network lookup');
+  service.recoveryDue.clear();
+  await assert.rejects(service.reconcileBroadcasts(), /durable identity/);
+  assert.equal(service.journal.entries()[0].status, 'accepted');
+});
+
+test('compact status preserves the original witness until canonical confirmation without downloading another proof', async t => {
   const { service, rpc, engine, key, original, alternate } = await observedClaimFixture(t);
   let completed = 0;
   engine.completeRecoveredClaim = () => completed++;
   rpc.respond = async method => {
-    assert.equal(method, 'gettransaction');
-    return { tip, status: 'pending', transaction: { hex: alternate.hex } };
+    assert.equal(method, 'gettransactionstatus');
+    return { tip, txid: original.txid, status: 'pending', confirmations: 0 };
   };
   await service.reconcileBroadcasts();
   assert.equal(service.journal.entries()[0].transactionHex, original.hex);
   assert.equal(service.journal.entries()[0].transactionHash, transactionDigest(original.hex));
   rpc.respond = async method => {
-    assert.equal(method, 'gettransaction');
-    return { tip, status: 'confirmed', block_hash: BLOCK, block_height: 100, transaction: { hex: alternate.hex } };
+    assert.equal(method, 'gettransactionstatus');
+    return { tip, txid: original.txid, status: 'confirmed', block_hash: BLOCK, block_height: 100, confirmations: 1 };
   };
   service.recoveryDue.clear(); await service.reconcileBroadcasts();
   assert.equal(service.journal.entries()[0].status, 'confirmed');
@@ -528,25 +560,26 @@ test('same-txid alternate observed witness preserves replay bytes until canonica
   assert.equal(rpc.calls.filter(call => call.method === 'sendrawtransaction').length, 0);
 });
 
-test('same-txid observed witness with a wrong challenge cannot compact the accepted proof', async t => {
+test('same-txid saved witness with a wrong challenge cannot be acknowledged through a compact receipt', async t => {
   const { service, rpc, original, alternate } = await observedClaimFixture(t);
   const tx = parseTransaction(alternate.hex), proof = Buffer.from(tx.inputs[0].witness[0], 'hex');
   proof[7] ^= 1;
   tx.inputs[0].witness[0] = proof.toString('hex');
   const malformed = serializeTransaction(tx).toString('hex');
   assert.equal(transactionIdFromRaw(malformed), original.txid);
-  rpc.respond = async () => ({ tip, status: 'confirmed', block_hash: BLOCK, block_height: 100,
-    transaction: { hex: malformed } });
+  const entries = service.journal.awaitingConfirmation.bind(service.journal);
+  service.journal.awaitingConfirmation = () => entries().map(row => ({ ...row,
+    transactionHex: malformed, transactionHash: transactionDigest(malformed) }));
+  rpc.respond = async () => assert.fail('Damaged local proof must fail before any receipt query');
   await assert.rejects(service.reconcileBroadcasts(), /not bound/);
   assert.equal(service.journal.entries()[0].transactionHex, original.hex);
   assert.equal(service.journal.entries()[0].status, 'accepted');
 });
 
-test('receipt reconciliation checks observed proof work against known bounty metadata before compaction', async t => {
+test('receipt reconciliation checks saved proof work against known bounty metadata before compaction', async t => {
   const { service, rpc, key, original, alternate } = await observedClaimFixture(t);
   service.outpoints.set(key, { ...bounty, txid: key.split(':')[0], connection_work_target: '00'.repeat(32) });
-  rpc.respond = async () => ({ tip, status: 'confirmed', block_hash: BLOCK, block_height: 100,
-    transaction: { hex: alternate.hex } });
+  rpc.respond = async () => assert.fail('Invalid local work must fail before any receipt query');
   await assert.rejects(service.reconcileBroadcasts(), /work target/);
   assert.equal(service.journal.entries()[0].transactionHex, original.hex);
   assert.equal(service.journal.entries()[0].status, 'accepted');
@@ -715,9 +748,9 @@ for (const finishResetBeforeReply of [false, true]) test(`receipt begun before c
   let completed = 0;
   engine.completeRecoveredClaim = () => completed++;
   rpc.respond = async method => {
-    assert.equal(method, 'gettransaction'); entered.resolve(); await release.promise;
+    assert.equal(method, 'gettransactionstatus'); entered.resolve(); await release.promise;
     return { tip, status: 'confirmed', block_hash: BLOCK, block_height: 100,
-      transaction: { hex: 'ab'.repeat(50) } };
+      txid: CLAIM, confirmations: 1 };
   };
   service.recoveryDue.clear(); const checking = service.reconcileBroadcasts();
   await entered.promise;
@@ -744,7 +777,7 @@ for (const finishResetBeforeReply of [false, true]) test(`missing receipt begun 
   engine.completeRecoveredClaim = () => completed++;
   rpc.respond = async method => {
     if (method === 'sendrawtransaction') { sent++; return { txid: CLAIM }; }
-    assert.equal(method, 'gettransaction'); entered.resolve(); await release.promise;
+    assert.equal(method, 'gettransactionstatus'); entered.resolve(); await release.promise;
     throw Object.assign(new Error('not found'), { code: -32004 });
   };
   service.recoveryDue.clear(); const checking = service.reconcileBroadcasts();
@@ -796,7 +829,7 @@ test('receipt queued for durable compaction rechecks its catalog before replacin
   service.journal.writing = release.promise;
   service.journal.update = (...args) => { if (args[1]?.status === 'confirmed') entered.resolve(); return update(...args); };
   rpc.respond = async () => ({ tip, status: 'confirmed', block_hash: BLOCK, block_height: 100,
-    transaction: { hex: 'ab'.repeat(50) } });
+    txid: CLAIM, confirmations: 1 });
   service.recoveryDue.clear(); const checking = service.reconcileBroadcasts();
   await entered.promise;
   try { service.resetCatalog({ reason: 'journal-reset' }); }
@@ -890,7 +923,7 @@ test('confirmation racing a local reorg keeps the witness for a coherent retry i
   await service.start(); await service.submit(await service.prepare(bounty), 'proof');
   service.blockWindow = { blocks: [{ height: 99, hash: 'b'.repeat(64) }] };
   rpc.respond = async () => ({ tip, status: 'confirmed', block_hash: 'c'.repeat(64), block_height: 99,
-    transaction: { hex: 'ab'.repeat(50) } });
+    txid: CLAIM, confirmations: 2 });
   service.recoveryDue.clear(); await service.reconcileBroadcasts();
   assert.equal(service.running, true); assert.equal(service.fatalError, null);
   assert.equal(service.journal.entries()[0].status, 'accepted');
@@ -907,7 +940,7 @@ test(`accepted replay preserves the same durable proof and once-counted receipt 
   let completed = 0;
   engine.completeRecoveredClaim = () => completed++;
   rpc.respond = async (method, params, options) => {
-    if (method === 'gettransaction') {
+    if (method === 'gettransactionstatus') {
       if (mode === 'backend') throw Object.assign(new Error('Backend unavailable'), { code: -32002 });
       throw Object.assign(new Error('Not indexed'), { code: -32004 });
     }
@@ -979,7 +1012,7 @@ test('failed ACK receipt write retains exact bytes and recovers an evicted trans
   assert.equal(service.reserved.has(key), true); assert.equal(service.fatalError, null);
   assert.equal(service.engine.snapshot().completed, 0);
   rpc.respond = async (method, params, options) => {
-    if (method === 'gettransaction') throw Object.assign(new Error('Previously accepted transaction evicted'), { code: -32004 });
+    if (method === 'gettransactionstatus') throw Object.assign(new Error('Previously accepted transaction evicted'), { code: -32004 });
     assert.equal(method, 'sendrawtransaction'); options.beforeSend();
     assert.equal(params.transaction_hex, 'ab'.repeat(50));
     return { txid: CLAIM };
@@ -1020,7 +1053,7 @@ test('real engine keeps a rejected winning proof through pending-spend and avail
   engine.state.attempts = 7;
   let reject = true, transmitted = 0;
   rpc.respond = async (method, params, options) => {
-    if (method === 'gettransaction') {
+    if (method === 'gettransactionstatus') {
       assert.equal(params.txid, CLAIM);
       throw Object.assign(new Error('Claim absent'), { code: -32004 });
     }
@@ -1056,8 +1089,8 @@ test('lost response reconciles an indexed transaction without resending or compl
   let completed = 0;
   engine.completeRecoveredClaim = (key, txid) => { assert.equal(key, `${HASH}:0`); assert.equal(txid, CLAIM); completed++; };
   rpc.respond = async (method, params) => {
-    assert.equal(method, 'gettransaction'); assert.equal(params.txid, CLAIM);
-    return { tip, transaction: { hex: 'ab'.repeat(50) } };
+    assert.equal(method, 'gettransactionstatus'); assert.equal(params.txid, CLAIM);
+    return { tip, status: 'pending', txid: CLAIM, confirmations: 0 };
   };
   await Promise.all([service.reconcileBroadcasts(), service.reconcileBroadcasts()]);
   await service.reconcileBroadcasts();
@@ -1074,7 +1107,7 @@ test('missing index replays exactly the saved public witness and only one reques
   const original = service.journal.unresolved()[0]; let completed = 0;
   engine.completeRecoveredClaim = () => completed++;
   rpc.respond = async (method, params, options) => {
-    if (method === 'gettransaction') throw Object.assign(new Error('Not indexed'), { code: -32004 });
+    if (method === 'gettransactionstatus') throw Object.assign(new Error('Not indexed'), { code: -32004 });
     assert.equal(method, 'sendrawtransaction');
     assert.equal(params.transaction_hex, original.transactionHex);
     assert.equal(service.journal.unresolved()[0].status, 'unknown');
@@ -1096,7 +1129,7 @@ for (const failure of [
   const { service, rpc } = await uncertainFixture(t);
   const original = service.journal.unresolved()[0];
   rpc.respond = async method => {
-    if (method === 'gettransaction') throw Object.assign(new Error('Not indexed'), { code: -32004 });
+    if (method === 'gettransactionstatus') throw Object.assign(new Error('Not indexed'), { code: -32004 });
     throw Object.assign(new Error('Retry failed'), failure);
   };
   await service.reconcileBroadcasts();
@@ -1109,7 +1142,7 @@ for (const failure of [
   assert.ok(service.recoveryDue.get(`${HASH}:0`) > Date.now());
 });
 
-test('legacy unresolved record is isolated while other bounties run and can resolve by indexed receipt', async t => {
+test('legacy unresolved record without bytes stays isolated without fetching a replacement proof', async t => {
   const { directory } = await fixture(t), statePath = join(directory, 'legacy.json');
   await writeFile(statePath, JSON.stringify({ version: 1, records: [{ outpoint: `${HASH}:0`, txid: CLAIM,
     receivingAddress: config.receivingAddress, status: 'unknown', updatedAt: 0 }] }));
@@ -1123,10 +1156,11 @@ test('legacy unresolved record is isolated while other bounties run and can reso
   assert.equal(engine.queue.has(`${HASH}:1`), true);
   assert.equal(rpc.calls.some(row => row.method === 'sendrawtransaction'), false);
   service.recoveryDue.clear();
-  rpc.respond = async () => ({ tip, transaction: { hex: 'ab'.repeat(50) } });
+  rpc.respond = async () => assert.fail('A legacy row cannot be authenticated by a compact receipt');
   await service.reconcileBroadcasts();
-  assert.equal(service.journal.entries()[0].status, 'accepted');
-  assert.equal(service.snapshot().reviewRequired, false);
+  assert.equal(service.journal.entries()[0].status, 'unknown');
+  assert.equal(service.snapshot().reviewRequired, true);
+  assert.equal(service.reserved.has(`${HASH}:0`), true);
 });
 
 test('pending bytes recover after process restart without generating another claim', async t => {

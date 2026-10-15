@@ -87,6 +87,19 @@ test('unsubscribe accepts opaque bounded IDs and rejects overlong or control-cha
   }
 });
 
+test('bounty delta opt-in and compact transaction status keep strict parameter validation', () => {
+  assert.deepEqual(validateRpcParams('getbountychanges', { include_bounties: true, cursor: null }), { cursor: null, include_bounties: true });
+  assert.deepEqual(validateRpcParams('getbountychanges', { include_bounties: false }), { include_bounties: false });
+  for (const value of [null, undefined, 0, 1, 'true', [], {}]) {
+    assert.throws(() => validateRpcParams('getbountychanges', { include_bounties: value }), /Invalid RPC bounty delta option/);
+  }
+  assert.throws(() => validateRpcParams('getbountychanges', { get include_bounties() { throw new Error('Getter executed'); } }), /plain data/);
+  assert.deepEqual(validateRpcParams('gettransactionstatus', { txid: hash.toUpperCase() }), { txid: hash });
+  assert.throws(() => validateRpcParams('gettransactionstatus', {}), /Missing/);
+  assert.throws(() => validateRpcParams('gettransactionstatus', { txid: hash, password: 'secret' }), /Unexpected/);
+  assert.throws(() => validateRpcParams('gettransactionstatus', { txid: ['a'.repeat(64)] }), /Invalid/);
+});
+
 test('recent block count is an optional strict bounded integer without getters or coercion', () => {
   assert.deepEqual(validateRpcParams('getrecentblockhashes', {}), {});
   for (const count of [1, 5, 100, 600]) {

@@ -7,7 +7,7 @@ import { isKnownClaimRejection } from './core/claims.mjs';
 import { discoverBounties, readBountyBlock, bountyKey, BountyDiscoveryBusy } from './core/bounty-discovery.mjs';
 import { prepareClaim, attachClaimProof, estimateClaimFee, transactionIdFromRaw, FundingTransactionCache } from './core/transaction.mjs';
 import { BroadcastJournal, transactionDigest } from './broadcast-journal.mjs';
-import { deferredBroadcast, validateSavedClaim, validateObservedClaim, validateConfirmation } from './broadcast-recovery.mjs';
+import { deferredBroadcast, validateSavedClaim, validateObservedClaim, validateClaimStatus } from './broadcast-recovery.mjs';
 import { diagnosticError } from './core/diagnostics.mjs';
 import { ClaimMetrics } from './metrics.mjs';
 
@@ -578,23 +578,29 @@ export class ClaimerService {
         this.report('broadcast', { txid: row.txid, outpoint: row.outpoint, status: 'quarantined-address-mismatch' });
         return;
       }
+      // Older journals may have compacted the only witness on a mere ACK. A
+      // compact status cannot reconstruct or authenticate those missing bytes.
+      // Keep their reservations for review; never fetch a replacement witness
+      // or let this one record stop unrelated claims.
+      if (!row.transactionHex) {
+        this.recoveryBlocked.add(row.outpoint);
+        this.report('broadcast', { txid: row.txid, outpoint: row.outpoint, status: 'quarantined-legacy-no-bytes' });
+        return;
+      }
+      const raw = this.validateSaved(row, this.config,
+        { target: this.outpoints.get(row.outpoint)?.connection_work_target });
       let found = false, confirmation = null, checkConfirmation, confirmationAnchored = false;
       try {
-        const result = await this.rpc.request('gettransaction', { txid: row.txid }, { signal });
+        const result = await this.rpc.request('gettransactionstatus', { txid: row.txid }, { signal });
         checkCatalogRead(); validateTip(result?.tip, this.config.network);
-        if (result?.transaction?.txid !== undefined && result.transaction.txid !== row.txid) {
-          throw new Error('Claim receipt reports a conflicting transaction identity.');
-        }
-        this.validateObserved(row, result?.transaction?.hex, this.config,
-          { target: this.outpoints.get(row.outpoint)?.connection_work_target });
         // The txid commits to the input/payout, not the witness. A different
-        // bound proof can be accepted under that same ID (e.g. another claimer
-        // with the same payout). Validate its identity, framing and challenge,
-        // but never substitute it for the original immutable replay bytes.
-        confirmation = validateConfirmation(result, this.config, this.blockWindow);
+        // proof accepted by the full node under that ID is the same payment.
+        // Validate our original bytes locally; never download or substitute a
+        // remote witness just to learn whether that transaction was accepted.
+        confirmation = validateClaimStatus(result, row, this.config, this.blockWindow);
         if (confirmation) {
           checkConfirmation = () => {
-            checkCatalogRead(); validateConfirmation(result, this.config, this.blockWindow);
+            checkCatalogRead(); validateClaimStatus(result, row, this.config, this.blockWindow);
             const localTip = validateTip(this.tip, this.config.network);
             // Receipt and discovery can advance independently. Do not discard
             // the witness before our coherent catalog reaches its block; a
@@ -627,12 +633,6 @@ export class ClaimerService {
           return !current || current.status === 'available';
         };
         if (!replayAllowed()) return;
-        if (!row.transactionHex) {
-          this.recoveryBlocked.add(row.outpoint);
-          this.report('broadcast', { txid: row.txid, outpoint: row.outpoint, status: 'quarantined-legacy-no-bytes' });
-          return;
-        }
-        const raw = this.validateSaved(row, this.config);
         await this.waitForCatalog(epoch, signal);
         const beforeSend = () => {
           checkCatalogRead();
@@ -670,7 +670,7 @@ export class ClaimerService {
       // Uncertainty/rejections reserve only this outpoint and retain the exact
       // public transaction. Never release it on a later -25/-26/-27 or quota.
       if (error.unknownOutcome || error.notSent || transient(error) || error.code === -32011 ||
-          error.code === -32020 || error.name === 'AbortError') {
+          error.code === -32020 || error.code === -32601 || error.name === 'AbortError') {
         const retry = Number.isSafeInteger(error.data?.retry_after_ms) ? Math.min(300000, Math.max(30000, error.data.retry_after_ms)) : 30000;
         this.recoveryDue.set(row.outpoint, Date.now() + retry);
         this.report('broadcast', { txid: row.txid, outpoint: row.outpoint, status: 'reconciliation-pending', reason: diagnosticError(error) });

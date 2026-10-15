@@ -4,7 +4,7 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { BroadcastJournal, MAX_REPLAY_HEX, transactionDigest } from '../src/broadcast-journal.mjs';
-import { validateSavedClaim, validateObservedClaim, validateConfirmation, deferredBroadcast } from '../src/broadcast-recovery.mjs';
+import { validateSavedClaim, validateObservedClaim, validateConfirmation, validateClaimStatus, deferredBroadcast } from '../src/broadcast-recovery.mjs';
 import { GENESIS } from '../src/core/config.mjs';
 import { prepareClaim, attachClaimProof, parseTransaction, serializeTransaction, transactionIdFromRaw } from '../src/core/transaction.mjs';
 import { encodeAddress } from '../src/core/crypto.mjs';
@@ -173,6 +173,26 @@ test('deferred ownership marker retains the exact transaction identity and origi
   const txid = fixture().record.txid, error = deferredBroadcast(txid, cause);
   assert.equal(error.broadcastDeferred, true); assert.equal(error.txid, txid); assert.strictEqual(error.cause, cause);
   assert.equal(error.helperFatal, undefined);
+});
+
+test('compact receipts require an exact identity, state, confirmation count and canonical location', () => {
+  const { record } = fixture();
+  const tip = { height: 100, hash: 'a'.repeat(64), mediantime: 1700000000, chain: 'main', genesis_hash: GENESIS.main };
+  const receipt = { tip, txid: record.txid, status: 'confirmed', confirmations: 1, block_hash: tip.hash, block_height: 100 };
+  assert.deepEqual(validateClaimStatus(receipt, record, config), { blockHash: tip.hash, blockHeight: 100 });
+  assert.equal(validateClaimStatus({ tip, txid: record.txid, status: 'pending', confirmations: 0 }, record, config), null);
+  for (const fields of [
+    { txid: undefined }, { txid: 'b'.repeat(64) }, { status: undefined }, { status: 'accepted' },
+    { confirmations: undefined }, { confirmations: '1' }, { confirmations: -1 }, { confirmations: 0.5 },
+    { confirmations: 0 }, { confirmations: 2 }, { block_height: 101 }, { block_height: undefined },
+    { block_hash: 'b'.repeat(64) }, { block_hash: undefined }, { status: 'pending' },
+    { tip: { ...tip, chain: 'testnet4' } },
+  ]) assert.throws(() => validateClaimStatus({ ...receipt, ...fields }, record, config));
+  assert.throws(() => validateClaimStatus({ tip, txid: record.txid, status: 'pending', confirmations: 1 }, record, config));
+  assert.throws(() => validateClaimStatus({ ...receipt, block_height: 99, confirmations: 2 }, record, config,
+    { blocks: [{ height: 99, hash: 'b'.repeat(64) }] }), { code: -32011 });
+  assert.equal(validateSavedClaim(record, config, { target: 'ff'.repeat(32) }), record.transactionHex);
+  assert.throws(() => validateSavedClaim(record, config, { target: '00'.repeat(32) }), /work target/);
 });
 
 test('only coherent block metadata confirms a claim; a pending lookup or ACK cannot compact it', () => {

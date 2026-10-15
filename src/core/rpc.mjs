@@ -8,7 +8,7 @@ const PARAMS = Object.freeze({
   getchaintip: [], getrecentblockhashes: ['count'], getblockbounties: ['block_hash'],
   getaddressbalance: ['address'], getaddresshistory: ['address', 'cursor'], getaddressutxos: ['address', 'cursor', 'include_pending_spent'],
   getaddresschanges: ['addresses', 'cursor'],
-  gettransaction: ['txid'], gettransactions: ['txids'], sendrawtransaction: ['transaction_hex'], getbountychanges: ['cursor'],
+  gettransaction: ['txid'], gettransactionstatus: ['txid'], gettransactions: ['txids'], sendrawtransaction: ['transaction_hex'], getbountychanges: ['cursor', 'include_bounties'],
   subscribebounties: [], subscribeaddress: ['address', 'changes_only'], subscribetip: [], unsubscribe: ['subscription_id'],
 });
 const MAX_FRAME = 2 * 1024 * 1024;
@@ -27,7 +27,7 @@ export function validateRpcParams(method, params) {
   const clean = {};
   for (const key of PARAMS[method]) {
     if (!Object.hasOwn(params, key)) {
-      if (key !== 'cursor' && key !== 'include_pending_spent' && key !== 'changes_only' && key !== 'count') throw new Error(`Missing RPC parameter: ${key}.`);
+      if (key !== 'cursor' && key !== 'include_pending_spent' && key !== 'changes_only' && key !== 'count' && key !== 'include_bounties') throw new Error(`Missing RPC parameter: ${key}.`);
       continue;
     }
     const descriptor = Object.getOwnPropertyDescriptor(params, key);
@@ -39,6 +39,10 @@ export function validateRpcParams(method, params) {
     }
     if (key === 'include_pending_spent') {
       if (typeof value !== 'boolean') throw new Error('Invalid RPC pending-spend option.');
+      clean[key] = value; continue;
+    }
+    if (key === 'include_bounties') {
+      if (typeof value !== 'boolean') throw new Error('Invalid RPC bounty delta option.');
       clean[key] = value; continue;
     }
     if (key === 'changes_only') {

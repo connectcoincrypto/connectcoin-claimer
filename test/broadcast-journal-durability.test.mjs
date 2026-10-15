@@ -70,9 +70,8 @@ for (const stage of ['open', 'sync', 'close']) {
     const makeService = journal => {
       const rpc = new EventEmitter(); rpc.connect = async () => {}; rpc.close = () => {};
       rpc.request = async (method, params) => {
-        calls.push(method); assert.equal(method, 'gettransaction'); assert.equal(params.txid, saved.txid);
-        return { tip, status: 'confirmed', block_hash: tip.hash, block_height: tip.height,
-          transaction: { hex: transactionHex, txid: saved.txid, blockhash: tip.hash, confirmations: 1 } };
+        calls.push(method); assert.equal(method, 'gettransactionstatus'); assert.equal(params.txid, saved.txid);
+        return { tip, txid: saved.txid, status: 'confirmed', block_hash: tip.hash, block_height: tip.height, confirmations: 1 };
       };
       return new ClaimerService({ config, journal, rpcFactory: () => rpc,
         engineFactory: options => {
@@ -108,7 +107,7 @@ for (const stage of ['open', 'sync', 'close']) {
     assert.equal(reloaded.entries().length, 0);
     const disk = new BroadcastJournal(path); await disk.load(); assert.deepEqual(disk.entries(), []);
     assert.equal(restarted.snapshot().claims.completed, 0); assert.equal(restarted.snapshot().claims.attempts, 0);
-    assert.deepEqual(calls, ['gettransaction']);
+    assert.deepEqual(calls, ['gettransactionstatus']);
   });
 
   test(`queued journal write preserves the published record after directory ${stage} fails`, async t => {
@@ -161,8 +160,8 @@ for (const stage of ['open', 'sync', 'close']) {
     rpc.connect = async () => {}; rpc.close = () => {};
     rpc.request = async (method, params, options) => {
       calls.push(method); options?.beforeSend?.();
-      assert.equal(method, 'gettransaction'); assert.equal(params.txid, saved.txid);
-      return { tip, status: 'pending', transaction: { hex: transactionHex, txid: saved.txid, confirmations: 0 } };
+      assert.equal(method, 'gettransactionstatus'); assert.equal(params.txid, saved.txid);
+      return { tip, txid: saved.txid, status: 'pending', confirmations: 0 };
     };
     const config = { receivingAddress, network: 'main', rpc: { host: 'invalid.example', port: 48190 },
       connectionsPerSecond: 100, concurrency: 100, minExpectedReturn: 1000, lookbackBlocks: 600, feeRate: 1500 };
@@ -174,7 +173,7 @@ for (const stage of ['open', 'sync', 'close']) {
     await assert.rejects(service.reconcileBroadcasts().catch(error => { service.fail(error); throw error; }), { code: 'EIO', helperFatal: true });
     assert.equal(service.running, false); assert.equal(service.snapshot().claims.completed, 0);
     assert.equal(service.snapshot().claims.attempts, 0); assert.equal(service.reserved.has(outpoint), true);
-    assert.deepEqual(calls, ['gettransaction']);
+    assert.deepEqual(calls, ['gettransactionstatus']);
     await service.stop();
     const disk = new BroadcastJournal(path); await disk.load();
     assert.equal(disk.entries()[0].status, 'accepted');

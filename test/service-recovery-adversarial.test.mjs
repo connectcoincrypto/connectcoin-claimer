@@ -14,6 +14,9 @@ const receivingAddress = 'cc1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7
 const tip = { height: 100, hash: '22'.repeat(32), mediantime: 1700000000, chain: 'main', genesis_hash: GENESIS.main };
 const config = { receivingAddress, network: 'main', rpc: { host: 'invalid.example', port: 48190 },
   connectionsPerSecond: 100, concurrency: 100, minExpectedReturn: 1000, lookbackBlocks: 600, feeRate: 1500 };
+const pendingReceipt = (record, fields = {}) => ({ tip, txid: record.txid, status: 'pending', confirmations: 0, ...fields });
+const confirmedReceipt = (record, receiptTip = tip) => ({ tip: receiptTip, txid: record.txid,
+  status: 'confirmed', block_height: receiptTip.height, block_hash: receiptTip.hash, confirmations: 1 });
 function publicRecord() {
   // Independently golden public transaction, synthetic proof framing only.
   const tx = parseTransaction('0200000001548c9fc15a3c2bc70e81307961d1350359b8d080130859f526cc1c794bd54eb30000000000ffffffff0138bd9252020000000179be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f8179800000000');
@@ -22,21 +25,23 @@ function publicRecord() {
   return { outpoint: `${tx.inputs[0].txid}:0`, txid: transactionId(tx), receivingAddress, status: 'unknown',
     transactionHex, transactionHash: transactionDigest(transactionHex) };
 }
-async function fixture(t, status = 'unknown') {
+async function fixture(t, status = 'unknown', savedFields = {}) {
   const directory = await mkdtemp(join(tmpdir(), 'claimer-recovery-adversarial-'));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const path = join(directory, 'state.json');
-  const journal = new BroadcastJournal(path), record = { ...publicRecord(), status };
+  const journal = new BroadcastJournal(path), record = { ...publicRecord(), status, ...savedFields };
   await journal.load(); await journal.update(record.outpoint, record);
   const calls = [], rpc = new EventEmitter();
   rpc.connect = async () => {};
   rpc.close = () => {};
   rpc.request = async (method, params, options) => {
+    assert.notEqual(method, 'gettransaction', 'Recovery must validate saved bytes locally and never fetch a claim witness.');
     calls.push({ method, params }); options?.beforeSend?.();
     return rpc.respond(method, params, options);
   };
   rpc.respond = async method => {
-    if (method === 'gettransaction') return { tip, transaction: { hex: record.transactionHex } };
+    if (method === 'gettransactionstatus') return pendingReceipt(record);
+    assert.equal(method, 'sendrawtransaction');
     return { txid: record.txid };
   };
   const service = new ClaimerService({ config, journal, rpcFactory: () => rpc,
@@ -50,21 +55,24 @@ async function fixture(t, status = 'unknown') {
 }
 
 for (const status of ['unknown', 'accepted']) for (const malformed of [
-  { name: 'wrong network', result: record => ({ tip: { ...tip, genesis_hash: '00'.repeat(32) }, transaction: { hex: record.transactionHex } }) },
-  { name: 'missing transaction', result: () => ({ tip }) },
-  { name: 'malformed transaction', result: () => ({ tip, transaction: { hex: 'ab'.repeat(50) } }) },
-  { name: 'conflicting reported transaction ID', result: record => ({ tip, status: 'pending', transaction: { hex: record.transactionHex, txid: 'ab'.repeat(32) } }) },
-  { name: 'pending transaction with malformed block hash', result: record => ({ tip, status: 'pending', transaction: { hex: record.transactionHex, blockhash: 'bad' } }) },
-  { name: 'pending transaction with malformed confirmations', result: record => ({ tip, status: 'pending', transaction: { hex: record.transactionHex, confirmations: '1' } }) },
-  { name: 'false genesis confirmation', result: record => ({ tip, status: 'confirmed', block_height: 0, block_hash: tip.hash, transaction: { hex: record.transactionHex, blockhash: tip.hash, confirmations: 101 } }) },
-  { name: 'malformed raw transaction inside a location race', result: () => ({ tip, status: 'pending', transaction: { hex: 'ab'.repeat(50), blockhash: tip.hash, confirmations: 1 } }) },
-  { name: 'false genesis inside an orphaned-backend race', result: record => ({ tip, status: 'confirmed', block_height: 0, block_hash: tip.hash, transaction: { hex: record.transactionHex, blockhash: tip.hash, confirmations: 0 } }) },
+  { name: 'wrong network', result: record => pendingReceipt(record, { tip: { ...tip, genesis_hash: '00'.repeat(32) } }) },
+  { name: 'missing receipt identity', result: () => ({ tip, status: 'pending', confirmations: 0 }) },
+  { name: 'malformed saved transaction', savedHex: 'ab'.repeat(50), result: record => pendingReceipt(record) },
+  { name: 'conflicting reported transaction ID', result: record => pendingReceipt(record, { txid: 'ab'.repeat(32) }) },
+  { name: 'pending transaction with malformed block hash', result: record => pendingReceipt(record, { block_hash: 'bad' }) },
+  { name: 'pending transaction with malformed confirmations', result: record => pendingReceipt(record, { confirmations: '1' }) },
+  { name: 'false genesis confirmation', result: record => ({ ...confirmedReceipt(record), block_height: 0, confirmations: 101 }) },
+  { name: 'malformed saved transaction before a location race', savedHex: 'ab'.repeat(50),
+    result: record => pendingReceipt(record, { confirmations: 1 }) },
+  { name: 'false genesis inside an orphaned-index race', result: record => ({ ...confirmedReceipt(record), block_height: 0, confirmations: 0 }) },
 ]) test(`${status} reconciliation fails closed on ${malformed.name}, never sends replacement bytes or counts success`, async t => {
-  const { service, journal, rpc, calls, record, recover, path } = await fixture(t, status);
+  const savedFields = malformed.savedHex ? { transactionHex: malformed.savedHex, transactionHash: transactionDigest(malformed.savedHex) } : {};
+  const { service, journal, rpc, calls, record, recover, path } = await fixture(t, status, savedFields);
   rpc.respond = async () => malformed.result(record);
   await assert.rejects(recover(), { helperFatal: true });
   assert.equal(service.running, false); assert.equal(service.snapshot().claims.completed, 0);
   assert.equal(calls.some(item => item.method === 'sendrawtransaction'), false);
+  if (malformed.savedHex) assert.equal(calls.length, 0, 'Damaged local bytes fail before any receipt lookup.');
   assert.equal(journal.entries()[0].transactionHex, record.transactionHex);
   assert.equal(service.reserved.has(record.outpoint), true);
   await service.stop();
@@ -76,14 +84,19 @@ for (const status of ['unknown', 'accepted']) for (const malformed of [
 });
 
 for (const status of ['unknown', 'accepted']) for (const race of [
-  { name: 'index pending while backend mined', location: { status: 'pending' }, transaction: { blockhash: tip.hash, confirmations: 1 } },
-  { name: 'index pending with only backend confirmations', location: { status: 'pending' }, transaction: { confirmations: 1 } },
-  { name: 'index pending with only backend block hash', location: { status: 'pending' }, transaction: { blockhash: tip.hash } },
-  { name: 'index confirmed while backend orphaned', location: { status: 'confirmed', block_height: 99, block_hash: 'ab'.repeat(32) }, transaction: { blockhash: 'ab'.repeat(32), confirmations: 0 } },
-  { name: 'index confirmed in another backend block', location: { status: 'confirmed', block_height: 99, block_hash: 'ab'.repeat(32) }, transaction: { blockhash: 'cd'.repeat(32), confirmations: 1 } },
+  { name: 'index pending with positive confirmations', receipt: record => pendingReceipt(record, { confirmations: 1 }) },
+  { name: 'index synchronizing during receipt lookup', code: -32001 },
+  { name: 'index invalidated during receipt lookup', code: -32011 },
+  { name: 'index confirmed with zero confirmations', receipt: record => ({ ...confirmedReceipt(record), confirmations: 0 }) },
+  { name: 'index confirmed in another catalog block', receipt: record => ({ ...confirmedReceipt(record), block_height: 99, block_hash: 'ab'.repeat(32), confirmations: 2 }),
+    window: { tip, blocks: [{ height: 99, hash: 'cd'.repeat(32) }], window: 600 } },
 ]) test(`${status} ${race.name} retries without stopping, losing proof, sending bytes or counting success`, async t => {
   const { service, journal, rpc, calls, record, recover, path } = await fixture(t, status);
-  rpc.respond = async () => ({ tip, ...race.location, transaction: { txid: record.txid, hex: record.transactionHex, ...race.transaction } });
+  if (race.window) service.blockWindow = race.window;
+  rpc.respond = async () => {
+    if (race.code) throw Object.assign(new Error('Indexed state changed'), { code: race.code });
+    return race.receipt(record);
+  };
   await recover();
   assert.equal(service.running, true);
   assert.equal(service.snapshot().claims.completed, 0);
@@ -94,8 +107,7 @@ for (const status of ['unknown', 'accepted']) for (const race of [
   assert.equal(reloaded.entries()[0].status, status);
   assert.equal(reloaded.entries()[0].transactionHex, record.transactionHex);
   assert.equal(reloaded.entries()[0].transactionHash, record.transactionHash);
-  rpc.respond = async () => ({ tip, status: 'confirmed', block_height: tip.height, block_hash: tip.hash,
-    transaction: { txid: record.txid, hex: record.transactionHex, confirmations: 1, blockhash: tip.hash } });
+  rpc.respond = async () => confirmedReceipt(record);
   service.recoveryDue.clear(); await recover();
   assert.equal(journal.entries()[0].status, 'confirmed');
   assert.equal(service.snapshot().claims.completed, status === 'unknown' ? 1 : 0);
@@ -106,15 +118,14 @@ for (const status of ['unknown', 'accepted']) for (const race of [
 
 for (const status of ['unknown', 'accepted']) test(`${status} coherent pending receipt retains proof and later confirmation counts at most once`, async t => {
   const { service, journal, rpc, calls, record, recover, path } = await fixture(t, status);
-  rpc.respond = async () => ({ tip, status: 'pending', transaction: { txid: record.txid, hex: record.transactionHex, confirmations: 0 } });
+  rpc.respond = async () => pendingReceipt(record);
   await recover();
   assert.equal(journal.entries()[0].status, 'accepted');
   assert.equal(journal.entries()[0].transactionHex, record.transactionHex);
   assert.equal(service.snapshot().claims.completed, status === 'unknown' ? 1 : 0);
   const reloaded = new BroadcastJournal(path); await reloaded.load();
   assert.equal(reloaded.entries()[0].transactionHex, record.transactionHex);
-  rpc.respond = async () => ({ tip, status: 'confirmed', block_height: tip.height, block_hash: tip.hash,
-    transaction: { txid: record.txid, hex: record.transactionHex, confirmations: 1, blockhash: tip.hash } });
+  rpc.respond = async () => confirmedReceipt(record);
   service.recoveryDue.clear(); await recover();
   assert.equal(journal.entries()[0].status, 'confirmed');
   assert.equal(journal.entries()[0].transactionHex, undefined);
@@ -139,7 +150,7 @@ for (const stage of ['before-replay', 'accepted-receipt']) test(`reconciliation 
 test('a mismatching retry receipt retains identical bytes and cannot complete the recovered claim', async t => {
   const { service, journal, rpc, calls, record, recover } = await fixture(t);
   rpc.respond = async method => {
-    if (method === 'gettransaction') throw Object.assign(new Error('Not indexed'), { code: -32004 });
+    if (method === 'gettransactionstatus') throw Object.assign(new Error('Not indexed'), { code: -32004 });
     return { txid: '99'.repeat(32) };
   };
   await assert.rejects(recover(), { helperFatal: true });
@@ -152,7 +163,7 @@ test('a mismatching retry receipt retains identical bytes and cannot complete th
 test('real replay validation and real engine count one durable recovered receipt, without new capture work', async t => {
   const { service, journal, rpc, calls, record, recover } = await fixture(t);
   rpc.respond = async method => {
-    if (method === 'gettransaction') throw Object.assign(new Error('Not indexed'), { code: -32004 });
+    if (method === 'gettransactionstatus') throw Object.assign(new Error('Not indexed'), { code: -32004 });
     return { txid: record.txid };
   };
   await recover(); await recover();
@@ -167,8 +178,7 @@ for (const status of ['unknown', 'accepted']) test(`${status} confirmation ahead
   const { service, journal, rpc, calls, record, recover, path } = await fixture(t, status);
   const ahead = { ...tip, height: tip.height + 1, hash: 'ab'.repeat(32) };
   service.blockWindow = { tip, blocks: [{ height: tip.height, hash: tip.hash }], window: 600 };
-  rpc.respond = async () => ({ tip: ahead, status: 'confirmed', block_height: ahead.height, block_hash: ahead.hash,
-    transaction: { txid: record.txid, hex: record.transactionHex, blockhash: ahead.hash, confirmations: 1 } });
+  rpc.respond = async () => confirmedReceipt(record, ahead);
   await recover();
   assert.equal(service.running, true);
   assert.equal(journal.entries()[0].status, status);
@@ -198,8 +208,7 @@ test('a freshly compacted confirmation can reopen after an immediate rollback wi
     window: { tip: currentTip, blocks: currentTip === tip ? [{ height: tip.height, hash: tip.hash }, { height: fundingHeight, hash: fundingBlock }]
       : [{ height: fundingHeight, hash: fundingBlock }], window: 600 } });
   await service.cycle();
-  rpc.respond = async () => ({ tip, status: 'confirmed', block_height: tip.height, block_hash: tip.hash,
-    transaction: { txid: record.txid, hex: record.transactionHex, blockhash: tip.hash, confirmations: 1 } });
+  rpc.respond = async () => confirmedReceipt(record);
   await recover();
   assert.equal(journal.entries()[0].status, 'confirmed');
   assert.equal(service.snapshot().claims.completed, 1);
@@ -226,8 +235,7 @@ for (const changed of ['rollback', 'same-height-reorg']) test(`queued confirmati
     }
     return update(key, fields, options);
   };
-  rpc.respond = async () => ({ tip, status: 'confirmed', block_height: tip.height, block_hash: tip.hash,
-    transaction: { txid: record.txid, hex: record.transactionHex, blockhash: tip.hash, confirmations: 1 } });
+  rpc.respond = async () => confirmedReceipt(record);
   const pending = recover();
   try {
     await entered.promise;

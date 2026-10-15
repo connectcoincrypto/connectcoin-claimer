@@ -441,7 +441,7 @@ for (const source of ['journal', 'snapshot']) test(`a first verified winner surv
   const request = f.rpc.request.bind(f.rpc);
   service.validateSaved = record => record.transactionHex; // Synthetic fixture bytes only.
   f.rpc.request = async (method, params, options) => {
-    if (method === 'gettransaction') {
+    if (method === 'gettransactionstatus') {
       assert.equal(params.txid, winner.context.txid);
       throw Object.assign(new Error('Not indexed'), { code: -32004 });
     }
@@ -537,7 +537,7 @@ for (const stage of ['RPC queue', 'node-rejection backoff']) test(`normal aging 
   // receipt/replay integrity is covered with real serialization in service.test.
   service.validateSaved = record => record.transactionHex;
   f.rpc.request = async (method, params, options) => {
-    if (stage === 'node-rejection backoff' && method === 'gettransaction') {
+    if (stage === 'node-rejection backoff' && method === 'gettransactionstatus') {
       assert.equal(params.txid, winner.context.txid);
       throw Object.assign(new Error('Claim not indexed.'), { code: -32004 });
     }

@@ -261,6 +261,21 @@ Run the resulting `claimer-performance-bench` executable from the build folder
 measure history bookkeeping and bounded allocation, not full TLS throughput;
 the native wall-time estimate is not a production CPU measurement.
 
+## Incremental bounty updates
+
+After the initial bounded snapshot, the claimer requests
+`getbountychanges` with `include_bounties: true`. A versioned delta carries the
+complete changed bounty and its publication tip, not the other bounties from
+its block. Cached rows are replaced only after validating the full payload,
+immutable identity, canonical block, status, spender and pagination fences.
+New blocks still require a complete initial stream; ordinary status updates
+to already loaded blocks do not. Confirmation counts advance with the tip.
+
+Journal gaps, reorganizations and inconsistent snapshots still trigger the
+existing coherent resynchronization. Older servers fall back to block reads
+without skipping their journal cursor. Cached state is published atomically:
+a failed page cannot consume its cursor or partially install updates.
+
 ## Shutdown, crash recovery and uncertain broadcasts
 
 Before a broadcast, the application durably writes a version-3 public
@@ -284,9 +299,11 @@ sent without a conclusive reply) record reserves **only that outpoint**;
 unrelated claims can continue. Neither status proves that no transmission took
 place. A definite node policy rejection also retains the original winning proof
 in the journal as `pending`; a later pending-spend/catalog change cannot discard
-it and force recapture. Recovery first queries
-`gettransaction` for the saved ID and validates returned transaction identity,
-input, receiving output and proof binding. If it is absent from the index,
+it and force recapture. Recovery validates the saved bytes' digest, transaction
+identity, input, receiving output and proof binding locally, then queries
+`gettransactionstatus` for the saved ID. This indexed-only receipt contains
+identity, pending/confirmed state, confirmation count and block location; it
+does not download the raw transaction or witness. If it is absent from the index,
 absence is **not** treated as rejection: the client may retransmit only the
 **identical saved bytes**, after checking the digest, transaction ID, recipient
 and proof structure/binding. It never creates a competing replacement claim.
@@ -306,9 +323,9 @@ another completed claim. Only validated block-confirmation metadata and the
 matching transaction permit transition to `confirmed` and compacting the
 saved bytes; the outpoint/ID reservation remains. Transaction IDs exclude the
 witness, so a node-observed proof can differ from our saved proof while still
-matching the same input, payout and challenge. The observed proof must pass
-the receipt's identity/structure/binding checks; it never replaces the original
-bytes for retransmission. Work is also checked against the bounty target while
+matching the same input, payout and challenge. The full node validates the
+accepted proof; recovery rechecks our original saved proof, and never replaces
+its bytes with a remotely observed witness. Work is checked against the bounty target while
 that metadata remains available; the full node remains the consensus validator.
 A later timeout, quota response or node rejection cannot release an
 outpoint whose earlier broadcast is still uncertain. Invalid saved data or
@@ -326,15 +343,18 @@ publishing any records. Short filesystem reads are continued; trailing corrupt
 data, interrupted reads and growth beyond the 8 MiB limit remain errors and
 never authorize replay from a partially read state.
 
-Receipt metadata must agree with the observed transaction: an optional reported
-transaction ID cannot contradict its saved ID, and an unconfirmed receipt cannot
+Receipt metadata must bind to the saved transaction: its required reported
+transaction ID must match exactly, and an unconfirmed receipt cannot
 carry a block hash or nonzero confirmations. A confirmation at height zero must
 match the network's pinned genesis, even when that block is outside the current
 discovery window. Inconsistent replies never compact the saved proof or credit
-a completed claim. Well-formed location conflicts between the RPC index and its
-backend (for example, the backend mines or orphans a transaction first) retain
-the owner and retry through normal bounded reconciliation instead of stopping
-the service; malformed identity or field types still fail closed.
+a completed claim. Confirmation counts must agree with the indexed tip and
+block height. Well-formed location conflicts retain the owner and retry through
+normal bounded reconciliation instead of stopping the service; malformed
+identity or field types still fail closed. Older RPC servers without the compact
+method leave proofs reserved for retry; there is no full-transaction fallback
+for confirmation polling. Full funding transactions are still fetched and
+validated when preparing a claim, with the existing bounded shared cache.
 
 Receipt reads are fenced against catalog resets, including while a confirmation
 waits for durable storage. An old reply cannot compact a witness or authorize a
@@ -364,8 +384,9 @@ an error status, not a false success. This cannot protect against forced process
 termination or power loss before any durable write succeeds.
 
 Version-1 and version-2 journals remain readable. A legacy record without saved
-transaction bytes can be recognized by an RPC lookup, but cannot be replayed
-if absent; only that outpoint remains quarantined for review. A saved claim for
+transaction bytes cannot be authenticated or replayed by a compact receipt;
+only that outpoint remains quarantined for review, with its reservation intact.
+The client never downloads a replacement proof for that record. A saved claim for
 a different receiving address is also quarantined, never redirected. Keep a
 backup and check the transaction ID/outpoint through a trusted node before
 resolving such a record. Never delete the whole journal or switch configuration
