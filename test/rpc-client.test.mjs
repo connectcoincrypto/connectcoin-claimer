@@ -7,6 +7,8 @@ import { performance } from 'node:perf_hooks';
 import { RpcClient, RpcError, validateRpcParams } from '../src/core/rpc.mjs';
 
 const hash = 'a'.repeat(64);
+const IO_GUARD_MS = 5000;
+const FIXTURE_TIMEOUT_MS = 10000;
 const line = message => `${JSON.stringify(message)}\n`;
 const response = (request, result) => ({ jsonrpc: '2.0', id: request.id, result });
 const note = (method, params) => ({ jsonrpc: '2.0', method, params });
@@ -27,16 +29,37 @@ async function mock(handler, options = {}) {
     });
   });
   server.listen(0, '127.0.0.1'); await once(server, 'listening');
-  const client = new RpcClient({ host: '127.0.0.1', port: server.address().port, timeoutMs: 1000, ...options });
+  const client = new RpcClient({ host: '127.0.0.1', port: server.address().port, timeoutMs: FIXTURE_TIMEOUT_MS, ...options });
   return { client, requests, get connections() { return connections; }, async close() {
     client.close(); for (const socket of sockets) socket.destroy();
     await new Promise(resolve => server.close(resolve));
   } };
 }
-async function bounded(promise) {
+async function bounded(promise, timeoutMs = IO_GUARD_MS) {
   let timer;
-  try { return await Promise.race([promise, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('TEST: stranded RPC promise')), 400); })]); }
+  try { return await Promise.race([promise, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('TEST: stranded RPC promise')), timeoutMs); })]); }
   finally { clearTimeout(timer); }
+}
+
+// Set up real TCP first. Intentional expiry/pacing tests then control both the
+// request timer and its monotonic admission clock; CPU steal is not elapsed
+// protocol time in these fixtures. Each test also has a real runner deadline.
+function controlledClock(t) {
+  let now = 0;
+  t.mock.method(performance, 'now', () => now);
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  return { tick(ms) { now += ms; t.mock.timers.tick(ms); },
+    reset() { t.mock.timers.reset(); t.mock.restoreAll(); } };
+}
+const settle = () => new Promise(resolve => setImmediate(resolve));
+function pacingWait(t, client) {
+  const waiting = Promise.withResolvers(), original = client.quotaWait;
+  t.mock.method(client, 'quotaWait', function (...args) {
+    const wait = original.apply(this, args);
+    if (wait > 0) waiting.resolve(wait);
+    return wait;
+  });
+  return waiting.promise;
 }
 
 test('only well-framed explicit stream invalidations preserve recoverable server codes', async () => {
@@ -157,13 +180,17 @@ test('recent block count is transmitted by the real RPC client and copied before
 });
 
 test('concurrent requests share one connection; chunk fragmentation is reassembled', async () => {
-  const server = await mock((request, socket) => {
-    const encoded = line(response(request, { method: request.method }));
-    if (request.method === 'getchaintip') { socket.write(encoded.slice(0, 8)); setTimeout(() => socket.write(encoded.slice(8)), 5); }
-    else setTimeout(() => socket.write(encoded), 10);
-  });
+  const received = Promise.withResolvers();
+  const server = await mock((_request, socket, requests) => { if (requests.length === 2) received.resolve(socket); });
   try {
-    const results = await Promise.all([server.client.request('getchaintip'), server.client.request('getrecentblockhashes')]);
+    const pending = Promise.all([server.client.request('getchaintip'), server.client.request('getrecentblockhashes')]);
+    const socket = await bounded(received.promise);
+    const first = line(response(server.requests[0], { method: server.requests[0].method }));
+    const fragmentRead = once(server.client.socket, 'data');
+    socket.write(first.slice(0, 8)); await bounded(fragmentRead);
+    assert.equal(server.client.pending.size, 2, 'A partial frame cannot settle either request');
+    socket.write(first.slice(8) + line(response(server.requests[1], { method: server.requests[1].method })));
+    const results = await pending;
     assert.deepEqual(results.map(result => result.method), ['getchaintip', 'getrecentblockhashes']);
     assert.equal(server.connections, 1); assert.equal(server.client.pending.size, 0);
   } finally { await server.close(); }
@@ -278,45 +305,82 @@ test('invalid envelopes, UTF8, and oversized unframed messages fail closed', asy
     () => Buffer.alloc(2 * 1024 * 1024 + 1, 65),
   ]) {
     const server = await mock((request, socket) => socket.write(malformed(request)));
-    try { await assert.rejects(bounded(server.client.request('getchaintip')), /invalid or oversized/); }
+    try {
+      // A complete 2 MiB transfer may take more than 400 ms on a contended runner.
+      // This is only a liveness guard: protocol rejection is still mandatory,
+      // and the longer RPC timeout cannot accidentally satisfy this assertion.
+      await assert.rejects(bounded(server.client.request('getchaintip')), /invalid or oversized/);
+      assert.equal(server.requests.length, 1);
+      assert.equal(server.client.pending.size, 0); assert.equal(server.client.streams.size, 0);
+      assert.equal(server.client.socket?.destroyed ?? true, true);
+    }
     finally { await server.close(); }
   }
 });
 
-test('timeout and transport loss make broadcast outcome explicitly unknown, with no retry', async () => {
+test('timeout and transport loss make broadcast outcome explicitly unknown, with no retry', { timeout: FIXTURE_TIMEOUT_MS }, async t => {
   for (const close of [true, false]) {
-    const server = await mock((_request, socket) => { if (close) socket.destroy(); }, { timeoutMs: 50 });
+    const received = Promise.withResolvers();
+    const server = await mock((_request, socket) => received.resolve(socket));
+    let clock;
     try {
-      await assert.rejects(server.client.request('sendrawtransaction', { transaction_hex: '00'.repeat(20) }), error => error.unknownOutcome && /unknown/.test(error.message));
-      await delay(30); assert.equal(server.requests.length, 1); assert.equal(server.connections, 1);
-    } finally { await server.close(); }
+      await server.client.connect();
+      clock = controlledClock(t); server.client.timeoutMs = 50;
+      const result = assert.rejects(server.client.request('sendrawtransaction', { transaction_hex: '00'.repeat(20) }), error => error.unknownOutcome && /unknown/.test(error.message));
+      const socket = await received.promise;
+      assert.equal(server.client.pending.size, 1);
+      if (close) socket.destroy();
+      else {
+        clock.tick(49); await settle();
+        assert.equal(server.client.pending.size, 1, 'The written broadcast must not expire early');
+        clock.tick(1);
+      }
+      await result; clock.tick(1000); await settle();
+      assert.equal(server.requests.length, 1); assert.equal(server.connections, 1);
+      assert.equal(server.client.pending.size, 0);
+    } finally { await server.close(); clock?.reset(); }
   }
 });
 
-for (const failure of ['timeout', 'malformed reply']) test(`immediate retry after ${failure} publishes disconnection before replacing the socket`, async () => {
+for (const failure of ['timeout', 'malformed reply']) test(`immediate retry after ${failure} publishes disconnection before replacing the socket`, { timeout: FIXTURE_TIMEOUT_MS }, async t => {
+  const received = Promise.withResolvers();
   const server = await mock((request, socket, requests) => {
     if (requests.length > 1) socket.write(line(response(request, true)));
-    else if (failure === 'malformed reply') socket.write('invalid-json\n');
-  }, { timeoutMs: 50 });
+    else received.resolve(socket);
+  });
   const events = [];
   server.client.on('connected', () => events.push('connected'));
   server.client.on('disconnected', () => events.push('disconnected'));
   try {
-    await assert.rejects(server.client.request('getchaintip'), /timed out|invalid or oversized/);
+    await server.client.connect();
+    const clock = controlledClock(t); server.client.timeoutMs = 50;
+    const rejected = assert.rejects(server.client.request('getchaintip'), failure === 'timeout' ? /request timed out/ : /invalid or oversized/);
+    const socket = await received.promise;
+    if (failure === 'timeout') {
+      clock.tick(49); await settle(); assert.equal(server.client.pending.size, 1);
+      clock.tick(1);
+    } else socket.write('invalid-json\n');
+    await rejected;
     // Retry in the rejected request's continuation, before the old socket's
     // close event. Subscription and wallet invalidations must not disappear.
     assert.equal(await server.client.request('getchaintip'), true);
-    await new Promise(resolve => setImmediate(resolve));
+    await settle();
     assert.deepEqual(events, ['connected', 'disconnected', 'connected']);
     assert.equal(server.connections, 2);
     assert.equal(server.client.pending.size, 0);
   } finally { await server.close(); }
 });
 
-test('a disconnection listener can close the client before an immediate reconnect', async () => {
-  const server = await mock(() => {}, { timeoutMs: 50 });
+test('a disconnection listener can close the client before an immediate reconnect', { timeout: FIXTURE_TIMEOUT_MS }, async t => {
+  const received = Promise.withResolvers();
+  const server = await mock(() => received.resolve());
   try {
-    await assert.rejects(server.client.request('getchaintip'), /timed out/);
+    await server.client.connect();
+    const clock = controlledClock(t); server.client.timeoutMs = 50;
+    const rejected = assert.rejects(server.client.request('getchaintip'), /request timed out/);
+    await received.promise;
+    clock.tick(49); await settle(); assert.equal(server.client.pending.size, 1);
+    clock.tick(1); await rejected;
     server.client.once('disconnected', () => server.client.close());
     await assert.rejects(server.client.request('getchaintip'), { name: 'AbortError' });
     assert.equal(server.connections, 1);
@@ -325,38 +389,52 @@ test('a disconnection listener can close the client before an immediate reconnec
   } finally { await server.close(); }
 });
 
-test('RPC not-ready and rate limit errors retain structured codes; future request obeys cooldown', async () => {
+test('RPC not-ready and rate limit errors retain structured codes; future request obeys cooldown', { timeout: FIXTURE_TIMEOUT_MS }, async t => {
   const times = [];
   const server = await mock((request, socket, requests) => {
     times.push(performance.now());
     socket.write(line(requests.length === 1 ? { jsonrpc: '2.0', id: request.id, error: { code: -32029, message: 'Rate limited', data: { retry_after_ms: 80 } } } : response(request, true)));
   });
   try {
+    await server.client.connect(); const clock = controlledClock(t);
     await assert.rejects(server.client.request('getchaintip'), error => error instanceof RpcError && error.code === -32029);
-    assert.equal(await server.client.request('getchaintip'), true);
-    assert.ok(times[1] - times[0] >= 70);
+    const waiting = pacingWait(t, server.client);
+    const pending = server.client.request('getchaintip');
+    assert.equal(await waiting, 80, 'The real cooldown must suspend admission');
+    clock.tick(79); await settle(); assert.equal(server.requests.length, 1, 'Cooldown forbids early transmission');
+    clock.tick(1); assert.equal(await pending, true);
+    assert.equal(times[1] - times[0], 80);
   } finally { await server.close(); }
   const notReady = await mock((request, socket) => socket.write(line({ jsonrpc: '2.0', id: request.id, error: { code: -32001, message: 'Not ready' } })));
   try { await assert.rejects(notReady.client.request('getchaintip'), error => error.code === -32001); }
   finally { await notReady.close(); }
 });
 
-test('quota survives reconnection and block quotas are canonical per block', async () => {
+test('quota survives reconnection and block quotas are canonical per block', { timeout: FIXTURE_TIMEOUT_MS }, async t => {
   const times = [];
   const server = await mock((request, socket) => { times.push(performance.now()); socket.write(line(response(request, true))); }, { quota: 1, windowMs: 100 });
   try {
+    await server.client.connect(); const clock = controlledClock(t);
     await server.client.request('getchaintip');
     const oldClosed = once(server.client, 'disconnected'); server.client.socket.destroy(); await oldClosed;
-    await server.client.request('getchaintip');
-    assert.ok(times[1] - times[0] >= 90); assert.equal(server.connections, 2);
+    assert.deepEqual(server.client.history.get('getchaintip'), [0], 'Closing the socket cannot clear quota history');
+    const waiting = pacingWait(t, server.client);
+    const pending = server.client.request('getchaintip');
+    assert.equal(await waiting, 110, 'The retained quota must suspend admission');
+    clock.tick(99); await settle(); assert.equal(server.requests.length, 1, 'Quota survives socket replacement');
+    assert.ok(server.client.quotaWait('getchaintip', {}) > 0, 'Admission remains blocked before the quota window');
+    clock.tick(11); await pending;
+    assert.equal(times[1] - times[0], 110); assert.equal(server.connections, 2);
     assert.equal(server.client.history.get('getchaintip').length, 1);
+    assert.equal(server.client.history.get('getchaintip')[0], 110, 'Admission uses the controlled write clock');
     await server.client.pace('getblockbounties', { block_hash: hash });
     await server.client.pace('getblockbounties', { block_hash: 'b'.repeat(64) });
     assert.equal(server.client.history.get(`getblockbounties:${hash}`).length, 1);
   } finally { await server.close(); }
 });
 
-test('queued parameters are snapshotted, close aborts pace waiters, connection-close race settles', async () => {
+test('queued parameters are snapshotted, close aborts pace waiters, connection-close race settles', async t => {
+  t.mock.method(performance, 'now', () => 0);
   const events = [];
   const server = await mock((request, socket) => socket.write(line(response(request, request.params))), {
     quota: 1, windowMs: 1000, onDiagnostic: (event, details) => events.push({ event, details }),
@@ -368,6 +446,7 @@ test('queued parameters are snapshotted, close aborts pace waiters, connection-c
     const waiting = server.client.request('gettransaction', { txid: hash });
     const assertion = assert.rejects(bounded(waiting), error => error.name === 'AbortError' && error.code === 'ABORT_ERR');
     server.client.close(); await assertion; assert.equal(server.client.queuedRequests, 0);
+    assert.equal(server.requests.length, 1);
     assert.equal(events.filter(item => item.event === 'rpc.cancelled').length, 1);
     assert.equal(events.some(item => item.event === 'rpc.failed'), false);
   } finally { await server.close(); }
@@ -465,7 +544,8 @@ test('diagnostic callbacks cannot fail requests or replace RPC errors', async ()
   }
 });
 
-test('diagnostics record RPC error metadata without request params or endpoint details', async () => {
+test('diagnostics record RPC error metadata without request params or endpoint details', async t => {
+  t.mock.method(performance, 'now', () => 0);
   const events = [];
   const server = await mock((request, socket) => socket.write(line({ jsonrpc: '2.0', id: request.id,
     error: { code: -32020, message: 'Rejected', data: { node_code: -26 } } })), { onDiagnostic: (event, details) => events.push({ event, details }) });
@@ -492,24 +572,40 @@ test('diagnostics record RPC error metadata without request params or endpoint d
     assert.equal(serialized.includes('127.0.0.1'), false);
     assert.equal(events.filter(item => item.event === 'rpc.connected').length, 1);
     assert.equal(events.some(item => item.event === 'rpc.slow'), false);
-  } finally { await server.close(); }
-  await delay(0);
+  } finally {
+    // Intentional client.close clears its socket reference, so its public
+    // disconnected event is not promised; diagnostics run on socket.close.
+    const disconnected = server.client.socket ? once(server.client.socket, 'close') : Promise.resolve();
+    await server.close(); await bounded(disconnected);
+  }
   assert.equal(events.filter(item => item.event === 'rpc.disconnected').length, 1);
 });
 
-test('transport diagnostics retain the timeout cause and unknown broadcast outcome without retrying', async () => {
+test('transport diagnostics retain the timeout cause and unknown broadcast outcome without retrying', { timeout: FIXTURE_TIMEOUT_MS }, async t => {
   const events = [];
-  const server = await mock(() => {}, { timeoutMs: 30, onDiagnostic: (event, details) => events.push({ event, details }) });
+  const received = Promise.withResolvers();
+  const server = await mock(() => received.resolve(), { onDiagnostic: (event, details) => events.push({ event, details }) });
   try {
-    await assert.rejects(server.client.request('sendrawtransaction', { transaction_hex: 'ab'.repeat(40) }), error => error.unknownOutcome === true);
+    await server.client.connect();
+    const clock = controlledClock(t); server.client.timeoutMs = 30;
+    const result = assert.rejects(server.client.request('sendrawtransaction', { transaction_hex: 'ab'.repeat(40) }), error => error.unknownOutcome === true);
+    // A local socket.write does not mean the peer's data callback has run.
+    // Exercise the actual timeout only after the mock has received the bytes.
+    await received.promise;
+    assert.equal(server.requests.length, 1); assert.equal(server.client.pending.size, 1);
+    clock.tick(29); await settle();
+    assert.equal(events.filter(item => item.event === 'rpc.failed').length, 0);
+    assert.equal(server.client.pending.size, 1, 'The request must not expire before 30 ms');
+    clock.tick(1); await result;
     const failures = events.filter(item => item.event === 'rpc.failed');
     assert.equal(failures.length, 1);
     assert.equal(failures[0].details.method, 'sendrawtransaction');
     assert.equal(failures[0].details.stage, 'request');
     assert.equal(failures[0].details.unknownOutcome, true);
     assert.match(failures[0].details.error.message, /request timed out/);
-    assert.ok(failures[0].details.durationMs >= 20);
+    assert.equal(failures[0].details.durationMs, 30);
     assert.equal(server.requests.length, 1);
+    assert.equal(server.client.pending.size, 0); assert.equal(server.connections, 1);
   } finally { await server.close(); }
 });
 
@@ -535,7 +631,7 @@ test('connection failures retain their socket code and request context', async (
   const server = await mock(() => {}, { onDiagnostic: (event, details) => events.push({ event, details }) });
   const port = server.client.port;
   await server.close();
-  const client = new RpcClient({ host: '127.0.0.1', port, timeoutMs: 1000, onDiagnostic: (event, details) => events.push({ event, details }) });
+  const client = new RpcClient({ host: '127.0.0.1', port, timeoutMs: FIXTURE_TIMEOUT_MS, onDiagnostic: (event, details) => events.push({ event, details }) });
   try {
     await assert.rejects(client.request('getchaintip'), /Cannot connect/);
     const failures = events.filter(item => item.event === 'rpc.failed');
@@ -562,20 +658,25 @@ test('invalid method names and rejected params are never copied into diagnostics
   } finally { client.close(); }
 });
 
-test('slow diagnostics include pacing time and omit fast successful requests', async () => {
+test('slow diagnostics include pacing time and omit fast successful requests', { timeout: FIXTURE_TIMEOUT_MS }, async t => {
   const events = [];
   const server = await mock((request, socket) => socket.write(line(response(request, true))), {
     quota: 1, windowMs: 1100, onDiagnostic: (event, details) => events.push({ event, details }),
   });
   try {
+    await server.client.connect(); const clock = controlledClock(t);
     assert.equal(await server.client.request('getchaintip'), true);
     assert.equal(events.some(item => item.event === 'rpc.slow'), false);
-    assert.equal(await server.client.request('getchaintip'), true);
+    const waiting = pacingWait(t, server.client);
+    const pending = server.client.request('getchaintip');
+    assert.equal(await waiting, 1110, 'Real quota pacing contributes to request duration');
+    clock.tick(1099); await settle(); assert.equal(server.requests.length, 1);
+    clock.tick(11); assert.equal(await pending, true);
     const slow = events.filter(item => item.event === 'rpc.slow');
     assert.equal(slow.length, 1);
     assert.equal(slow[0].details.method, 'getchaintip');
     assert.equal(slow[0].details.stage, 'request');
-    assert.ok(slow[0].details.durationMs >= 1000);
+    assert.equal(slow[0].details.durationMs, 1110);
     assert.equal(events.some(item => item.event === 'rpc.failed'), false);
     assert.equal(server.requests.length, 2);
   } finally { await server.close(); }
