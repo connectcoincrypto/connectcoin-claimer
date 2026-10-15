@@ -179,6 +179,74 @@ function validateBountyRow(row, tip, hash, height, delta = false) {
       ((row.status === 'immature') !== (row.coinbase && row.confirmations < 100)))) throw new Error('Invalid bounty delta metadata.');
 }
 
+// Compact v2 changes transport representation only. Reconstruct a v1-shaped
+// page before the same sequence/count/row/canonical-window validators run.
+// No array/null alias may borrow state from another request or RPC epoch.
+function normalizeCompactV2Page(page, { requestedVersion, state, base, network }) {
+  if (page?.compact !== 2) return page;
+  if (requestedVersion !== 2) throw new Error('Unrequested compact bounty version.');
+  if (Object.hasOwn(page, 'unchanged')) {
+    if (page.unchanged !== true || Reflect.ownKeys(page).length !== 2) throw new Error('Invalid unchanged bounty acknowledgement.');
+    return { compact: 1, unchanged: true };
+  }
+  if (Object.hasOwn(page, 'bounty_deltas') || Object.hasOwn(page, 'block_deltas') ||
+      !Array.isArray(page.changes) || page.changes.length > 10000 ||
+      !Array.isArray(page.tips) || page.tips.length > 10000) throw new Error('Invalid compact v2 bounty page.');
+  const bound = Array.isArray(page.tip);
+  let tip = page.tip, blockDelta = page.block_delta, cursor = page.next_cursor;
+  if (bound) {
+    if (!state || !base || state.digest !== bountyStateDigest(state.tip, state.cursor) ||
+        !sameTip(state.tip, base.tip) || tip.length !== 3 || !Array.isArray(blockDelta) || blockDelta.length > 5) {
+      throw new Error('Invalid request-bound bounty page.');
+    }
+    validateTip(state.tip, network);
+    tip = { height: tip[0], hash: tip[1], mediantime: tip[2], chain: state.tip.chain, genesis_hash: state.tip.genesis_hash };
+    validateTip(tip, network);
+    if (blockDelta.length !== tip.height - base.tip.height) throw new Error('Invalid request-bound block sequence.');
+    blockDelta = { base_height: base.tip.height, base_hash: base.tip.hash, blocks: blockDelta.map((entry, index) => {
+      const height = base.tip.height + index + 1;
+      if (!Array.isArray(entry) || entry.length !== 2 || !uint(entry[1], MAX_ROWS) ||
+          (entry[0] === null ? index !== page.block_delta.length - 1 || height !== tip.height : typeof entry[0] !== 'string' || !HASH.test(entry[0]))) {
+        throw new Error('Invalid request-bound block metadata.');
+      }
+      return { height, hash: entry[0] === null ? tip.hash : entry[0], bounty_count: entry[1] };
+    }) };
+    if (cursor === null) {
+      if (page.changes.length || page.has_more !== false || !cursorValid(state.cursor)) throw new Error('Invalid unchanged bounty cursor.');
+      cursor = state.cursor;
+    }
+  } else if (Array.isArray(blockDelta) || cursor === null) throw new Error('Unbound compact bounty alias.');
+  validateTip(tip, network);
+  const tips = page.tips.slice();
+  let currentTipIndex;
+  const changes = page.changes.map(original => {
+    if (!original || Array.isArray(original) ||
+        (original.tip_ref !== -1 && !uint(original.tip_ref, page.tips.length - 1))) throw new Error('Invalid compact bounty event.');
+    const event = { ...original };
+    if (event.tip_ref === -1) {
+      currentTipIndex ??= tips.push(tip) - 1;
+      event.tip_ref = currentTipIndex;
+    }
+    if (event.type === 'added') {
+      if (['txid', 'vout', 'block_hash', 'block_height'].some(key => Object.hasOwn(event, key))) throw new Error('Mixed compact added identity.');
+      const eventTip = tips[event.tip_ref];
+      validateTip(eventTip, network);
+      validateBountyRow(event.bounty, eventTip, event.bounty?.block_hash, undefined, true);
+      Object.assign(event, { txid: event.bounty.txid, vout: event.bounty.vout, block_hash: event.bounty.block_hash, block_height: event.bounty.block_height });
+    }
+    if (Object.hasOwn(event, 'spending_txid_ref')) {
+      if (event.spending_txid_ref !== true || Object.hasOwn(event, 'spending_txid') ||
+          !['pending_spend', 'spent', 'available_again', 'matured'].includes(event.type) ||
+          !event.bounty_delta || !Object.hasOwn(event.bounty_delta, 'spending_txid')) throw new Error('Invalid compact spender alias.');
+      event.spending_txid = event.bounty_delta.spending_txid;
+      delete event.spending_txid_ref;
+    }
+    return event;
+  });
+  return { ...page, compact: 1, tip, tips, changes, next_cursor: cursor, bounty_deltas: 1,
+    ...(base || Object.hasOwn(page, 'block_delta') ? { block_deltas: 1, block_delta: blockDelta } : {}) };
+}
+
 function expandCompactPage(page, { requested, state, base, staged, network, lastSequence, inline, expectedCounts, lookback }) {
   if (page?.compact === undefined) {
     if (page && (Object.hasOwn(page, 'unchanged') || Object.hasOwn(page, 'tips'))) throw new Error('Missing compact bounty capability.');
@@ -206,7 +274,7 @@ function expandCompactPage(page, { requested, state, base, staged, network, last
     if (!event || !['added', 'spent', 'pending_spend', 'available_again', 'matured', 'window_exit'].includes(event.type) ||
         typeof event.txid !== 'string' || !HASH.test(event.txid) || !uint(event.vout) ||
         !uint(event.sequence, Number.MAX_SAFE_INTEGER) || event.sequence <= lastSequence ||
-        !uint(event.tip_ref, page.tips.length - 1) || Object.hasOwn(event, 'tip') ||
+        !uint(event.tip_ref, page.tips.length - 1) || Object.hasOwn(event, 'tip') || Object.hasOwn(event, 'spending_txid_ref') ||
         (event.block_hash !== undefined && (typeof event.block_hash !== 'string' || !HASH.test(event.block_hash))) ||
         (event.spending_txid !== undefined && event.spending_txid !== null && (typeof event.spending_txid !== 'string' || !HASH.test(event.spending_txid)))) throw new Error('Invalid compact bounty event.');
     lastSequence = event.sequence;
@@ -309,7 +377,7 @@ export async function readBountyBlock({ rpc, network, hash, height, check = () =
 }
 
 /** Stage the complete window, replay every journal page, then publish atomically. */
-export async function discoverBounties({ rpc, network, lookback = 600, previous = new Map(), previousWindow = null, cursor = null, check = () => {}, onInvalidate = () => {}, onWindow = () => {}, onReset = async () => {}, readBlock }) {
+export async function discoverBounties({ rpc, network, lookback = 600, previous = new Map(), previousWindow = null, cursor = null, capabilities, check = () => {}, onInvalidate = () => {}, onWindow = () => {}, onReset = async () => {}, readBlock }) {
   if (!Number.isInteger(lookback) || lookback < 1 || lookback > 600) throw new Error('Invalid bounty lookback.');
   let cached = new Map(previous);
   // blockCounts is local snapshot metadata, explicitly copied from our prior
@@ -317,6 +385,7 @@ export async function discoverBounties({ rpc, network, lookback = 600, previous 
   let knownWindow = previousWindow ? validatedWindow(previousWindow, network, previousWindow.blockCounts) : null;
   let cachedWindow = cursor ? knownWindow : null;
   let requestDeltas = true, requestBlocks = true, requestCompact = true, requestCounts = true;
+  let requestCompactV2 = capabilities?.compactVersion !== 1;
   if (!cursor) { check(); await onReset({ reason: 'initial' }); check(); cached = new Map(); }
   for (let restart = 0; restart < 4; restart++) {
     check();
@@ -399,12 +468,15 @@ export async function discoverBounties({ rpc, network, lookback = 600, previous 
       for (;;) {
         const expanded = requestDeltas ? { ...params, include_bounties: true } : params;
         const compact = requestDeltas && requestCompact;
+        const requestedVersion = compact && requestCompactV2 ? 2 : 1;
         const state = compact && base && from ? { tip: Object.freeze({ ...base.tip }), cursor: from } : null;
         if (state) state.digest = bountyStateDigest(state.tip, state.cursor);
         try {
           page = await query('getbountychanges', { ...expanded,
             ...(base ? { known_tip: { height: base.tip.height, hash: base.tip.hash } } : {}),
-            ...(compact ? { compact: true } : {}), ...(state ? { known_state: state.digest } : {}) });
+            ...(compact ? { compact: true } : {}), ...(compact && requestCompactV2 ? { compact_version: 2 } : {}), ...(state ? { known_state: state.digest } : {}) });
+          const returnedVersion = page?.compact;
+          page = normalizeCompactV2Page(page, { requestedVersion, state, base, network });
           if (page?.changes?.some?.(event => event?.type === 'resync_required')) throw new RescanRequired('Bounty journal requested a new snapshot.');
           const advertisedCompact = page?.compact !== undefined;
           // Unknown immutable rows permit an expanded replay, not forgiveness
@@ -413,6 +485,9 @@ export async function discoverBounties({ rpc, network, lookback = 600, previous 
           if (!acknowledgement) inline = validatePage(page);
           page = expandCompactPage(page, { requested: compact, state, base, staged, network, lastSequence, inline, expectedCounts, lookback });
           if (acknowledgement) inline = validatePage(page);
+          if (compact && requestedVersion === 2 && returnedVersion === 1) {
+            requestCompactV2 = false; if (capabilities) capabilities.compactVersion = 1;
+          }
           if (!advertisedCompact) requestCompact = false;
           break;
         } catch (error) {
@@ -422,7 +497,8 @@ export async function discoverBounties({ rpc, network, lookback = 600, previous 
           if (!requestDeltas || error.code !== -32602) throw error;
           // Negotiate one optional extension at a time, at this exact cursor.
           // Transport/backend failures are never compatibility signals.
-          if (compact) requestCompact = false;
+          if (compact && requestCompactV2) { requestCompactV2 = false; if (capabilities) capabilities.compactVersion = 1; }
+          else if (compact) requestCompact = false;
           else if (base) { requestBlocks = false; base = null; }
           else { requestDeltas = false; requestBlocks = false; }
         }

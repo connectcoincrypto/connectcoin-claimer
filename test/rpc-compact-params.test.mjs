@@ -3,6 +3,18 @@ import assert from 'node:assert/strict';
 import { validateRpcParams } from '../src/core/rpc.mjs';
 
 const hash = 'ab'.repeat(32), known_tip = { height: 700, hash }, cursor = 'opaque-cursor';
+
+test('compact version 2 is an explicit numeric opt-in, without getters or mixed legacy modes', () => {
+  const base = { include_bounties: true, compact: true };
+  assert.deepEqual(validateRpcParams('getbountychanges', { ...base, compact_version: 2 }), { ...base, compact_version: 2 });
+  for (const value of [undefined, null, 0, 1, 3, 2.5, '2', true, [], {}]) {
+    assert.throws(() => validateRpcParams('getbountychanges', { ...base, compact_version: value }), /Invalid RPC compact version/);
+  }
+  for (const params of [{ compact_version: 2 }, { include_bounties: true, compact: false, compact_version: 2 }]) {
+    assert.throws(() => validateRpcParams('getbountychanges', params), /Invalid RPC/);
+  }
+  assert.throws(() => validateRpcParams('getbountychanges', { ...base, get compact_version() { assert.fail('Getter executed'); } }), /plain data/);
+});
 test('compact/count/raw opt-ins require booleans and never invoke getters or leak extras', () => {
   for (const [method, key, base] of [['getbountychanges', 'compact', { include_bounties: true }],
     ['getrecentblockhashes', 'include_bounty_counts', {}], ['gettransaction', 'raw_only', { txid: hash }]]) {

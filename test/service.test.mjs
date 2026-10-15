@@ -94,6 +94,21 @@ test('custom engines keep their push-state contract even if they have an unrelat
   assert.deepEqual(service.snapshot().claims, { completed: 7, attempts: 12 });
 });
 
+test('bounty wire negotiation is retained within one RPC epoch and discarded on disconnect', async t => {
+  const seen = [], owners = [];
+  const { service, rpc } = await fixture(t, { discover: async options => {
+    owners.push(options.capabilities); seen.push({ ...options.capabilities });
+    options.capabilities.compactVersion = 1;
+    return { blocks: new Map([[BLOCK, [bounty]]]), cursor: 'cursor-one', tip };
+  } });
+  await service.start(); await service.cycle();
+  assert.deepEqual(seen, [{}, { compactVersion: 1 }]); assert.equal(owners[0], owners[1]);
+  rpc.emit('disconnected'); await service.suspending;
+  assert.notEqual(service.bountyCapabilities, owners[0]);
+  owners[0].compactVersion = 2; // Late old-epoch negotiation cannot affect the replacement.
+  await service.cycle(); assert.deepEqual(seen[2], {}); assert.notEqual(owners[2], owners[0]);
+});
+
 test('reuses the processed discovery cursor and validates parent transaction before preparing a public-address claim', async t => {
   const calls = [];
   const { service, rpc, engine } = await fixture(t, { discover: async options => {

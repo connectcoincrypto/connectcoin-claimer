@@ -8,7 +8,7 @@ const PARAMS = Object.freeze({
   getchaintip: [], getrecentblockhashes: ['count', 'include_bounty_counts'], getblockbounties: ['block_hash'],
   getaddressbalance: ['address'], getaddresshistory: ['address', 'cursor'], getaddressutxos: ['address', 'cursor', 'include_pending_spent'],
   getaddresschanges: ['addresses', 'cursor'],
-  gettransaction: ['txid', 'raw_only'], gettransactionstatus: ['txid'], gettransactions: ['txids'], sendrawtransaction: ['transaction_hex'], getbountychanges: ['cursor', 'include_bounties', 'known_tip', 'compact', 'known_state'],
+  gettransaction: ['txid', 'raw_only'], gettransactionstatus: ['txid'], gettransactions: ['txids'], sendrawtransaction: ['transaction_hex'], getbountychanges: ['cursor', 'include_bounties', 'known_tip', 'compact', 'compact_version', 'known_state'],
   subscribebounties: [], subscribeaddress: ['address', 'changes_only'], subscribetip: [], unsubscribe: ['subscription_id'],
 });
 const MAX_FRAME = 2 * 1024 * 1024;
@@ -27,7 +27,7 @@ export function validateRpcParams(method, params) {
   const clean = {};
   for (const key of PARAMS[method]) {
     if (!Object.hasOwn(params, key)) {
-      if (!['cursor', 'include_pending_spent', 'changes_only', 'count', 'include_bounties', 'known_tip', 'compact', 'known_state', 'include_bounty_counts', 'raw_only'].includes(key)) throw new Error(`Missing RPC parameter: ${key}.`);
+      if (!['cursor', 'include_pending_spent', 'changes_only', 'count', 'include_bounties', 'known_tip', 'compact', 'compact_version', 'known_state', 'include_bounty_counts', 'raw_only'].includes(key)) throw new Error(`Missing RPC parameter: ${key}.`);
       continue;
     }
     const descriptor = Object.getOwnPropertyDescriptor(params, key);
@@ -35,6 +35,10 @@ export function validateRpcParams(method, params) {
     const value = descriptor.value;
     if (['compact', 'include_bounty_counts', 'raw_only'].includes(key)) {
       if (typeof value !== 'boolean' || (key === 'compact' && value && clean.include_bounties !== true)) throw new Error(`Invalid RPC ${key} option.`);
+      clean[key] = value; continue;
+    }
+    if (key === 'compact_version') {
+      if (value !== 2 || clean.compact !== true || clean.include_bounties !== true) throw new Error('Invalid RPC compact version.');
       clean[key] = value; continue;
     }
     if (key === 'known_state') {

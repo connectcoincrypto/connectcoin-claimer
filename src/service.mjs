@@ -46,6 +46,7 @@ export class ClaimerService {
     this.blocks = new Map(); this.outpoints = new Map(); this.cursor = null; this.blockWindow = null; this.reserved = new Set();
     this.catalogGate = null; this.catalogRevision = 0;
     this.fundingPending = new Map(); this.ioAbort = new AbortController(); this.rawFunding = true;
+    this.bountyCapabilities = {};
     this.metrics = new ClaimMetrics();
     this.timer = null; this.cycling = null; this.suspending = null; this.stopping = null; this.stoppingFailed = false;
     this.inFlightBroadcasts = new Set(); this.recoveryDue = new Map(); this.recoveryBlocked = new Set();
@@ -176,6 +177,7 @@ export class ClaimerService {
     this.ready = false;
     this.epoch++; this.ioAbort.abort(); this.cancelCatalogWaiters(); this.ioAbort = new AbortController();
     this.tip = null; this.blockWindow = null; this.clearFundingCache(); this.fundingPending.clear(); this.rawFunding = true;
+    this.bountyCapabilities = {};
     this.status = 'reconnecting';
     const epoch = this.epoch;
     const saved = this.persistPendingProofs(), previous = this.suspending;
@@ -213,6 +215,7 @@ export class ClaimerService {
       await this.rpc.connect(); check();
       const scopedRpc = { request: (method, params, options) => this.rpc.request(method, params, { ...options, signal }) };
       const result = await this.discover({ rpc: scopedRpc, network: this.config.network,
+        capabilities: this.bountyCapabilities,
         lookback: this.config.lookbackBlocks, previous: this.blocks, previousWindow: this.blockWindow, cursor: this.cursor, check,
         onReset: async details => { check(); this.resetCatalog(details); },
         onInvalidate: (row, reason) => {

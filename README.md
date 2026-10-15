@@ -128,6 +128,16 @@ working directory. Source runs default to `./claimer.conf`.
   envelopes, known-reference mismatches and contradictory counts never use that
   fallback. Optional features are removed individually only on RPC `-32602`;
   backend, transport and malformed-data failures do not negotiate away checks.
+  The additional `compact_version: 2` opt-in removes repeated wire fields, not
+  validation: request-bound tip/block arrays and unchanged cursors reconstruct
+  from the exact privately owned request snapshot; page-tip references, added
+  identities and equal spender aliases are expanded before the same complete
+  row, count, sequence and canonical-chain checks. Reorganizations and unbound
+  responses retain explicit tips, cursors and block-delta bases. Contradictory
+  or mixed aliases fail closed. Unsupported v2 is negotiated first at the same
+  cursor, remembered only for that RPC connection epoch, and retried after a
+  reconnect. Polling, receipt schedules, journal retention and counters do not
+  change.
   A changed tip not covered by an inline block delta, including a same-height reorganization, requests
   the latest 5 hashes, then 100, then 600 as needed to find a matching cached
   hash **and height** and reconstruct the complete window. Contradictory

@@ -234,8 +234,10 @@ test('count option rejection retries without it and never treats missing counts 
 test('compact rejection drops only compact/known_state at the same cursor', async () => {
   const f = fixture(); f.before = (method, params) => { if (params.compact) throw Object.assign(new Error('Old compact schema'), { code: -32602 }); };
   const result = await discoverBounties({ ...f.options, ...f.warm() });
-  assert.equal(f.calls.length, 2); assert.equal(result.cursor, '0');
-  assert.deepEqual(f.calls[1].params, { cursor: '0', include_bounties: true, known_tip: { height: 700, hash: f.current.tip.hash } });
+  assert.equal(f.calls.length, 3); assert.equal(result.cursor, '0');
+  assert.equal(f.calls[0].params.compact_version, 2);
+  assert.equal(f.calls[1].params.compact_version, undefined); assert.equal(f.calls[1].params.compact, true);
+  assert.deepEqual(f.calls[2].params, { cursor: '0', include_bounties: true, known_tip: { height: 700, hash: f.current.tip.hash } });
 });
 
 for (const code of [-32001, -32002, -32029, -32601, 'ECONNRESET']) test(`genuine compact failure ${code} never negotiates away validation`, async () => {
