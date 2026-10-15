@@ -128,14 +128,14 @@ working directory. Source runs default to `./claimer.conf`.
   envelopes, known-reference mismatches and contradictory counts never use that
   fallback. Optional features are removed individually only on RPC `-32602`;
   backend, transport and malformed-data failures do not negotiate away checks.
-  The additional `compact_version: 2` opt-in removes repeated wire fields, not
+  The current `compact_version: 3` opt-in extends version 2's wire reductions, not
   validation: request-bound tip/block arrays and unchanged cursors reconstruct
   from the exact privately owned request snapshot; page-tip references, added
   identities and equal spender aliases are expanded before the same complete
   row, count, sequence and canonical-chain checks. Reorganizations and unbound
   responses retain explicit tips, cursors and block-delta bases. Contradictory
-  or mixed aliases fail closed. Unsupported v2 is negotiated first at the same
-  cursor, remembered only for that RPC connection epoch, and retried after a
+  or mixed aliases fail closed. Unsupported v3 falls back to v2, then v1, at the
+  same cursor, remembered only for that RPC connection epoch and retried after a
   reconnect. Polling, receipt schedules, journal retention and counters do not
   change.
   A changed tip not covered by an inline block delta, including a same-height reorganization, requests
@@ -147,8 +147,9 @@ working directory. Source runs default to `./claimer.conf`.
   cached bounty state and count authority, then obtain a complete current,
   validated hash/count manifest after a new journal watermark. Retained hashes
   only check consistency; old counts or a short suffix cannot replace that
-  manifest. Fresh acknowledged zero counts avoid empty streams; positive or
-  unknown counts still require complete block streams and journal replay. RPCs
+  manifest. Fresh acknowledged zero counts avoid empty streams; positive counts
+  require either a complete validated journal-row set or a complete block stream
+  and replay. Unknown counts always require the complete stream and replay. RPCs
   without count support retain the full-stream fallback. This complete manifest
   is for initialization/reset recovery, not every ordinary new block.
   Startup without a cache and RPC reconnects
@@ -323,18 +324,36 @@ and hash). A server advertising `block_deltas: 1` may return up to five new,
 contiguous block hashes and their authoritative total P2C bounty counts in the
 same indexed publication. Only an explicit zero count permits installing an
 empty block without a stream; missing counts, unsupported extensions, gaps
-and reorganizations never imply emptiness. A positive count still requires a
-complete initial stream and subsequent journal replay. Ordinary status updates
+and reorganizations never imply emptiness. For a positive count, fully validated
+journal rows accumulate separately from the complete cache until every page is
+drained and the number of distinct outpoints exactly matches that authoritative
+all-output count (including spent, pending and immature outputs). Only then can
+the new block be installed without downloading the same rows again. Partial or
+unknown-count blocks still require a complete stream and subsequent journal
+replay; streamed immutable identities must also agree with any candidates.
+Ordinary status updates
 to already loaded blocks do not reread them. Confirmation counts advance with
 the published tip. Authoritative totals remain attached to the immutable local
 window across pages and cycles: later rows and complete streams must agree
 with them. Reorganizations discard displaced counts; journal resets discard
 all count authority before rebuilding the catalog.
 
+Compact version 3 (`compact: true`, `compact_version: 3`) omits empty/default
+fields and binds tip references to this request's validated tip/cursor digest.
+State-row confirmations can be derived from the event's historical publication
+height and the digest-checked immutable block height. Explicit values are still
+validated, never silently corrected. Reconstruction precedes the normal row,
+sequence, canonical-chain and count checks. Unknown immutable references replay
+the same cursor in expanded form before publication. Parameter rejection alone
+negotiates version 3, then 2, then 1; the negotiated version is retained for the
+current RPC connection epoch and reset on disconnect. No polling interval,
+claim/proof counter, signature validation or durable journal format changes.
+
 Journal gaps, reorganizations and inconsistent snapshots still trigger the
 existing coherent resynchronization. Older servers fall back to block reads
-without skipping their journal cursor: parameter rejection first retries
-without `known_tip`, retaining bounty deltas, then negotiates the legacy
+without skipping their journal cursor: after negotiating compact versions and
+representation, parameter rejection retries without `known_tip`, retaining
+bounty deltas, then negotiates the legacy
 schema if necessary. Malformed data and transport errors never negotiate
 compatibility. Cached state is published atomically:
 a failed page cannot consume its cursor or partially install updates.

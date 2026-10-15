@@ -66,7 +66,8 @@ test('v2 ACK uses one request and retains the exact complete warm snapshot', asy
   for (let i = 0; i < 10; i++) previous = previousFrom(await discoverBounties({ ...f.options, ...previous }));
   assert.equal(f.calls.length, 10); assert.deepEqual(f.reads, []); assert.equal(previous.cursor, '0');
   assert.deepEqual(previous.previous.get(row.block_hash), [row]);
-  assert.ok(f.calls.every(call => call.params.compact_version === 2));
+  assert.equal(f.calls[0].params.compact_version, 3);
+  assert.ok(f.calls.slice(1).every(call => call.params.compact_version === 2));
 });
 
 test('cold v2 fallback is explicit and replays after the authoritative hash snapshot', async () => {
@@ -108,19 +109,19 @@ test('v2 historical full tips remain independent from the current publication ti
   assert.equal(result.blocks.get(row.block_hash)[0].confirmations, 4); assert.deepEqual(f.reads, []);
 });
 
-test('v2 added identities reconstruct only from a complete validated nested row; stream replay is retained', async () => {
+test('v2 added identities plus an exact authoritative count avoid a redundant stream', async () => {
   const f = fixture(), previous = f.warm(); f.current = windowAt(701);
   const row = { ...rowAt(f.current.blocks[0]), confirmations: 1 }; f.rows.set(row.block_hash, [row]);
   f.pages = [params => f.bound(params, [{ type: 'added', sequence: 1, tip_ref: -1, bounty: row }], '1')];
   const result = await discoverBounties({ ...f.options, ...previous });
-  assert.deepEqual(result.blocks.get(row.block_hash), [row]); assert.deepEqual(f.reads, [row.block_hash]);
-  assert.equal(f.calls.length, 2); assert.equal(f.calls[1].params.cursor, '1');
+  assert.deepEqual(result.blocks.get(row.block_hash), [row]); assert.deepEqual(f.reads, []);
+  assert.equal(f.calls.length, 1); assert.equal(result.cursor, '1');
 });
 
 test('v2 mutation during a positive-count stream is replayed before publishing', async () => {
   const f = fixture(), previous = f.warm(); f.current = windowAt(701);
   const row = { ...rowAt(f.current.blocks[0]), confirmations: 1 }; f.rows.set(row.block_hash, [row]);
-  f.pages = [params => f.bound(params, [{ type: 'added', sequence: 1, tip_ref: -1, bounty: row }], '1')];
+  f.pages = [params => f.bound(params, [], '1')];
   f.afterRead = () => { f.pages = [params => f.bound(params, [stateEvent(row, 2)], '2')]; };
   const result = await discoverBounties({ ...f.options, ...previous });
   assert.equal(result.cursor, '2'); assert.equal(result.blocks.get(row.block_hash)[0].status, 'pending_spend');
@@ -177,12 +178,12 @@ test('v2 journal reset discards old request bindings before rebuilding a complet
 
 test('v2 parameter fallback retries the same cursor and is remembered only in supplied epoch capabilities', async () => {
   const f = fixture();
-  f.before = (method, params) => { if (params.compact_version === 2) throw Object.assign(new Error('Old version'), { code: -32602 }); };
+  f.before = (method, params) => { if (params.compact_version >= 2) throw Object.assign(new Error('Old version'), { code: -32602 }); };
   f.hook = (method, params, page) => method === 'getbountychanges' ? { compact: 1, unchanged: true } : page;
   const result = await discoverBounties({ ...f.options, ...f.warm() });
-  assert.deepEqual(f.calls.map(call => call.params.compact_version), [2, undefined]); assert.equal(f.capabilities.compactVersion, 1);
-  await discoverBounties({ ...f.options, ...previousFrom(result) }); assert.equal(f.calls.length, 3);
-  await discoverBounties({ ...f.options, capabilities: {}, ...previousFrom(result) }); assert.equal(f.calls.length, 5);
+  assert.deepEqual(f.calls.map(call => call.params.compact_version), [3, 2, undefined]); assert.equal(f.capabilities.compactVersion, 1);
+  await discoverBounties({ ...f.options, ...previousFrom(result) }); assert.equal(f.calls.length, 4);
+  await discoverBounties({ ...f.options, capabilities: {}, ...previousFrom(result) }); assert.equal(f.calls.length, 7);
   assert.ok(f.calls.every(call => call.params.cursor === '0'));
 });
 
@@ -194,7 +195,7 @@ test('valid v1 response from a server ignoring v2 is remembered after validation
 });
 
 const malformedPages = {
-  unknown_version: page => { page.compact = 3; },
+  unknown_version: page => { page.compact = 4; },
   string_version: page => { page.compact = '2'; },
   mixed_capabilities: page => { page.bounty_deltas = 1; },
   mixed_block_capabilities: page => { page.block_deltas = 1; },

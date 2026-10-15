@@ -242,7 +242,8 @@ test('legacy parameter rejection retries the exact cursor and retains whole-bloc
   };
   const result = await discoverBounties({ ...f.options, ...previous });
   assert.deepEqual(f.calls.filter(call => call.method === 'getbountychanges').map(call => call.params),
-    [{ cursor: '0', include_bounties: true, known_tip: { height: 700, hash: f.current.tip.hash }, compact: true, compact_version: 2, known_state: bountyStateDigest(f.current.tip, '0') },
+    [{ cursor: '0', include_bounties: true, known_tip: { height: 700, hash: f.current.tip.hash }, compact: true, compact_version: 3, known_state: bountyStateDigest(f.current.tip, '0') },
+      { cursor: '0', include_bounties: true, known_tip: { height: 700, hash: f.current.tip.hash }, compact: true, compact_version: 2, known_state: bountyStateDigest(f.current.tip, '0') },
       { cursor: '0', include_bounties: true, known_tip: { height: 700, hash: f.current.tip.hash }, compact: true, known_state: bountyStateDigest(f.current.tip, '0') },
       { cursor: '0', include_bounties: true, known_tip: { height: 700, hash: f.current.tip.hash } },
       { cursor: '0', include_bounties: true }, { cursor: '0' }, { cursor: '1' }]);
@@ -259,6 +260,7 @@ test('known-tip rejection preserves full bounty deltas and retries the same curs
   const result = await discoverBounties({ ...f.options, ...previous });
   assert.deepEqual(result.blocks.get(row.block_hash), [pending]); assert.deepEqual(f.reads, []);
   assert.deepEqual(f.calls.map(call => call.params), [
+    { cursor: '0', include_bounties: true, known_tip: { height: 700, hash: f.current.tip.hash }, compact: true, compact_version: 3, known_state: bountyStateDigest(f.current.tip, '0') },
     { cursor: '0', include_bounties: true, known_tip: { height: 700, hash: f.current.tip.hash }, compact: true, compact_version: 2, known_state: bountyStateDigest(f.current.tip, '0') },
     { cursor: '0', include_bounties: true, known_tip: { height: 700, hash: f.current.tip.hash }, compact: true, known_state: bountyStateDigest(f.current.tip, '0') },
     { cursor: '0', include_bounties: true, known_tip: { height: 700, hash: f.current.tip.hash } },

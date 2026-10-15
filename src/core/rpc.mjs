@@ -38,7 +38,7 @@ export function validateRpcParams(method, params) {
       clean[key] = value; continue;
     }
     if (key === 'compact_version') {
-      if (value !== 2 || clean.compact !== true || clean.include_bounties !== true) throw new Error('Invalid RPC compact version.');
+      if (![2, 3].includes(value) || clean.compact !== true || clean.include_bounties !== true) throw new Error('Invalid RPC compact version.');
       clean[key] = value; continue;
     }
     if (key === 'known_state') {

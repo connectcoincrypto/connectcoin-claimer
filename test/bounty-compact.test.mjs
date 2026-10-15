@@ -144,22 +144,22 @@ test('unknown immutable references replay the same cursor expanded before publis
   const result = await discoverBounties({ ...f.options, ...previous });
   assert.equal(f.calls[0].params.cursor, '0'); assert.equal(f.calls[1].params.cursor, '0');
   assert.equal(f.calls[1].params.compact, undefined); assert.equal(f.calls[1].params.known_state, undefined);
-  assert.deepEqual(f.reads, [row.block_hash]); assert.deepEqual(result.blocks.get(row.block_hash), [row]);
+  assert.deepEqual(f.reads, []); assert.deepEqual(result.blocks.get(row.block_hash), [row]);
   assert.equal(result.cursor, '1'); assert.equal(previous.previous.has(row.block_hash), false);
 });
 
-test('added full rows can resolve following compact states on that page, while positive blocks still get complete snapshots', async () => {
+test('added full rows resolve following compact states and complete an exact-count block without a stream', async () => {
   const f = fixture(), previous = f.warm(); f.current = windowAt(701);
   const row = rowAt(f.current.blocks[0], 701), next = { ...row, status: 'spent', spending_txid: hash(900) };
   f.rows.set(row.block_hash, [next]); f.pages.push([eventAt(row, 1, f.current.tip, 'added'), eventAt(next, 2, f.current.tip, 'spent')]);
   const result = await discoverBounties({ ...f.options, ...previous });
-  assert.equal(f.calls.length, 2); assert.deepEqual(f.reads, [row.block_hash]); assert.deepEqual(result.blocks.get(row.block_hash), [next]);
+  assert.equal(f.calls.length, 1); assert.deepEqual(f.reads, []); assert.deepEqual(result.blocks.get(row.block_hash), [next]);
 });
 
 test('a spend racing positive-count streaming is replayed, not lost behind an ACK', async () => {
   const f = fixture(), previous = f.warm(); f.current = windowAt(701);
   const row = rowAt(f.current.blocks[0], 701), next = { ...row, status: 'spent', spending_txid: hash(900) };
-  f.rows.set(row.block_hash, [row]); f.pages.push([eventAt(row, 1, f.current.tip, 'added')]);
+  f.rows.set(row.block_hash, [row]); f.pages.push([]);
   f.afterRead = () => { f.pages.push([eventAt(next, 2, f.current.tip, 'spent')]); };
   const result = await discoverBounties({ ...f.options, ...previous });
   assert.equal(result.cursor, '2'); assert.deepEqual(result.blocks.get(row.block_hash), [next]); assert.equal(f.calls.length, 2);
@@ -234,10 +234,11 @@ test('count option rejection retries without it and never treats missing counts 
 test('compact rejection drops only compact/known_state at the same cursor', async () => {
   const f = fixture(); f.before = (method, params) => { if (params.compact) throw Object.assign(new Error('Old compact schema'), { code: -32602 }); };
   const result = await discoverBounties({ ...f.options, ...f.warm() });
-  assert.equal(f.calls.length, 3); assert.equal(result.cursor, '0');
-  assert.equal(f.calls[0].params.compact_version, 2);
-  assert.equal(f.calls[1].params.compact_version, undefined); assert.equal(f.calls[1].params.compact, true);
-  assert.deepEqual(f.calls[2].params, { cursor: '0', include_bounties: true, known_tip: { height: 700, hash: f.current.tip.hash } });
+  assert.equal(f.calls.length, 4); assert.equal(result.cursor, '0');
+  assert.equal(f.calls[0].params.compact_version, 3);
+  assert.equal(f.calls[1].params.compact_version, 2);
+  assert.equal(f.calls[2].params.compact_version, undefined); assert.equal(f.calls[2].params.compact, true);
+  assert.deepEqual(f.calls[3].params, { cursor: '0', include_bounties: true, known_tip: { height: 700, hash: f.current.tip.hash } });
 });
 
 for (const code of [-32001, -32002, -32029, -32601, 'ECONNRESET']) test(`genuine compact failure ${code} never negotiates away validation`, async () => {
@@ -344,7 +345,7 @@ for (const race of ['new-block', 'reorg', 'rollback']) test(`a ${race} during th
   assert.deepEqual(result.blocks.get(newRow.block_hash), [newRow]);
   assert.equal(result.blocks.size, 600); assert.equal(Object.keys(result.window.blockCounts).length, 600);
   assert.ok(f.reads.every(blockHash => (f.rows.get(blockHash) ?? []).length > 0), 'No empty streams may be inferred from a lost manifest.');
-  assert.equal(f.calls.at(-1).method, 'getbountychanges'); assert.equal(f.calls.at(-1).params.cursor, '1');
+  assert.equal(f.calls.at(-1).method, 'getbountychanges'); assert.equal(f.calls.at(-1).params.cursor, race === 'new-block' ? '0' : '1');
   assert.equal(f.calls.filter(call => call.method === 'getrecentblockhashes')[0].params.count, undefined);
   if (race !== 'new-block') {
     assert.equal(result.blocks.has(oldRow.block_hash), false); assert.equal(result.window.blockCounts[oldRow.block_hash], undefined);

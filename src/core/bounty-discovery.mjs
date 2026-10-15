@@ -179,12 +179,53 @@ function validateBountyRow(row, tip, hash, height, delta = false) {
       ((row.status === 'immature') !== (row.coinbase && row.confirmations < 100)))) throw new Error('Invalid bounty delta metadata.');
 }
 
+// V3 omits deterministic defaults and may refer to this request's authenticated
+// base tip. Explicit fields are never overwritten: the existing validators must
+// still reject nulls, wrong types, contradictory times/cursors and confirmations.
+function normalizeCompactV3Page(original, { requestedVersion, state, base, network }) {
+  if (original?.compact !== 3) return original;
+  if (requestedVersion !== 3) throw new Error('Unrequested compact bounty version.');
+  if (Object.hasOwn(original, 'unchanged')) {
+    if (original.unchanged !== true || Reflect.ownKeys(original).length !== 2) throw new Error('Invalid unchanged bounty acknowledgement.');
+    return { compact: 2, unchanged: true };
+  }
+  const page = { ...original, compact: 2 };
+  for (const [key, value] of Object.entries({ changes: [], tips: [], has_more: false, next_cursor: null })) {
+    if (!Object.hasOwn(page, key)) page[key] = value;
+  }
+  const bound = (page.tip === null || Array.isArray(page.tip)) && Array.isArray(page.block_delta);
+  const requireBase = () => {
+    if (!bound || !state || !base || state.digest !== bountyStateDigest(state.tip, state.cursor) ||
+        !sameTip(state.tip, base.tip)) throw new Error('Invalid request-bound bounty base reference.');
+    validateTip(state.tip, network);
+  };
+  if (page.tip === null) {
+    requireBase();
+    if (page.block_delta.length !== 0) throw new Error('Invalid unchanged bounty tip delta.');
+    page.tip = [state.tip.height, state.tip.hash, state.tip.mediantime];
+  }
+  if (!Array.isArray(page.changes) || page.changes.length > 10000 || !Array.isArray(page.tips) || page.tips.length > 10000) throw new Error('Invalid compact v3 bounty page.');
+  page.tips = page.tips.slice();
+  let baseTipIndex;
+  page.changes = page.changes.map(event => {
+    // Appending the private base must not make a previously out-of-range wire
+    // index valid, even when a different event uses the explicit -2 sentinel.
+    if (!event || Array.isArray(event) || (event.tip_ref !== -2 && event.tip_ref !== -1 &&
+        !uint(event.tip_ref, (original.tips?.length ?? 0) - 1))) throw new Error('Invalid compact bounty event.');
+    if (event?.tip_ref !== -2) return event;
+    requireBase();
+    baseTipIndex ??= page.tips.push(state.tip) - 1;
+    return { ...event, tip_ref: baseTipIndex };
+  });
+  return page;
+}
+
 // Compact v2 changes transport representation only. Reconstruct a v1-shaped
 // page before the same sequence/count/row/canonical-window validators run.
 // No array/null alias may borrow state from another request or RPC epoch.
 function normalizeCompactV2Page(page, { requestedVersion, state, base, network }) {
   if (page?.compact !== 2) return page;
-  if (requestedVersion !== 2) throw new Error('Unrequested compact bounty version.');
+  if (requestedVersion < 2) throw new Error('Unrequested compact bounty version.');
   if (Object.hasOwn(page, 'unchanged')) {
     if (page.unchanged !== true || Reflect.ownKeys(page).length !== 2) throw new Error('Invalid unchanged bounty acknowledgement.');
     return { compact: 1, unchanged: true };
@@ -247,7 +288,7 @@ function normalizeCompactV2Page(page, { requestedVersion, state, base, network }
     ...(base || Object.hasOwn(page, 'block_delta') ? { block_deltas: 1, block_delta: blockDelta } : {}) };
 }
 
-function expandCompactPage(page, { requested, state, base, staged, network, lastSequence, inline, expectedCounts, lookback }) {
+function expandCompactPage(page, { requested, deriveConfirmations, state, base, staged, candidates, network, lastSequence, inline, expectedCounts, lookback }) {
   if (page?.compact === undefined) {
     if (page && (Object.hasOwn(page, 'unchanged') || Object.hasOwn(page, 'tips'))) throw new Error('Missing compact bounty capability.');
     return page;
@@ -290,17 +331,19 @@ function expandCompactPage(page, { requested, state, base, staged, network, last
       }
     } else {
       const delta = event.bounty_delta;
+      const implicitConfirmations = deriveConfirmations && delta && !Object.hasOwn(delta, 'confirmations');
       if (Object.hasOwn(event, 'bounty') || typeof event.bounty_ref !== 'string' || !HASH.test(event.bounty_ref) ||
-          !delta || Array.isArray(delta) || Reflect.ownKeys(delta).length !== 3 ||
+          !delta || Array.isArray(delta) || Reflect.ownKeys(delta).length !== (implicitConfirmations ? 2 : 3) ||
           Reflect.ownKeys(delta).some(key => !['status', 'spending_txid', 'confirmations'].includes(key)) ||
-          !['available', 'spent', 'pending_spend', 'immature'].includes(delta.status) || !uint(delta.confirmations) || delta.confirmations === 0 ||
+          !['available', 'spent', 'pending_spend', 'immature'].includes(delta.status) || (!implicitConfirmations && (!uint(delta.confirmations) || delta.confirmations === 0)) ||
           (delta.spending_txid !== null && (typeof delta.spending_txid !== 'string' || !HASH.test(delta.spending_txid))) ||
           (['spent', 'pending_spend'].includes(delta.status) !== (delta.spending_txid !== null))) throw new Error('Invalid compact bounty state.');
     }
     return { ...event, tip };
   });
   const rows = new Map();
-  if (events.length) for (const block of staged.values()) for (const row of block) {
+  const availableRows = new Map([...staged, ...[...candidates].map(([hash, block]) => [hash, block.rows])]);
+  if (events.length) for (const block of availableRows.values()) for (const row of block) {
     const key = bountyKey(row);
     if (rows.has(key)) throw new Error('Duplicate bounty across the recent window.');
     rows.set(key, row);
@@ -310,7 +353,7 @@ function expandCompactPage(page, { requested, state, base, staged, network, last
   const heights = new Map(canonicalWindow?.blocks.map(block => [block.hash, block.height]) ?? []);
   const selected = new Set(canonicalWindow?.blocks.slice(0, lookback).map(block => block.hash) ?? []);
   const counts = new Map([...expectedCounts, ...Object.entries(inline?.window.blockCounts ?? {})]);
-  const sizes = new Map([...staged].map(([hash, block]) => [hash, block.length]));
+  const sizes = new Map([...availableRows].map(([hash, block]) => [hash, block.length]));
   let unknown = false;
   for (const event of events) {
     const key = bountyKey(event);
@@ -334,6 +377,7 @@ function expandCompactPage(page, { requested, state, base, staged, network, last
       }
       if (bountyImmutableDigest(previous) !== event.bounty_ref) throw new Error('Inconsistent immutable bounty reference.');
       event.bounty = { ...previous, ...event.bounty_delta };
+      if (deriveConfirmations && !Object.hasOwn(event.bounty_delta, 'confirmations')) event.bounty.confirmations = event.tip.height - previous.block_height + 1;
       validateBountyRow(event.bounty, event.tip, event.bounty.block_hash, undefined, true);
       rows.set(key, event.bounty);
     }
@@ -385,11 +429,11 @@ export async function discoverBounties({ rpc, network, lookback = 600, previous 
   let knownWindow = previousWindow ? validatedWindow(previousWindow, network, previousWindow.blockCounts) : null;
   let cachedWindow = cursor ? knownWindow : null;
   let requestDeltas = true, requestBlocks = true, requestCompact = true, requestCounts = true;
-  let requestCompactV2 = capabilities?.compactVersion !== 1;
+  let compactVersion = [1, 2].includes(capabilities?.compactVersion) ? capabilities.compactVersion : 3;
   if (!cursor) { check(); await onReset({ reason: 'initial' }); check(); cached = new Map(); }
   for (let restart = 0; restart < 4; restart++) {
     check();
-    const staged = new Map(cached), dirty = new Set(), deltaBlocks = new Map();
+    const staged = new Map(cached), dirty = new Set(), deltaBlocks = new Map(), candidates = new Map();
     const expectedCounts = new Map(Object.entries(cachedWindow?.blockCounts ?? {}));
     const budget = { count: 0, limit: MAX_ROWS };
     for (const [hash, rows] of staged) {
@@ -451,6 +495,10 @@ export async function discoverBounties({ rpc, network, lookback = 600, previous 
         }
         budget.count -= rows.length; staged.delete(hash); dirty.delete(hash); deltaBlocks.delete(hash);
       }
+      for (const [hash, block] of candidates) if (!desired.has(hash)) {
+        for (const row of block.rows) onInvalidate(row, row.block_height < oldest || canonical.get(row.block_height) === hash ? 'window_exit' : 'reorg');
+        budget.count -= block.rows.length; candidates.delete(hash);
+      }
       for (const [hash, count] of expectedCounts) if (desired.has(hash)) {
         if (staged.has(hash) && staged.get(hash).length !== count) throw new Error('Cached bounty block contradicts its immutable count.');
         if (count === 0) {
@@ -479,14 +527,15 @@ export async function discoverBounties({ rpc, network, lookback = 600, previous 
       for (;;) {
         const expanded = requestDeltas ? { ...params, include_bounties: true } : params;
         const compact = requestDeltas && requestCompact;
-        const requestedVersion = compact && requestCompactV2 ? 2 : 1;
+        const requestedVersion = compact ? compactVersion : 1;
         const state = compact && base && from ? { tip: Object.freeze({ ...base.tip }), cursor: from } : null;
         if (state) state.digest = bountyStateDigest(state.tip, state.cursor);
         try {
           page = await query('getbountychanges', { ...expanded,
             ...(base ? { known_tip: { height: base.tip.height, hash: base.tip.hash } } : {}),
-            ...(compact ? { compact: true } : {}), ...(compact && requestCompactV2 ? { compact_version: 2 } : {}), ...(state ? { known_state: state.digest } : {}) });
+            ...(compact ? { compact: true } : {}), ...(compact && compactVersion > 1 ? { compact_version: compactVersion } : {}), ...(state ? { known_state: state.digest } : {}) });
           const returnedVersion = page?.compact;
+          page = normalizeCompactV3Page(page, { requestedVersion, state, base, network });
           page = normalizeCompactV2Page(page, { requestedVersion, state, base, network });
           if (page?.changes?.some?.(event => event?.type === 'resync_required')) throw new RescanRequired('Bounty journal requested a new snapshot.');
           const advertisedCompact = page?.compact !== undefined;
@@ -494,10 +543,10 @@ export async function discoverBounties({ rpc, network, lookback = 600, previous 
           // of an invalid cursor/page/canonical block delta in this response.
           const acknowledgement = page?.unchanged === true;
           if (!acknowledgement) inline = validatePage(page);
-          page = expandCompactPage(page, { requested: compact, state, base, staged, network, lastSequence, inline, expectedCounts, lookback });
+          page = expandCompactPage(page, { requested: compact, deriveConfirmations: returnedVersion === 3, state, base, staged, candidates, network, lastSequence, inline, expectedCounts, lookback });
           if (acknowledgement) inline = validatePage(page);
-          if (compact && requestedVersion === 2 && returnedVersion === 1) {
-            requestCompactV2 = false; if (capabilities) capabilities.compactVersion = 1;
+          if (compact && [1, 2].includes(returnedVersion) && returnedVersion < requestedVersion) {
+            compactVersion = returnedVersion; if (capabilities) capabilities.compactVersion = returnedVersion;
           }
           if (!advertisedCompact) requestCompact = false;
           break;
@@ -508,7 +557,7 @@ export async function discoverBounties({ rpc, network, lookback = 600, previous 
           if (!requestDeltas || error.code !== -32602) throw error;
           // Negotiate one optional extension at a time, at this exact cursor.
           // Transport/backend failures are never compatibility signals.
-          if (compact && requestCompactV2) { requestCompactV2 = false; if (capabilities) capabilities.compactVersion = 1; }
+          if (compact && compactVersion > 1) { compactVersion--; if (capabilities) capabilities.compactVersion = compactVersion; }
           else if (compact) requestCompact = false;
           else if (base) { requestBlocks = false; base = null; }
           else { requestDeltas = false; requestBlocks = false; }
@@ -554,6 +603,7 @@ export async function discoverBounties({ rpc, network, lookback = 600, previous 
             if (event.block_hash === undefined && !outpoints) {
               outpoints = new Map();
               for (const [hash, rows] of staged) for (const cached of rows) outpoints.set(bountyKey(cached), hash);
+              for (const [hash, block] of candidates) for (const cached of block.rows) outpoints.set(bountyKey(cached), hash);
             }
             const hash = event.block_hash ?? outpoints.get(bountyKey(event));
             if (desired.has(hash)) throw new RescanRequired('A bounty exited a retained canonical block.');
@@ -568,16 +618,20 @@ export async function discoverBounties({ rpc, network, lookback = 600, previous 
           // A reorg racing the page/window request must rescan, rather than
           // applying rows from a displaced block or advancing past them.
           if (canonical.has(row.block_height) && canonical.get(row.block_height) !== row.block_hash) throw new RescanRequired('Bounty delta is no longer canonical.');
-          if (desired.has(row.block_hash) && staged.has(row.block_hash) && !dirty.has(row.block_hash)) {
-            let block = deltaBlocks.get(row.block_hash);
+          if (desired.has(row.block_hash) && !dirty.has(row.block_hash) &&
+              (staged.has(row.block_hash) || expectedCounts.has(row.block_hash))) {
+            const complete = staged.has(row.block_hash);
+            let block = complete ? deltaBlocks.get(row.block_hash) : candidates.get(row.block_hash);
             if (!block) {
-              const rows = staged.get(row.block_hash).slice(), positions = new Map();
+              const rows = complete ? staged.get(row.block_hash).slice() : [], positions = new Map();
               for (const [index, existing] of rows.entries()) {
                 const key = bountyKey(existing);
                 if (positions.has(key)) throw new Error('Duplicate bounty in cached block.');
                 positions.set(key, index);
               }
-              block = { rows, positions }; deltaBlocks.set(row.block_hash, block); staged.set(row.block_hash, rows);
+              block = { rows, positions };
+              if (complete) { deltaBlocks.set(row.block_hash, block); staged.set(row.block_hash, rows); }
+              else candidates.set(row.block_hash, block);
             }
             const key = bountyKey(row), index = block.positions.get(key), existing = index === undefined ? undefined : block.rows[index];
             if (existing && IMMUTABLE_BOUNTY_FIELDS.some(field => existing[field] !== row[field])) throw new Error('Inconsistent immutable bounty metadata.');
@@ -596,6 +650,7 @@ export async function discoverBounties({ rpc, network, lookback = 600, previous 
         if (event.block_hash === undefined && !outpoints) {
           outpoints = new Map();
           for (const [hash, rows] of staged) for (const row of rows) outpoints.set(bountyKey(row), hash);
+          for (const [hash, block] of candidates) for (const row of block.rows) outpoints.set(bountyKey(row), hash);
         }
         const hash = event.block_hash ?? outpoints.get(bountyKey(event));
         if (hash && desired.has(hash) && event.type !== 'window_exit') dirty.add(hash);
@@ -603,6 +658,14 @@ export async function discoverBounties({ rpc, network, lookback = 600, previous 
       }
     };
     const loadDirty = async () => {
+      // Full journal rows already carry every validation performed above. They
+      // become a complete block only after draining all pages and matching the
+      // canonical, immutable ALL-output count with distinct outpoints. Partial
+      // candidates never enter staged or authorize a skip for missing counts.
+      for (const [hash, block] of candidates) if (!dirty.has(hash) && desired.has(hash) &&
+          expectedCounts.has(hash) && block.rows.length === expectedCounts.get(hash)) {
+        staged.set(hash, block.rows); deltaBlocks.set(hash, block); candidates.delete(hash);
+      }
       // The server lists newest first. Read the oldest required blocks first,
       // before new blocks can push them out of the recent window. Reverse only
       // the work queue; keep the validated window and journal order unchanged.
@@ -615,6 +678,8 @@ export async function discoverBounties({ rpc, network, lookback = 600, previous 
           current(); const block = pending[position++];
           const old = staged.get(block.hash);
           if (old) { budget.count -= old.length; staged.delete(block.hash); }
+          const candidate = candidates.get(block.hash);
+          if (candidate) { budget.count -= candidate.rows.length; candidates.delete(block.hash); }
           try {
             // A sibling's busy/quota failure must not escape through this
             // stream's onChunk callback: the transport correctly treats
@@ -623,6 +688,13 @@ export async function discoverBounties({ rpc, network, lookback = 600, previous 
             // real epoch/cancellation fence; stop new work/publication below.
             const rows = await readBlock(block.hash, { height: block.height, check, budget });
             if (expectedCounts.has(block.hash) && rows.length !== expectedCounts.get(block.hash)) throw new Error('Bounty stream contradicts its immutable block count.');
+            if (candidate) {
+              const byKey = new Map(rows.map(row => [bountyKey(row), row]));
+              for (const before of candidate.rows) {
+                const after = byKey.get(bountyKey(before));
+                if (!after || IMMUTABLE_BOUNTY_FIELDS.some(field => before[field] !== after[field])) throw new Error('Bounty stream contradicts immutable journal metadata.');
+              }
+            }
             current(); staged.set(block.hash, rows); dirty.delete(block.hash); deltaBlocks.delete(block.hash);
             for (const row of rows) if (row.status !== 'available') onInvalidate(row);
           } catch (error) { failure ??= error; throw error; }

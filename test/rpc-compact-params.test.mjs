@@ -4,10 +4,11 @@ import { validateRpcParams } from '../src/core/rpc.mjs';
 
 const hash = 'ab'.repeat(32), known_tip = { height: 700, hash }, cursor = 'opaque-cursor';
 
-test('compact version 2 is an explicit numeric opt-in, without getters or mixed legacy modes', () => {
+test('compact versions 2 and 3 are explicit numeric opt-ins, without getters or mixed legacy modes', () => {
   const base = { include_bounties: true, compact: true };
   assert.deepEqual(validateRpcParams('getbountychanges', { ...base, compact_version: 2 }), { ...base, compact_version: 2 });
-  for (const value of [undefined, null, 0, 1, 3, 2.5, '2', true, [], {}]) {
+  assert.deepEqual(validateRpcParams('getbountychanges', { ...base, compact_version: 3 }), { ...base, compact_version: 3 });
+  for (const value of [undefined, null, 0, 1, 4, 2.5, '2', '3', true, [], {}]) {
     assert.throws(() => validateRpcParams('getbountychanges', { ...base, compact_version: value }), /Invalid RPC compact version/);
   }
   for (const params of [{ compact_version: 2 }, { include_bounties: true, compact: false, compact_version: 2 }]) {
