@@ -115,6 +115,19 @@ working directory. Source runs default to `./claimer.conf`.
   tip-and-cursor fence; any later hash or block read requires another replay
   before publication. An unchanged warm cycle therefore needs one journal
   request, without a redundant second poll or `getchaintip` request.
+  Compatible servers also accept `compact: true`: unchanged replies acknowledge
+  a SHA-256 binding of the exact requested network, tip metadata and cursor.
+  That acknowledgement can only reuse this request's validated complete window;
+  it cannot advance a cursor or invent block hashes, bounty rows or empty counts.
+  Changed pages share publication tips through a bounded page-local table.
+  Mutable-state patches bind to the SHA-256 digest of an already validated
+  bounty's immutable fields, and the reconstructed row passes the same full
+  validation as an expanded row. Event labels/spenders may be intermediate
+  coalesced mutations; the validated final row controls admission. Unknown rows
+  trigger an expanded replay from the same cursor, before publication. Malformed
+  envelopes, known-reference mismatches and contradictory counts never use that
+  fallback. Optional features are removed individually only on RPC `-32602`;
+  backend, transport and malformed-data failures do not negotiate away checks.
   A changed tip not covered by an inline block delta, including a same-height reorganization, requests
   the latest 5 hashes, then 100, then 600 as needed to find a matching cached
   hash **and height** and reconstruct the complete window. Contradictory
@@ -128,6 +141,14 @@ working directory. Source runs default to `./claimer.conf`.
   server must support the optional `getrecentblockhashes` `count` parameter for
   reduced transfers. Older servers that reject it fall back to a full request;
   malformed data never triggers that compatibility fallback.
+  Hash-window reads request authoritative all-output bounty counts when supported.
+  Only the explicit `bounty_counts: 1` acknowledgement and a valid count for every
+  returned block can establish an empty block. Positive counts still require a
+  complete snapshot of exactly that size, including spent, pending and immature
+  outputs. Hash reads always require journal replay before publication. A cold
+  600-block window with acknowledged zero counts therefore needs three RPCs
+  instead of 600 empty streams plus the window and journal reads. Counts remain
+  bound to canonical block hashes and are revoked with a journal reset.
   Journal pages build a fallback outpoint index only when a validated event
   lacks its block hash, at most once per page. Empty pages and explicitly located
   events avoid that scan; event validation, replay and final snapshot checks remain.
@@ -150,6 +171,12 @@ working directory. Source runs default to `./claimer.conf`.
   of 16 MiB for raw transactions and 32 MiB for validated records. These are cache
   budgets, not process-memory limits. Oversized entries are validated without
   retention; disconnect, failure and stop clear both caches.
+  Funding reads request `raw_only: true` to omit unused verbose metadata, not
+  transaction data: the complete original hex, including every witness byte,
+  still undergoes the same parsing, identity and output checks. Only `-32602`
+  retries the same txid through the legacy response shape. That compatibility
+  choice is retained for the current RPC epoch; cancelling one consumer never
+  cancels another consumer's shared parent read.
 - Uses one RPC connection, polling every five seconds, with conservative client
   quotas: 48 ordinary calls/minute/method, eight calls/minute/block for bounty
   streams, at most four normal submissions in flight, and one serial recovery
@@ -157,6 +184,10 @@ working directory. Source runs default to `./claimer.conf`.
   RPC quotas and twelve-request global capacity. These are separate from the
   TCP/TLS connection settings. Server limits/cooldowns are also respected;
   other clients sharing your IP consume the same server quotas.
+- A busy or invalidated block read stops new work in that discovery batch;
+  already-started streams keep all validation and time/size limits before the
+  batch retries. A genuine malformed sibling still fails closed and no partial
+  catalog or cursor is published.
 - Disconnects pause the workers; discovery catches up before resuming. Invalid
   chain identity, malformed snapshots and fatal helper errors stop the client.
 

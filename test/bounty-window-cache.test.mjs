@@ -106,7 +106,7 @@ test('a new block refreshes the complete window using five hashes and preserves 
   const fresh = row(f.current.blocks[0]); f.rows.set(fresh.block_hash, [fresh]);
   const result = await discoverBounties({ ...f.options, ...previous });
   assert.equal(f.count('getrecentblockhashes'), 1);
-  assert.deepEqual(f.calls.find(call => call.method === 'getrecentblockhashes').params, { count: 5 });
+  assert.deepEqual(f.calls.find(call => call.method === 'getrecentblockhashes').params, { count: 5, include_bounty_counts: true });
   assert.deepEqual(f.reads, [fresh.block_hash]);
   assert.equal(result.blocks.size, 600);
   assert.equal(result.blocks.has(previous.previousWindow.blocks.at(-1).hash), false);
@@ -343,7 +343,7 @@ test('a rollback to a lower chain height rejects displaced-tip rows as reorgs', 
   const previous = f.warm(); f.current = makeWindow(699);
   const result = await discoverBounties({ ...f.options, ...previous });
   assert.equal(f.count('getrecentblockhashes'), 3);
-  assert.deepEqual(f.calls.filter(call => call.method === 'getrecentblockhashes').map(call => call.params), [{ count: 5 }, { count: 100 }, {}]);
+  assert.deepEqual(f.calls.filter(call => call.method === 'getrecentblockhashes').map(call => call.params), [{ count: 5, include_bounty_counts: true }, { count: 100 }, {}]);
   assert.deepEqual(result.tip, f.current.tip);
   assert.equal(result.blocks.has(bounty.block_hash), false);
   assert.ok(f.invalidated.some(item => item.key === bountyKey(bounty) && item.reason === 'reorg'));

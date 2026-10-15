@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { validateTip } from './config.mjs';
 
 const HASH = /^[0-9a-f]{64}$/;
@@ -12,8 +13,13 @@ const uint = (value, maximum = 0xffffffff) => Number.isSafeInteger(value) && val
 const cursorValid = value => typeof value === 'string' && value.length > 0 && value.length <= 4096;
 class RescanRequired extends Error {}
 class DiscoveryBudgetExceeded extends RescanRequired {}
+class UnknownBountyReference extends Error {}
 const IMMUTABLE_BOUNTY_FIELDS = ['txid', 'vout', 'block_hash', 'block_height', 'amount', 'domain',
   'connection_work_target', 'root_certificates_version', 'signature_algorithms_mask', 'coinbase'];
+const digest = fields => createHash('sha256').update(JSON.stringify(fields)).digest('hex');
+export const bountyStateDigest = (tip, cursor) => digest(['bounty-state-v1', tip.chain, tip.genesis_hash,
+  tip.height, tip.hash, tip.mediantime, cursor]);
+export const bountyImmutableDigest = row => digest(['bounty-immutable-v1', ...IMMUTABLE_BOUNTY_FIELDS.map(key => row[key])]);
 export class BountyDiscoveryBusy extends Error {
   constructor() {
     super('The bounty snapshot is still changing; retrying discovery shortly.');
@@ -33,6 +39,16 @@ function validateRecentBlocks(response, network, count) {
     if (!block || typeof block.hash !== 'string' || !HASH.test(block.hash) || block.height !== response.tip.height - index || hashes.has(block.hash) || (index === 0 && block.hash !== response.tip.hash) || (block.height === 0 && block.hash !== response.tip.genesis_hash)) throw new Error('Invalid recent-block sequence.');
     hashes.add(block.hash);
   }
+}
+
+function rpcBlockCounts(response) {
+  if (response.bounty_counts === undefined) {
+    if (response.blocks?.some(block => Object.hasOwn(block, 'bounty_count'))) throw new Error('Missing bounty count capability.');
+    return [];
+  }
+  if (response.bounty_counts !== 1 || !Array.isArray(response.blocks) ||
+      response.blocks.some(block => !block || !uint(block.bounty_count, MAX_ROWS))) throw new Error('Invalid authoritative bounty counts.');
+  return response.blocks.map(block => [block.hash, block.bounty_count]);
 }
 
 function windowFrom(response, network, lookback) {
@@ -96,18 +112,21 @@ function joinRecentWindow(response, known, network) {
     if (anchor >= 0 && knownHashes.has(block.height) && knownHashes.get(block.height) !== block.hash) throw new Error('Inconsistent recent-block ancestry.');
   }
   const size = Math.min(600, response.tip.height + 1);
-  if (response.blocks.length === size) return validatedWindow(response, network, retainedBlockCounts(known, response.blocks));
+  if (response.blocks.length === size) return validatedWindow(response, network, retainedBlockCounts(known, response.blocks, rpcBlockCounts(response)));
   if (anchor < 0) return null;
   const anchorHeight = response.blocks[anchor].height;
   const blocks = [...response.blocks.slice(0, anchor), ...known.blocks.filter(block => block.height <= anchorHeight)].slice(0, size);
   // A rollback can find an anchor while still lacking the oldest required
   // blocks. Escalate rather than silently publishing an incomplete window.
   if (blocks.length !== size) return null;
-  return validatedWindow({ window: 600, tip: response.tip, blocks }, network, retainedBlockCounts(known, blocks));
+  return validatedWindow({ window: 600, tip: response.tip, blocks }, network, retainedBlockCounts(known, blocks, rpcBlockCounts(response)));
 }
 
 async function refreshRecentWindow(query, known, network) {
-  if (!known) return validatedWindow(await query('getrecentblockhashes'), network);
+  if (!known) {
+    const response = await query('getrecentblockhashes');
+    return validatedWindow(response, network, Object.fromEntries(rpcBlockCounts(response)));
+  }
   for (const count of [5, 100, 600]) {
     let response;
     try { response = await query('getrecentblockhashes', count === 600 ? {} : { count }); }
@@ -160,6 +179,110 @@ function validateBountyRow(row, tip, hash, height, delta = false) {
       ((row.status === 'immature') !== (row.coinbase && row.confirmations < 100)))) throw new Error('Invalid bounty delta metadata.');
 }
 
+function expandCompactPage(page, { requested, state, base, staged, network, lastSequence, inline, expectedCounts, lookback }) {
+  if (page?.compact === undefined) {
+    if (page && (Object.hasOwn(page, 'unchanged') || Object.hasOwn(page, 'tips'))) throw new Error('Missing compact bounty capability.');
+    return page;
+  }
+  if (!requested || page.compact !== 1) throw new Error('Invalid compact bounty capability.');
+  if (Object.hasOwn(page, 'unchanged')) {
+    if (page.unchanged !== true || Reflect.ownKeys(page).length !== 2 || !state || !base ||
+        state.digest !== bountyStateDigest(state.tip, state.cursor) || !sameTip(state.tip, base.tip)) throw new Error('Invalid unchanged bounty acknowledgement.');
+    // This request's privately owned, complete hash window is the only source
+    // of an ACK's tip/cursor. An ACK cannot introduce a hash, row or zero count.
+    return { tip: state.tip, next_cursor: state.cursor, has_more: false, changes: [], bounty_deltas: 1,
+      block_deltas: 1, block_delta: { base_height: base.tip.height, base_hash: base.tip.hash, blocks: [] } };
+  }
+  if (page.bounty_deltas !== 1 || !Array.isArray(page.tips) || page.tips.length > 10000 ||
+      !Array.isArray(page.changes) || page.changes.length > 10000) throw new Error('Invalid compact bounty page.');
+  validateTip(page.tip, network);
+  for (const tip of page.tips) {
+    validateTip(tip, network); sameTip(tip, page.tip);
+    if (tip.height > page.tip.height) throw new Error('Invalid bounty publication tip.');
+  }
+  // Validate the complete wire shape before deciding whether an unknown row
+  // requires an expanded replay. Malformation is never a negotiation signal.
+  const events = page.changes.map(event => {
+    if (!event || !['added', 'spent', 'pending_spend', 'available_again', 'matured', 'window_exit'].includes(event.type) ||
+        typeof event.txid !== 'string' || !HASH.test(event.txid) || !uint(event.vout) ||
+        !uint(event.sequence, Number.MAX_SAFE_INTEGER) || event.sequence <= lastSequence ||
+        !uint(event.tip_ref, page.tips.length - 1) || Object.hasOwn(event, 'tip') ||
+        (event.block_hash !== undefined && (typeof event.block_hash !== 'string' || !HASH.test(event.block_hash))) ||
+        (event.spending_txid !== undefined && event.spending_txid !== null && (typeof event.spending_txid !== 'string' || !HASH.test(event.spending_txid)))) throw new Error('Invalid compact bounty event.');
+    lastSequence = event.sequence;
+    const tip = page.tips[event.tip_ref];
+    if (event.type === 'added' || event.type === 'window_exit') {
+      if (Object.hasOwn(event, 'bounty_ref') || Object.hasOwn(event, 'bounty_delta') ||
+          (event.type === 'window_exit' && event.bounty !== null)) throw new Error('Invalid compact bounty payload.');
+      if (event.type === 'added') {
+        if (typeof event.bounty?.block_hash !== 'string' || !HASH.test(event.bounty.block_hash) ||
+            (event.block_hash !== undefined && event.block_hash !== event.bounty.block_hash)) throw new Error('Invalid bounty delta identity.');
+        validateBountyRow(event.bounty, tip, event.bounty?.block_hash, undefined, true);
+        if (event.bounty.txid !== event.txid || event.bounty.vout !== event.vout) throw new Error('Invalid bounty delta identity.');
+      }
+    } else {
+      const delta = event.bounty_delta;
+      if (Object.hasOwn(event, 'bounty') || typeof event.bounty_ref !== 'string' || !HASH.test(event.bounty_ref) ||
+          !delta || Array.isArray(delta) || Reflect.ownKeys(delta).length !== 3 ||
+          Reflect.ownKeys(delta).some(key => !['status', 'spending_txid', 'confirmations'].includes(key)) ||
+          !['available', 'spent', 'pending_spend', 'immature'].includes(delta.status) || !uint(delta.confirmations) || delta.confirmations === 0 ||
+          (delta.spending_txid !== null && (typeof delta.spending_txid !== 'string' || !HASH.test(delta.spending_txid))) ||
+          (['spent', 'pending_spend'].includes(delta.status) !== (delta.spending_txid !== null))) throw new Error('Invalid compact bounty state.');
+    }
+    return { ...event, tip };
+  });
+  const rows = new Map();
+  if (events.length) for (const block of staged.values()) for (const row of block) {
+    const key = bountyKey(row);
+    if (rows.has(key)) throw new Error('Duplicate bounty across the recent window.');
+    rows.set(key, row);
+  }
+  const canonicalWindow = inline?.window ?? (base && sameTip(base.tip, page.tip) ? base : null);
+  const canonical = new Map(canonicalWindow?.blocks.map(block => [block.height, block.hash]) ?? []);
+  const heights = new Map(canonicalWindow?.blocks.map(block => [block.hash, block.height]) ?? []);
+  const selected = new Set(canonicalWindow?.blocks.slice(0, lookback).map(block => block.hash) ?? []);
+  const counts = new Map([...expectedCounts, ...Object.entries(inline?.window.blockCounts ?? {})]);
+  const sizes = new Map([...staged].map(([hash, block]) => [hash, block.length]));
+  let unknown = false;
+  for (const event of events) {
+    const key = bountyKey(event);
+    if (canonical.has(event.tip.height) && canonical.get(event.tip.height) !== event.tip.hash) throw new RescanRequired('Bounty publication is no longer canonical.');
+    if (event.type === 'window_exit') {
+      const hash = event.block_hash ?? rows.get(key)?.block_hash;
+      if (selected.has(hash)) throw new RescanRequired('A bounty exited a retained canonical block.');
+      continue;
+    }
+    if (event.type === 'added') {
+      const previous = rows.get(key);
+      if (previous && IMMUTABLE_BOUNTY_FIELDS.some(field => previous[field] !== event.bounty[field])) throw new Error('Inconsistent immutable bounty metadata.');
+      if (!previous) sizes.set(event.bounty.block_hash, (sizes.get(event.bounty.block_hash) ?? 0) + 1);
+      rows.set(key, event.bounty);
+    }
+    else if (Object.hasOwn(event, 'bounty_ref')) {
+      const previous = rows.get(key);
+      if (!previous) {
+        if (event.block_hash !== undefined && counts.get(event.block_hash) === 0) throw new Error('Bounty delta contradicts its immutable block count.');
+        unknown = true; continue;
+      }
+      if (bountyImmutableDigest(previous) !== event.bounty_ref) throw new Error('Inconsistent immutable bounty reference.');
+      event.bounty = { ...previous, ...event.bounty_delta };
+      validateBountyRow(event.bounty, event.tip, event.bounty.block_hash, undefined, true);
+      rows.set(key, event.bounty);
+    }
+    if (event.bounty) {
+      const row = event.bounty;
+      if (event.block_hash !== undefined && event.block_hash !== row.block_hash) throw new Error('Invalid bounty delta identity.');
+      validateBountyRow(row, event.tip, row.block_hash, heights.get(row.block_hash), true);
+      if (canonical.has(row.block_height) && canonical.get(row.block_height) !== row.block_hash) throw new RescanRequired('Bounty delta is no longer canonical.');
+      if (counts.get(row.block_hash) === 0 || (counts.has(row.block_hash) && (sizes.get(row.block_hash) ?? 0) > counts.get(row.block_hash))) {
+        throw new Error('Bounty delta contradicts its immutable block count.');
+      }
+    }
+  }
+  if (unknown) throw new UnknownBountyReference();
+  return { ...page, changes: events };
+}
+
 /** A block is applied only after the transport acknowledges a complete stream. */
 export async function readBountyBlock({ rpc, network, hash, height, check = () => {}, budget = { count: 0, limit: MAX_ROWS } }) {
   if (!HASH.test(hash)) throw new Error('Invalid bounty block hash.');
@@ -193,7 +316,7 @@ export async function discoverBounties({ rpc, network, lookback = 600, previous 
   // publication. Raw getrecentblockhashes extras never confer count authority.
   let knownWindow = previousWindow ? validatedWindow(previousWindow, network, previousWindow.blockCounts) : null;
   let cachedWindow = cursor ? knownWindow : null;
-  let requestDeltas = true, requestBlocks = true;
+  let requestDeltas = true, requestBlocks = true, requestCompact = true, requestCounts = true;
   if (!cursor) { check(); await onReset({ reason: 'initial' }); check(); cached = new Map(); }
   for (let restart = 0; restart < 4; restart++) {
     check();
@@ -209,7 +332,18 @@ export async function discoverBounties({ rpc, network, lookback = 600, previous 
     const query = async (method, params = {}) => {
       check();
       if (method === 'getrecentblockhashes') readsSincePage = true;
-      const value = await rpc.request(method, params); check(); validateTip(value?.tip, network); return value;
+      let value;
+      try { value = await rpc.request(method, method === 'getrecentblockhashes' && requestCounts ? { ...params, include_bounty_counts: true } : params); }
+      catch (error) {
+        if (method !== 'getrecentblockhashes' || !requestCounts || error.code !== -32602) throw error;
+        check(); requestCounts = false; value = await rpc.request(method, params);
+      }
+      check();
+      if (method !== 'getbountychanges') {
+        validateTip(value?.tip, network); rpcBlockCounts(value);
+        if (value.bounty_counts === undefined) requestCounts = false;
+      }
+      return value;
     };
     const resetError = error => error instanceof RescanRequired || [-32004, -32011].includes(error.code);
     const readWindow = async (expectedTip, inline) => {
@@ -239,11 +373,14 @@ export async function discoverBounties({ rpc, network, lookback = 600, previous 
         }
         budget.count -= rows.length; staged.delete(hash); dirty.delete(hash); deltaBlocks.delete(hash);
       }
-      for (const [hash, count] of inline?.counts ?? []) if (count === 0 && desired.has(hash)) {
-        if (staged.get(hash)?.length || dirty.has(hash)) throw new Error('Inconsistent empty bounty block.');
-        // This zero covers every P2C row in the same authoritative index
-        // publication as the journal page, not just its available bounties.
-        if (!staged.has(hash)) staged.set(hash, []);
+      for (const [hash, count] of expectedCounts) if (desired.has(hash)) {
+        if (staged.has(hash) && staged.get(hash).length !== count) throw new Error('Cached bounty block contradicts its immutable count.');
+        if (count === 0) {
+          if (dirty.has(hash)) throw new Error('Inconsistent empty bounty block.');
+          // Only acknowledged all-output counts, from a coherent journal or
+          // hash-window snapshot, authorize an empty complete cache entry.
+          if (!staged.has(hash)) staged.set(hash, []);
+        }
       }
     };
     const changes = async () => {
@@ -251,29 +388,50 @@ export async function discoverBounties({ rpc, network, lookback = 600, previous 
       if (journalPages >= MAX_JOURNAL_PAGES) throw new DiscoveryBudgetExceeded('Bounty journal work budget reached.');
       const from = cursor;
       const params = from ? { cursor: from } : {};
-      let page, base = requestDeltas && requestBlocks ? snapshot ?? knownWindow : null;
+      let page, inline, base = requestDeltas && requestBlocks ? snapshot ?? knownWindow : null;
+      const validatePage = value => {
+        validateTip(value?.tip, network);
+        if (!cursorValid(value.next_cursor) || typeof value.has_more !== 'boolean' || !Array.isArray(value.changes) || value.changes.length > 10000 ||
+            (value.has_more && !value.changes.length) || (value.changes.length && value.next_cursor === from)) throw new Error('Invalid or excessive bounty journal response.');
+        if (value.bounty_deltas !== undefined && value.bounty_deltas !== 1) throw new Error('Invalid bounty delta capability.');
+        return validateBlockDelta(value, base, network);
+      };
       for (;;) {
         const expanded = requestDeltas ? { ...params, include_bounties: true } : params;
+        const compact = requestDeltas && requestCompact;
+        const state = compact && base && from ? { tip: Object.freeze({ ...base.tip }), cursor: from } : null;
+        if (state) state.digest = bountyStateDigest(state.tip, state.cursor);
         try {
-          page = await query('getbountychanges', base ? { ...expanded,
-            known_tip: { height: base.tip.height, hash: base.tip.hash } } : expanded);
+          page = await query('getbountychanges', { ...expanded,
+            ...(base ? { known_tip: { height: base.tip.height, hash: base.tip.hash } } : {}),
+            ...(compact ? { compact: true } : {}), ...(state ? { known_state: state.digest } : {}) });
+          if (page?.changes?.some?.(event => event?.type === 'resync_required')) throw new RescanRequired('Bounty journal requested a new snapshot.');
+          const advertisedCompact = page?.compact !== undefined;
+          // Unknown immutable rows permit an expanded replay, not forgiveness
+          // of an invalid cursor/page/canonical block delta in this response.
+          const acknowledgement = page?.unchanged === true;
+          if (!acknowledgement) inline = validatePage(page);
+          page = expandCompactPage(page, { requested: compact, state, base, staged, network, lastSequence, inline, expectedCounts, lookback });
+          if (acknowledgement) inline = validatePage(page);
+          if (!advertisedCompact) requestCompact = false;
           break;
         } catch (error) {
+          // Replay the same cursor, before any event/cursor publication, when
+          // a patch cannot bind to a locally validated immutable row.
+          if (error instanceof UnknownBountyReference) { requestCompact = false; continue; }
           if (!requestDeltas || error.code !== -32602) throw error;
           // Negotiate one optional extension at a time, at this exact cursor.
           // Transport/backend failures are never compatibility signals.
-          if (base) { requestBlocks = false; base = null; }
+          if (compact) requestCompact = false;
+          else if (base) { requestBlocks = false; base = null; }
           else { requestDeltas = false; requestBlocks = false; }
         }
       }
       journalPages++;
-      if (!cursorValid(page.next_cursor) || typeof page.has_more !== 'boolean' || !Array.isArray(page.changes) || page.changes.length > 10000 || (page.has_more && !page.changes.length) || (page.changes.length && page.next_cursor === from)) throw new Error('Invalid or excessive bounty journal response.');
       // A reset revokes the old catalog before any following hash request can
       // block on quota, timeout or hide the reset behind an unrelated failure.
       if (page.changes.some(event => event?.type === 'resync_required')) throw new RescanRequired('Bounty journal requested a new snapshot.');
-      if (page.bounty_deltas !== undefined && page.bounty_deltas !== 1) throw new Error('Invalid bounty delta capability.');
       if (page.bounty_deltas === undefined) requestDeltas = false;
-      const inline = validateBlockDelta(page, base, network);
       if (base && page.block_deltas === undefined) requestBlocks = false;
       if (inline) pageBlocks.set(page, inline);
       cursor = page.next_cursor;
@@ -371,7 +529,12 @@ export async function discoverBounties({ rpc, network, lookback = 600, previous 
           const old = staged.get(block.hash);
           if (old) { budget.count -= old.length; staged.delete(block.hash); }
           try {
-            const rows = await readBlock(block.hash, { height: block.height, check: current, budget });
+            // A sibling's busy/quota failure must not escape through this
+            // stream's onChunk callback: the transport correctly treats
+            // callback validation exceptions as malformed data. Finish every
+            // already-started bounded stream with its full validation and the
+            // real epoch/cancellation fence; stop new work/publication below.
+            const rows = await readBlock(block.hash, { height: block.height, check, budget });
             if (expectedCounts.has(block.hash) && rows.length !== expectedCounts.get(block.hash)) throw new Error('Bounty stream contradicts its immutable block count.');
             current(); staged.set(block.hash, rows); dirty.delete(block.hash); deltaBlocks.delete(block.hash);
             for (const row of rows) if (row.status !== 'available') onInvalidate(row);
@@ -379,7 +542,13 @@ export async function discoverBounties({ rpc, network, lookback = 600, previous 
         }
       });
       const results = await Promise.allSettled(workers);
-      const rejected = results.find(result => result.status === 'rejected');
+      const failures = results.filter(result => result.status === 'rejected');
+      // Do not let an earlier worker's retryable reply hide a genuine malformed
+      // sibling or a contradictory complete count. This changes only which
+      // existing failure is propagated; no parsing/stream check is relaxed.
+      const deferred = error => error?.name === 'AbortError' || error instanceof RescanRequired ||
+        ['RPC_QUEUE_FULL', -32001, -32002, -32004, -32011, -32029, -32030].includes(error?.code);
+      const rejected = failures.find(result => !deferred(result.reason)) ?? failures[0];
       if (rejected) throw rejected.reason;
     };
     try {

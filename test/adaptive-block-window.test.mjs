@@ -145,7 +145,7 @@ test('a legacy server rejecting count falls back to the validated full response'
     }
   };
   const result = await discoverBounties({ ...f.options, ...previous });
-  assert.deepEqual(f.counts(), [5, 600]);
+  assert.deepEqual(f.counts(), [5, 5, 600]);
   assertComplete(result, f.current);
 });
 

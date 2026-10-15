@@ -45,7 +45,7 @@ export class ClaimerService {
     this.status = 'stopped'; this.lastError = null; this.fatalError = null; this.tip = null;
     this.blocks = new Map(); this.outpoints = new Map(); this.cursor = null; this.blockWindow = null; this.reserved = new Set();
     this.catalogGate = null; this.catalogRevision = 0;
-    this.fundingPending = new Map(); this.ioAbort = new AbortController();
+    this.fundingPending = new Map(); this.ioAbort = new AbortController(); this.rawFunding = true;
     this.metrics = new ClaimMetrics();
     this.timer = null; this.cycling = null; this.suspending = null; this.stopping = null; this.stoppingFailed = false;
     this.inFlightBroadcasts = new Set(); this.recoveryDue = new Map(); this.recoveryBlocked = new Set();
@@ -175,7 +175,7 @@ export class ClaimerService {
     if (!this.running || this.fatalError) return;
     this.ready = false;
     this.epoch++; this.ioAbort.abort(); this.cancelCatalogWaiters(); this.ioAbort = new AbortController();
-    this.tip = null; this.blockWindow = null; this.clearFundingCache(); this.fundingPending.clear();
+    this.tip = null; this.blockWindow = null; this.clearFundingCache(); this.fundingPending.clear(); this.rawFunding = true;
     this.status = 'reconnecting';
     const epoch = this.epoch;
     const saved = this.persistPendingProofs(), previous = this.suspending;
@@ -343,7 +343,14 @@ export class ClaimerService {
       const scopedSignal = this.ioAbort.signal;
       entry = { epoch };
       entry.promise = (async () => {
-        const result = await this.rpc.request('gettransaction', { txid }, { signal: scopedSignal });
+        const rawOnly = this.rawFunding;
+        let result;
+        try { result = await this.rpc.request('gettransaction', { txid, ...(rawOnly ? { raw_only: true } : {}) }, { signal: scopedSignal }); }
+        catch (error) {
+          if (!rawOnly || error.code !== -32602) throw error;
+          this.check(epoch, scopedSignal); this.rawFunding = false;
+          result = await this.rpc.request('gettransaction', { txid }, { signal: scopedSignal });
+        }
         this.check(epoch, scopedSignal);
         let raw;
         try {
