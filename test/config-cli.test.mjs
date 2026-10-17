@@ -60,7 +60,7 @@ test('one instance per configuration and lock release cannot delete a changed ow
 test('CLI help/version have no side effects; default first run creates empty config offline', async t => {
   const directory = await temporary(t), cli = resolve('src/cli.mjs');
   assert.match((await run(process.execPath, [cli, '--help'], { cwd: directory })).stdout, /Ctrl\+C/);
-  assert.equal((await run(process.execPath, [cli, '--version'], { cwd: directory })).stdout.trim(), '1.0.1');
+  assert.equal((await run(process.execPath, [cli, '--version'], { cwd: directory })).stdout.trim(), '1.0.2');
   await assert.rejects(readFile(join(directory, 'claimer.conf')), { code: 'ENOENT' });
   await assert.rejects(run(process.execPath, [cli], { cwd: directory }), error => error.code === 2 && /No connections were made/.test(error.stdout));
   assert.equal(await readFile(join(directory, 'claimer.conf'), 'utf8'), CONFIG_TEMPLATE);

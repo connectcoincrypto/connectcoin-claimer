@@ -1,6 +1,6 @@
 {
   "name": "connectcoin-claimer",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Address-only, headless ConnectCoin Automatic Claims client",
   "type": "module",
   "private": true,
