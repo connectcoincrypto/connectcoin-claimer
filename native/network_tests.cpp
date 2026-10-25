@@ -172,6 +172,38 @@ int main(int argc, char** argv)
             const std::span<const unsigned char> root_bytes{reinterpret_cast<const unsigned char*>(roots.data()), roots.size()};
             const auto good = claimer::VerifyProofForTesting(proof, context, root_bytes);
             Require(good.meets_target, "Fixture work target mismatch");
+            // The target gate must use the exact same tagged work hash and
+            // display-byte order as the complete authenticated verifier. It
+            // consumes only the four messages through Certificate, never CV.
+            const auto parsed_prefix = claimer::ParseProof(proof, context);
+            const std::span<const unsigned char> prefix{proof.data(),
+                static_cast<size_t>(parsed_prefix.certificate.data() + parsed_prefix.certificate.size() - proof.data())};
+            Require(claimer::CertificatePrefixMeetsTarget(prefix, claimer::PreparedContext(context)),
+                    "Winning Certificate prefix was discarded");
+            auto boundary = context;
+            boundary.connection_work_target = good.work_hash;
+            Require(claimer::CertificatePrefixMeetsTarget(prefix, claimer::PreparedContext(boundary)),
+                    "Target equality was discarded");
+            auto lower = claimer::Unhex(good.work_hash);
+            Require(good.work_hash != std::string(64, '0'), "Fixture work hash is zero");
+            size_t borrow = lower.size();
+            while (borrow && lower[--borrow] == 0) lower[borrow] = 255;
+            --lower[borrow];
+            boundary.connection_work_target = claimer::Hex(lower);
+            Require(!claimer::CertificatePrefixMeetsTarget(prefix, claimer::PreparedContext(boundary)),
+                    "Below-work target was accepted");
+            boundary = context; boundary.connection_work_target.assign(64, '0');
+            Require(!claimer::CertificatePrefixMeetsTarget(prefix, claimer::PreparedContext(boundary)),
+                    "Zero target Certificate prefix was accepted");
+            auto reject_prefix = [&](std::span<const unsigned char> bytes, const claimer::Context& changed) {
+                bool rejected{};
+                try { (void)claimer::CertificatePrefixMeetsTarget(bytes, claimer::PreparedContext(changed)); }
+                catch (const std::exception&) { rejected = true; }
+                Require(rejected, "Malformed or mismatched Certificate prefix was silently discarded");
+            };
+            reject_prefix(prefix.first(prefix.size() - 1), boundary);
+            reject_prefix(proof, boundary); // Trailing CertificateVerify is not a prefix.
+            ++boundary.input_index; reject_prefix(prefix, boundary);
             // Own bytes/context, then destroy/mutate all caller inputs. Copies
             // and moves must keep every parsed span bound to the owned bytes.
             auto owned = [&] {
@@ -313,6 +345,35 @@ int main(int argc, char** argv)
             for (auto& job : jobs) for (const auto& proof : job.get()) std::cout << claimer::Hex(proof) << '\n';
             return 0;
         }
+        if (mode == "target-miss" || mode == "target-miss-reuse" || mode == "target-miss-malformed") {
+            claimer::ClearSignatureCacheForTesting();
+            const int count = mode == "target-miss-reuse" ? 2 : 1;
+            for (int index = 0; index < count; ++index) {
+                const auto before = claimer::TlsReuseSnapshotForTesting();
+                claimer::CaptureControl own_control;
+                context = FixtureContext();
+                context.connection_work_target.assign(64, index == 0 ? '0' : 'f');
+                bool missed{};
+                unsigned starts{};
+                try {
+                    const auto captured = claimer::CapturePreparedForTesting(claimer::PreparedContext(context),
+                        {"127.0.0.1", AF_INET, static_cast<uint16_t>(port)}, own_control,
+                        [&] { ++starts; }, std::chrono::milliseconds{timeout_ms});
+                    Require(index == 1, "Certificate-only capture returned an incomplete proof");
+                    authenticate(captured.Encoded());
+                } catch (const claimer::CaptureTargetMiss&) { missed = true; }
+                Require(starts == 1 && missed == (index == 0), "Early target miss changed attempt accounting");
+                RequireTlsReused(before);
+                if (index == 0) {
+                    const auto signatures = claimer::SignatureCacheStatsForTesting();
+                    Require(signatures.misses == 0 && signatures.entries == 0,
+                            "Early target miss authenticated certificate signatures");
+                }
+            }
+            std::cout << "target-miss\n";
+            return 0;
+        }
+        if (mode == "complete-target-miss") context.connection_work_target.assign(64, '0');
         int starts{};
         bool cancelled{};
         std::promise<void> start_gate;
@@ -336,11 +397,18 @@ int main(int argc, char** argv)
         };
         try {
             const auto captured = claimer::CapturePreparedForTesting(claimer::PreparedContext(context), {"127.0.0.1", AF_INET, static_cast<uint16_t>(port)},
-                control, on_started, std::chrono::milliseconds{timeout_ms}, mode == "complete");
+                control, on_started, std::chrono::milliseconds{timeout_ms}, mode == "complete" || mode == "complete-target-miss");
             const auto& proof = captured.Encoded();
             const auto parsed = claimer::ParseProof(proof, context);
             Require(parsed.certificate_verify.size() >= 8, "Captured CV missing");
             Require(starts == 1, "Capture start count mismatch");
+            if (mode == "complete-target-miss") {
+                Require(!roots.empty(), "Complete target-miss fixture needs roots");
+                const std::span<const unsigned char> root_bytes{reinterpret_cast<const unsigned char*>(roots.data()), roots.size()};
+                Require(!claimer::VerifyCapturedForTesting(captured, root_bytes).meets_target,
+                        "Full-handshake target miss unexpectedly won");
+                context.connection_work_target.assign(64, 'f');
+            }
             authenticate(proof);
             std::cout << claimer::Hex(proof) << '\n';
         } catch (const claimer::CaptureCancelled&) {

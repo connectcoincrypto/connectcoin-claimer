@@ -66,6 +66,50 @@ function complete(command, child, overrides = {}) {
   child.send({ type: 'attempt', ...value, proof: '020100', verified: true });
 }
 
+test('early target misses preserve candidate budgets without inventing proof validation', async t => {
+  const { pool } = fixture(t, (command, child) => {
+    const value = observation(command, { captured: false, targetMiss: true, validationPassed: null });
+    child.send({ type: 'started', id: command.id });
+    child.send({ type: 'capture', ...value });
+    child.send({ type: 'attempt', ...value, proof: null, verified: false });
+  });
+  await pool.start({});
+  const captures = [], results = []; let starts = 0;
+  const result = await pool.attempt(context(), { bountyId, successfulConnections: 7n,
+    onStarted: () => starts++, onCapture: value => captures.push(value), onResult: value => results.push(value) });
+  assert.equal(starts, 1); assert.equal(captures.length, 1); assert.equal(results.length, 1);
+  assert.equal(result.successfulConnections, '8'); assert.equal(result.targetMiss, true);
+  assert.equal(result.validationPassed, null); assert.equal(result.captured, false);
+  assert.equal(result.proof, null); assert.equal(result.verified, false);
+  assert.equal(pool.requests.size, 0); assert.equal(pool.failure, undefined);
+});
+
+for (const patch of [{ targetMiss: 'true' }, { targetMiss: null }, { captured: true },
+  { validationPassed: true }, { validationPassed: false }, { proof: '020100', verified: true },
+  { blocked: 'budget' }, { localUnavailable: true }, { successfulConnections: '7' }]) {
+  test(`early target misses reject inconsistent evidence ${JSON.stringify(patch)}`, async t => {
+    const { pool } = fixture(t, (command, child) => {
+      const value = observation(command, { captured: false, targetMiss: true, validationPassed: null });
+      child.send({ type: 'started', id: command.id });
+      child.send({ type: 'capture', ...value });
+      child.send({ type: 'attempt', ...value, proof: null, verified: false, ...patch });
+    });
+    await pool.start({});
+    await assert.rejects(pool.attempt(context(), { bountyId, successfulConnections: 7n }), error => error.helperFatal === true);
+  });
+}
+
+test('target-miss flags must match capture and terminal frames', async t => {
+  const { pool } = fixture(t, (command, child) => {
+    const value = observation(command, { captured: false, targetMiss: true, validationPassed: null });
+    child.send({ type: 'started', id: command.id });
+    child.send({ type: 'capture', ...value });
+    child.send({ type: 'attempt', ...value, targetMiss: false, validationPassed: false, proof: null, verified: false });
+  });
+  await pool.start({});
+  await assert.rejects(pool.attempt(context(), { bountyId }), /Conflicting helper capture observation/);
+});
+
 test('admission pause suspends only pre-start watchdogs and resumes without counting control ACKs', async t => {
   t.mock.timers.enable({ apis: ['setTimeout'] });
   const { pool, commands, children } = fixture(t);

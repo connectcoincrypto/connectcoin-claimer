@@ -18,8 +18,8 @@ export function claimConnectionStopCount(target) {
   return firstExceeded < MAX_P2C_SUCCESSFUL_CONNECTIONS ? firstExceeded : MAX_P2C_SUCCESSFUL_CONNECTIONS;
 }
 
-/** Core's soft per-outpoint budget: only completed CertificateVerify captures
- * count. Equality with 2/p is still eligible; pending/failed TCP never reserves
+/** Soft per-outpoint budget: completed CertificateVerify captures and early
+ * target misses count. Equality with 2/p is still eligible; pending/failed TCP never reserves
  * budget. A saturated uint64 counter stops further starts, as in Core.
  */
 export function isP2CClaimConnectionLimitExceeded(target, successes) {
@@ -137,7 +137,9 @@ export class P2CDomainStats {
 }
 
 export function validateAttemptStats(stats, maxAttempts) {
+  const targetMisses = stats && Object.hasOwn(stats, 'targetMisses') ? stats.targetMisses : 0;
   if (!stats || stats.validation !== 'certificate-proof-v1' || !Number.isSafeInteger(stats.completed) || stats.completed < 0 || stats.completed > maxAttempts ||
+      !Number.isSafeInteger(targetMisses) || targetMisses < 0 || targetMisses > maxAttempts - stats.completed ||
       !Array.isArray(stats.recent) || stats.recent.length !== Math.min(100, stats.completed)) throw new Error('Invalid helper attempt statistics');
   for (const sample of stats.recent) {
     if (!Array.isArray(sample) || sample.length !== 2 || typeof sample[0] !== 'boolean' ||

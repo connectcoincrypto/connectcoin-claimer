@@ -72,7 +72,7 @@ struct DnsEntry {
 };
 struct Job {
     uint64_t id{};
-    bool attempt{}, running{}, started{}, captured{};
+    bool attempt{}, running{}, started{}, captured{}, target_miss{};
     Context context;
     std::optional<PreparedContext> prepared_context;
     std::optional<Endpoint> endpoint;
@@ -275,6 +275,7 @@ struct ClaimsService::Impl {
         UniValue fields(UniValue::VOBJ);
         fields.pushKV("id", job->id); fields.pushKV("context", PublicContext(job->context));
         fields.pushKV("started", job->started); fields.pushKV("captured", job->captured);
+        if (job->target_miss) fields.pushKV("targetMiss", true);
         fields.pushKV("seconds", job->seconds); fields.pushKV("cancelled", job->Cancelled());
         fields.pushKV("successfulConnections", std::to_string(count));
         return fields;
@@ -485,6 +486,7 @@ struct ClaimsService::Impl {
                 job->captured = true;
             }
             catch (const OutputFailure&) { throw; }
+            catch (const CaptureTargetMiss&) { job->target_miss = true; }
             catch (const CaptureCancelled&) { capture_error = std::current_exception(); }
             // These gate exits can follow an already-visible started ACK but
             // precede the actual connect call. Preserve that protocol ACK and
@@ -506,14 +508,16 @@ struct ClaimsService::Impl {
                 { std::lock_guard lock(mutex);
                     job->seconds = std::nearbyint(std::max(0.0, elapsed) * 1000000.0) / 1000000.0;
                     auto& budget = budgets.at(job->bounty);
-                    if (job->captured && budget.successes != UINT64_MAX) ++budget.successes;
+                    // Count each target-evaluable candidate once, including
+                    // early misses, without claiming it was authenticated.
+                    if ((job->captured || job->target_miss) && budget.successes != UINT64_MAX) ++budget.successes;
                     job->successes = budget.successes;
                     BudgetChangedLocked(job->bounty, budget);
                 }
                 auto frame = Fields(job); frame.pushKV("type", "capture"); EmitFrame(frame);
             }
             if (capture_error) std::rethrow_exception(capture_error);
-            if (!job->Cancelled()) {
+            if (!job->Cancelled() && !job->target_miss) {
                 validating = true;
                 const auto verified = native_capture ? VerifyCaptured(*native_capture) : deps.verify(captured, job->context);
                 validated = true;
@@ -542,9 +546,11 @@ struct ClaimsService::Impl {
         // An actual failed connect still counts as a failed attempt, but a
         // conclusive local route/family limitation says nothing about remote
         // certificate validity or endpoint quality. Keep those histories neutral.
-        if (!local_unavailable && score && validated && std::isfinite(job->seconds) && job->seconds >= 0) {
+        // Throughput scores estimate usable work candidates. Early target
+        // misses are useful throughput observations, not valid-proof samples.
+        if (!local_unavailable && score && (validated || job->target_miss) && std::isfinite(job->seconds) && job->seconds >= 0) {
             std::lock_guard lock(mutex);
-            performance.Record(score, *validated, job->seconds, deps.performance_time());
+            performance.Record(score, job->target_miss || *validated, job->seconds, deps.performance_time());
         }
         frame.pushKV("type", "attempt"); frame.pushKV("proof", proof ? UniValue(*proof) : UniValue()); frame.pushKV("verified", proof.has_value());
         frame.pushKV("validationPassed", validated ? UniValue(*validated) : UniValue());

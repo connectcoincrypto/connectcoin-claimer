@@ -103,7 +103,7 @@ export function formatMetricsLine(state) {
   return `[${safeText(state.status ?? state.engine?.status ?? 'running')}] ` +
     `${Number(metrics.connectionsPerSecond ?? 0).toFixed(1)} connections/s (last 10s) | active ${metrics.activeConnections ?? 0} | ` +
     `started ${metrics.connectionsStarted ?? 0} | valid ${metrics.valid ?? 0} | failed ${metrics.invalid ?? 0} | ` +
-    `target reached ${metrics.targetReached ?? 0} | submitted ${state.claims?.completed ?? 0}`;
+    `target reached ${metrics.targetReached ?? 0} | submitted ${state.claims?.completed ?? 0} | target misses ${metrics.targetMisses ?? 0}`;
 }
 
 export async function main(args = process.argv.slice(2), {

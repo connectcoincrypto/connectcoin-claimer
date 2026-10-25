@@ -125,9 +125,21 @@ The embedded consensus-v1 root bundle is `helpers/p2c_roots_v1.pem`, SHA-256
 CMake rejects a different bundle. It is never replaced by the host trust store.
 The bundle's Mozilla attribution remains in its header.
 
-Ordinary captures stop at CertificateVerify. Cryptographic validation is done
-by the verifier after capture, including for valid proofs that miss the work
-target. The separate RSA compatibility probe can complete the TLS handshake.
+Ordinary captures check the tagged work hash after the complete Certificate
+message. Nonwinning prefixes throw `CaptureTargetMiss` and close the socket
+before fetching CertificateVerify, without signature authentication. The prefix
+parser shares the full proof's transcript/context checks and target comparison;
+it cannot construct a verified proof. Candidates that meet the target continue
+through CertificateVerify and undergo full cryptographic verification. Offline
+verification of supplied full proofs always authenticates signatures even when
+the target misses. The separate RSA compatibility probe completes the TLS
+handshake without the early filter.
+
+The helper emits `targetMiss: true`, `captured: false`, `validationPassed: null`
+and no proof for an early discard. It counts once toward the candidate budget
+and throughput score, separately from valid/failed proof counters. Capture and
+terminal frames retain the same per-job cumulative count; cancellation cannot
+turn an early discard into a claim or cause duplicate accounting.
 
 The abbreviated Certificate adapter in `p2c_tls_private.c` mirrors the envelope
 parser from Mbed TLS 3.6.7 `library/ssl_tls13_generic.c` (Copyright The Mbed TLS
@@ -136,7 +148,7 @@ bounded reassembly, request-context/list/entry/extension bounds, empty-chain
 rejection, per-certificate extension-mask reset and the original
 `mbedtls_ssl_tls13_check_received_extension` admission checks. Only the redundant
 TLS-owned DER chain is omitted: the caller immediately parses the same exact
-message through the owned certificate cache, and every proof still undergoes
+message through the owned certificate cache, and every winning proof still undergoes
 the full chain, hostname, time, usage, signature-mask, CertificateVerify and
 target checks. No untrusted parsed input becomes an authentication result.
 The complete-handshake path keeps the original Mbed TLS handler. Offline

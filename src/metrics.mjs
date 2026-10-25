@@ -7,7 +7,7 @@ export class ClaimMetrics {
   constructor({ now = () => performance.now() } = {}) {
     this.now = now; this.buckets = Array.from({ length: 100 }, () => ({ tick: -1, count: 0 }));
     this.connectionsStarted = 0; this.activeConnections = 0; this.attemptsFinished = 0;
-    this.valid = 0; this.invalid = 0; this.cancelled = 0; this.targetReached = 0;
+    this.valid = 0; this.invalid = 0; this.cancelled = 0; this.targetReached = 0; this.targetMisses = 0;
   }
   started() {
     const tick = Math.floor(this.now() / 100), bucket = this.buckets[tick % this.buckets.length];
@@ -20,6 +20,7 @@ export class ClaimMetrics {
     this.attemptsFinished = increment(this.attemptsFinished);
     if (result?.validationPassed === true) this.valid = increment(this.valid);
     if (result?.validationPassed === false) this.invalid = increment(this.invalid);
+    if (result?.targetMiss === true) this.targetMisses = increment(this.targetMisses);
     if (result?.cancelled === true) this.cancelled = increment(this.cancelled);
     if (result?.verified === true && result?.proof && !result.cancelled) this.targetReached = increment(this.targetReached);
   }
@@ -28,7 +29,7 @@ export class ClaimMetrics {
     const count = this.buckets.reduce((sum, bucket) => sum + (bucket.tick > tick - 100 && bucket.tick <= tick ? bucket.count : 0), 0);
     return { connectionsStarted: this.connectionsStarted, activeConnections: this.activeConnections,
       connectionsPerSecond: count / 10, attemptsFinished: this.attemptsFinished,
-      valid: this.valid, invalid: this.invalid, cancelled: this.cancelled, targetReached: this.targetReached };
+      valid: this.valid, invalid: this.invalid, cancelled: this.cancelled, targetReached: this.targetReached, targetMisses: this.targetMisses };
   }
   wrap(pool) {
     const attempt = pool.attempt.bind(pool);

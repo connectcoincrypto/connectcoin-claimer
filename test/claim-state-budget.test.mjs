@@ -85,6 +85,35 @@ test('default push notifications remain synchronous and detached, including warn
   assert.equal(value.options.concurrency, 100);
 });
 
+test('early target misses consume the budget once, including out-of-order snapshots and saturation', () => {
+  const value = engine(), job = { bounty: bounty('f'.repeat(64)) }, key = `${job.bounty.txid}:0`;
+  for (const [count, expected, blocked] of [[2n, 2n, false], [1n, 2n, false], [3n, 3n, true]]) {
+    value.observe({ job }, { captured: false, targetMiss: true, successfulConnections: String(count) });
+    assert.equal(value.successCounts.get(key), expected); assert.equal(job.budgetExceeded, blocked);
+  }
+  const request = { job };
+  value.observe(request, { captured: false, targetMiss: true, successfulConnections: String(MAX_P2C_SUCCESSFUL_CONNECTIONS) });
+  value.observe({ job }, { captured: false, targetMiss: true });
+  assert.equal(value.successCounts.get(key), MAX_P2C_SUCCESSFUL_CONNECTIONS);
+  assert.throws(() => value.observe(request, { captured: false, targetMiss: true }), /Duplicate connection observation/);
+});
+
+test('early target misses measure candidate throughput without asserting a validated proof', () => {
+  const value = engine(), job = { bounty: bounty('f'.repeat(64)) };
+  const miss = { started: true, captured: false, targetMiss: true, seconds: 0.25,
+    cancelled: false, validationPassed: null, proof: null, verified: false };
+  const request = { job };
+  value.observeResult(request, miss);
+  assert.deepEqual(value.domainStats.get('example.com:7').snapshot(), { attempts: 1, connections: 1, totalTime: 0.25, completed: 1 });
+  assert.equal(miss.validationPassed, null);
+  assert.throws(() => value.observeResult(request, miss), /Duplicate connection validation observation/);
+  for (const patch of [{ targetMiss: 1 }, { captured: true }, { started: false }, { validationPassed: true },
+    { validationPassed: false }, { proof: '020100', verified: true }, { localUnavailable: true }, { blocked: 'budget' }]) {
+    assert.throws(() => value.observeResult({ job }, { ...miss, ...patch }), /Invalid/);
+  }
+  assert.equal(value.domainStats.get('example.com:7').snapshot().completed, 1);
+});
+
 test('pull mode updates all state immediately without building or notifying discarded snapshots', () => {
   const pushed = engine();
   let notifications = 0, snapshots = 0;

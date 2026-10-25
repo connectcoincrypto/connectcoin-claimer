@@ -21,6 +21,9 @@ struct Endpoint {
 };
 struct CaptureCancelled : std::runtime_error { CaptureCancelled() : std::runtime_error("TLS capture cancelled") {} };
 struct CaptureTimeout : std::runtime_error { CaptureTimeout() : std::runtime_error("TLS connection timed out") {} };
+// A structurally checked Certificate prefix missed the work target. No
+// CertificateVerify was captured/authenticated and no claim proof is returned.
+struct CaptureTargetMiss : std::runtime_error { CaptureTargetMiss() : std::runtime_error("Certificate work hash missed target") {} };
 // A local socket/route limitation, not a remote TLS/proof validation failure.
 // Only socket creation can establish family-wide lack of support. A connect
 // route failure is endpoint-specific even when another address shares its family.
@@ -55,6 +58,8 @@ std::vector<Endpoint> ResolveEndpoints(const std::string& domain, uint16_t port 
 // atomic flag before waiting for the socket lock, so paced starts are cancellable.
 // Capture owns its socket until exit; cancellation shuts it down without closing
 // or permitting descriptor reuse. Caller must keep control alive until exit.
+// Unless complete_handshake is requested, a nonwinning Certificate prefix ends
+// capture with CaptureTargetMiss before CertificateVerify is fetched/verified.
 Bytes Capture(const Context& context, const Endpoint& endpoint, CaptureControl& control,
               const std::function<void()>& on_started = {},
               std::chrono::milliseconds timeout = std::chrono::seconds{10},

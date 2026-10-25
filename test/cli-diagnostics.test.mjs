@@ -12,9 +12,10 @@ test('CLI preserves accepted/discovery and exact metric line formats used by ope
     valid: 107959, invalid: 3, targetReached: 2,
   } };
   const line = formatMetricsLine(state);
-  assert.equal(line, '[running] 600.0 connections/s (last 10s) | active 34 | started 108000 | valid 107959 | failed 3 | target reached 2 | submitted 2');
+  assert.equal(line, '[running] 600.0 connections/s (last 10s) | active 34 | started 108000 | valid 107959 | failed 3 | target reached 2 | submitted 2 | target misses 0');
   assert.equal(formatMetricsLine({ ...state, status: 'resyncing' }), line.replace('[running]', '[resyncing]'));
-  assert.equal(formatMetricsLine({}), '[running] 0.0 connections/s (last 10s) | active 0 | started 0 | valid 0 | failed 0 | target reached 0 | submitted 0');
+  assert.equal(formatMetricsLine({}), '[running] 0.0 connections/s (last 10s) | active 0 | started 0 | valid 0 | failed 0 | target reached 0 | submitted 0 | target misses 0');
+  assert.equal(formatMetricsLine({ ...state, metrics: { ...state.metrics, targetMisses: 27 } }), line.replace('target misses 0', 'target misses 27'));
   assert.equal(formatServiceEvent('state', state), null);
 });
 

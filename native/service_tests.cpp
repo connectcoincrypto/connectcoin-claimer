@@ -569,6 +569,109 @@ void SuccessfulAndMissedProof() {
     Fixture miss(1, deps); miss.Ready(); miss.service->Command(Attempt(2)); const auto value = miss.Wait("attempt", 2);
     Check(value["validationPassed"].isTrue() && value["proof"].isNull() && value["verified"].isFalse(), "Hash miss still fully validated");
 }
+void EarlyTargetMissCountsWithoutVerification() {
+    std::atomic<unsigned> candidates{};
+    ServiceDependencies deps;
+    deps.capture = [&](const Context&, const Endpoint&, CaptureControl&, const std::function<void()>& started) -> Bytes {
+        started(); ++candidates; throw CaptureTargetMiss();
+    };
+    Fixture fixture(1, deps); fixture.Ready();
+    // The capture dependency deliberately simulates misses at a tiny budget,
+    // independently of the cryptographic prefix/target tests.
+    auto context = ContextFor(); context.connection_work_target = std::string(64, 'f');
+    for (uint64_t id = 2; id <= 4; ++id) {
+        fixture.service->Command(Attempt(id, context));
+        const auto capture = fixture.Wait("capture", id), result = fixture.Wait("attempt", id);
+        for (const auto* frame : {&capture, &result}) {
+            Check((*frame)["started"].isTrue() && (*frame)["captured"].isFalse() && (*frame)["targetMiss"].isTrue(), "Early miss reports real start but no CertificateVerify capture");
+            Check((*frame)["successfulConnections"].get_str() == std::to_string(id - 1), "Early target miss consumes one candidate budget slot");
+            Check((*frame)["cancelled"].isFalse() && (*frame)["seconds"].get_real() >= 0, "Early target miss preserves elapsed time and cancellation status");
+        }
+        Check(result["validationPassed"].isNull() && result["verified"].isFalse() && result["proof"].isNull(), "Unauthenticated early miss is neither a valid nor failed proof");
+        Check(result["message"].isNull(), "Normal early target miss is not a connection error");
+    }
+    fixture.service->Command(Attempt(5, context, "0")); const auto blocked = fixture.Wait("attempt", 5);
+    Check(blocked["blocked"].get_str() == "budget" && blocked["started"].isFalse() && blocked["successfulConnections"].get_str() == "3", "Early misses exhaust the shared budget despite stale controller reports");
+    Check(blocked["targetMiss"].isNull() && blocked["validationPassed"].isNull() && candidates == 3 && fixture.verifications == 0, "Budget rejection creates no extra miss, capture, or signature verification");
+
+    Fixture saturated(1, deps); saturated.Ready();
+    saturated.service->Command(Attempt(2, ContextFor(), "18446744073709551614"));
+    const auto last = saturated.Wait("attempt", 2);
+    Check(last["targetMiss"].isTrue() && last["successfulConnections"].get_str() == "18446744073709551615", "Early miss saturates candidate counter without overflow");
+    saturated.service->Command(Attempt(3));
+    Check(saturated.Wait("attempt", 3)["blocked"].get_str() == "budget" && saturated.verifications == 0, "Saturated miss budget blocks subsequent starts");
+}
+void EarlyTargetMissKeepsFailuresAndWinningValidation() {
+    std::atomic<unsigned> attempts{}, verifications{};
+    ServiceDependencies deps;
+    deps.capture = [&](const Context&, const Endpoint&, CaptureControl&, const std::function<void()>& started) -> Bytes {
+        started();
+        const auto attempt = ++attempts;
+        if (attempt == 1) throw CaptureTimeout();
+        if (attempt == 2) throw CaptureTargetMiss();
+        return {2, static_cast<unsigned char>(attempt)};
+    };
+    deps.verify = [&](const Bytes& proof, const Context&) {
+        ++verifications;
+        if (proof.back() == 3) throw std::runtime_error("Invalid CertificateVerify signature");
+        return Verification{std::string(64, '0'), true, 0x0403};
+    };
+    Fixture fixture(1, deps); fixture.Ready();
+    fixture.service->Command(Attempt(2)); const auto timeout = fixture.Wait("attempt", 2);
+    Check(timeout["validationPassed"].isFalse() && timeout["targetMiss"].isNull() && timeout["successfulConnections"].get_str() == "0", "Timeout remains a failed attempt and does not spend candidate budget");
+    fixture.service->Command(Attempt(3)); const auto miss = fixture.Wait("attempt", 3);
+    Check(miss["targetMiss"].isTrue() && miss["validationPassed"].isNull() && miss["successfulConnections"].get_str() == "1", "Only early miss is classified as unauthenticated target rejection");
+    fixture.service->Command(Attempt(4)); const auto invalid = fixture.Wait("attempt", 4);
+    Check(invalid["captured"].isTrue() && invalid["targetMiss"].isNull() && invalid["validationPassed"].isFalse() && invalid["verified"].isFalse() && invalid["proof"].isNull(), "Winning candidate with invalid signature is still rejected");
+    Check(invalid["successfulConnections"].get_str() == "2", "Rejected full proof counts the same candidate only once");
+    fixture.service->Command(Attempt(5)); const auto winner = fixture.Wait("attempt", 5);
+    Check(winner["captured"].isTrue() && winner["targetMiss"].isNull() && winner["validationPassed"].isTrue() && winner["verified"].isTrue() && winner["proof"].get_str() == "0204", "Winning proof passes through unchanged full verification and submission output");
+    Check(winner["successfulConnections"].get_str() == "3" && attempts == 4 && verifications == 2, "Exactly full candidates invoke verification; attempts and budgets stay distinct");
+}
+void ConcurrentEarlyTargetMissSnapshotsRemainImmutable() {
+    std::mutex gate;
+    std::condition_variable condition;
+    unsigned capturing = 0;
+    ServiceDependencies deps;
+    deps.capture = [&](const Context&, const Endpoint&, CaptureControl&, const std::function<void()>& started) -> Bytes {
+        started();
+        std::unique_lock lock(gate);
+        ++capturing; condition.notify_all();
+        Check(condition.wait_for(lock, 3s, [&] { return capturing == 8; }), "All concurrent attempts reach Certificate before target rejection");
+        throw CaptureTargetMiss();
+    };
+    Fixture fixture(8, deps); fixture.Ready();
+    for (uint64_t id = 2; id < 10; ++id) fixture.service->Command(Attempt(id));
+    std::vector<uint64_t> counts;
+    for (uint64_t id = 2; id < 10; ++id) {
+        const auto capture = fixture.Wait("capture", id), result = fixture.Wait("attempt", id);
+        Check(capture["targetMiss"].isTrue() && result["targetMiss"].isTrue() && capture["successfulConnections"].get_str() == result["successfulConnections"].get_str(), "Concurrent early miss retains its immutable candidate-count snapshot");
+        Check(result["captured"].isFalse() && result["validationPassed"].isNull() && result["proof"].isNull() && result["verified"].isFalse(), "Concurrent miss never becomes an authenticated proof or connection failure");
+        counts.push_back(std::stoull(result["successfulConnections"].get_str()));
+    }
+    std::sort(counts.begin(), counts.end());
+    Check(counts == std::vector<uint64_t>{1, 2, 3, 4, 5, 6, 7, 8} && fixture.verifications == 0, "Concurrent early misses consume exactly one budget slot each without verifying signatures");
+}
+void EarlyTargetMissSurvivesCancellationAfterCapture() {
+    ServiceDependencies deps;
+    deps.capture = [](const Context&, const Endpoint&, CaptureControl&, const std::function<void()>& started) -> Bytes {
+        started(); throw CaptureTargetMiss();
+    };
+    ClaimsService* controller = nullptr;
+    Fixture fixture(1, deps, 100000, [&](const UniValue& frame) {
+        if (frame["type"].get_str() == "capture" && frame["id"].getInt<uint64_t>() == 2) {
+            Check(frame["targetMiss"].isTrue(), "Cancellation races only after the completed prefix decision");
+            controller->Command(Cancel(2));
+        }
+    });
+    controller = fixture.service.get(); fixture.Ready(); fixture.service->Command(Attempt(2));
+    const auto result = fixture.Wait("attempt", 2), capture = fixture.Wait("capture", 2);
+    Check(result["cancelled"].isTrue() && result["targetMiss"].isTrue() && result["started"].isTrue() && result["captured"].isFalse(), "Cancellation after prefix decision preserves real work without inventing full capture");
+    Check(result["validationPassed"].isNull() && result["proof"].isNull() && result["verified"].isFalse() && result["successfulConnections"].get_str() == "1", "Cancelled early miss cannot become a failure, valid proof, or refunded candidate");
+    Check(capture["successfulConnections"].get_str() == result["successfulConnections"].get_str(), "Cancellation retains the frozen capture counter");
+    fixture.service->Command(Attempt(3)); const auto next = fixture.Wait("attempt", 3);
+    Check(next["targetMiss"].isTrue() && next["successfulConnections"].get_str() == "2" && next["cancelled"].isFalse() && fixture.verifications == 0, "Cancellation does not double-count misses or prevent the next attempt");
+}
 void ConcurrentCaptureSnapshotsRemainImmutable() {
     std::mutex gate;
     std::condition_variable condition;
@@ -1153,7 +1256,9 @@ int main() {
         NativePreparedContextReuse(); BudgetAndPacing(); PacedGateWaitsCancelAndClose(); PacedGateInvalidations();
         PacedGateThroughputAndCounters(); AdmissionPausePreservesCaptureAndCancelsWaiters();
         AdmissionPauseDuringStartedAck(); AdmissionValidationAndFailedResume(); PrecomputedBudgetBoundaries();
-        SuccessfulAndMissedProof(); ConcurrentCaptureSnapshotsRemainImmutable(); FailuresAndDnsCache();
+        SuccessfulAndMissedProof(); EarlyTargetMissCountsWithoutVerification(); EarlyTargetMissKeepsFailuresAndWinningValidation();
+        ConcurrentEarlyTargetMissSnapshotsRemainImmutable(); EarlyTargetMissSurvivesCancellationAfterCapture();
+        ConcurrentCaptureSnapshotsRemainImmutable(); FailuresAndDnsCache();
         CancelQueuedAndActive(); CancelWhileVerifying(); BudgetAcrossRequestsAndIds();
         BudgetCountsInvalidCapturesAndMonotonicReports(); EndpointSelectionBoundAndRoundRobin();
         OutputFailureStopsBeforeTcp(); TerminalReplenishmentAtCapacity();
@@ -1163,7 +1268,7 @@ int main() {
         QueuedEndpointRecheckedAndCancellationDoesNotExclude(); PerformanceMinuteBoundariesAndGaps();
         PerformancePriorAndFiniteRates(); PerformanceCacheBoundsAndSmoothedExpiry();
         PerformanceSurvivesSameIpDnsRefreshAndKeepsBudgets(); LocalRouteFailureDoesNotPenalizeRecoveredEndpoint();
-        std::cout << "35 offline service test groups passed\n"; return 0;
+        std::cout << "39 offline service test groups passed\n"; return 0;
     }
     catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }

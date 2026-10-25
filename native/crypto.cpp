@@ -926,7 +926,7 @@ PreparedContext PreparedContext::WithValidationTime(int64_t time) const {
     return result;
 }
 Hash ClaimChallenge(const Context& context) { return PreparedContext(context).Challenge(); }
-static ParsedProof ParsePreparedProof(std::span<const unsigned char> encoded, const PreparedContext& prepared) {
+static ParsedProof ParsePreparedProof(std::span<const unsigned char> encoded, const PreparedContext& prepared, bool certificate_only = false) {
     const auto& context = prepared.Get();
     if (encoded.empty() || encoded.size() > MAX_P2C_PROOF_SIZE) Fail("Invalid P2C proof size");
     ByteReader proof(encoded);
@@ -938,22 +938,33 @@ static ParsedProof ParsePreparedProof(std::span<const unsigned char> encoded, co
     if (!ReadHandshake(proof, 1, MAX_CLIENT_HELLO_SIZE, parsed.client_hello, ch, error) ||
         !ReadHandshake(proof, 2, MAX_SERVER_HELLO_SIZE, parsed.server_hello, sh, error) ||
         !ReadHandshake(proof, 8, MAX_ENCRYPTED_EXTENSIONS_SIZE, parsed.encrypted_extensions, ee, error) ||
-        !ReadHandshake(proof, 11, MAX_P2C_CERTIFICATE_MESSAGE_SIZE, parsed.certificate, cert, error) ||
-        !ReadHandshake(proof, 15, MAX_CERTIFICATE_VERIFY_SIZE, parsed.certificate_verify, cv, error)) Fail(error);
-    if (!proof.Empty()) Fail("Trailing bytes after CertificateVerify");
+        !ReadHandshake(proof, 11, MAX_P2C_CERTIFICATE_MESSAGE_SIZE, parsed.certificate, cert, error)) Fail(error);
+    if (!certificate_only && !ReadHandshake(proof, 15, MAX_CERTIFICATE_VERIFY_SIZE, parsed.certificate_verify, cv, error)) Fail(error);
+    if (!proof.Empty()) Fail(certificate_only ? "Trailing bytes after Certificate" : "Trailing bytes after CertificateVerify");
     ClientHelloState client;
     if (!ParseClientHello(ch, context.domain, prepared.Challenge(), client, error) ||
         !ParseServerHello(sh, client, error) || !ParseEncryptedExtensions(ee, error) ||
-        !ParseCertificate(cert, parsed, error) || !ParseCertificateVerify(cv, client, parsed, error)) Fail(error);
+        !ParseCertificate(cert, parsed, error) ||
+        (!certificate_only && !ParseCertificateVerify(cv, client, parsed, error))) Fail(error);
     Sha256 transcript, work;
     static const Hash work_tag = Digest(AsBytes("ConnectCoin/P2C/work/v2"));
     Tag(work, work_tag);
     for (auto message : {parsed.client_hello, parsed.server_hello, parsed.encrypted_extensions, parsed.certificate}) {
-        transcript.Add(message); work.Add(message);
+        if (!certificate_only) transcript.Add(message);
+        work.Add(message);
     }
-    parsed.transcript_hash = transcript.Finish();
+    if (!certificate_only) parsed.transcript_hash = transcript.Finish();
     parsed.connection_work_hash = work.Finish();
     return parsed;
+}
+static bool WorkMeetsTarget(const Hash& hash, const PreparedContext& prepared) {
+    const auto& target = prepared.Target();
+    // Work digests are interpreted little-endian; targets use display order.
+    // Equality wins, exactly as in full proof verification.
+    return !std::lexicographical_compare(target.begin(), target.end(), hash.rbegin(), hash.rend());
+}
+bool CertificatePrefixMeetsTarget(std::span<const unsigned char> prefix, const PreparedContext& context) {
+    return WorkMeetsTarget(ParsePreparedProof(prefix, context, true).connection_work_hash, context);
 }
 ParsedProof ParseProof(std::span<const unsigned char> encoded, const Context& context) {
     return ParsePreparedProof(encoded, PreparedContext(context));
@@ -996,8 +1007,7 @@ Verification VerifyWithRoots(const ParsedProof& parsed, const PreparedContext& p
     VerifySignature(chain, parsed);
     auto hash = parsed.connection_work_hash;
     std::reverse(hash.begin(), hash.end());
-    const auto& target = prepared.Target();
-    const bool meets = !std::lexicographical_compare(target.begin(), target.end(), hash.begin(), hash.end());
+    const bool meets = WorkMeetsTarget(parsed.connection_work_hash, prepared);
     return {Hex(hash), meets, parsed.certificate_verify_scheme};
 }
 } // namespace

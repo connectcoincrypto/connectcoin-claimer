@@ -577,10 +577,11 @@ export class ClaimsEngine {
     if (request.observed) throw new Error('Duplicate connection observation');
     request.observed = true;
     const { job } = request, key = keyOf(job.bounty);
-    if (observation.captured) {
-      this.countDiagnostic('captures');
+    if (observation.captured || observation.targetMiss === true) {
+      if (observation.captured) this.countDiagnostic('captures');
       const count = this.successCounts.get(key) ?? 0n;
-      // The raw-capture budget is independent of the validated domain window. Replies
+      // The target-evaluable capture budget includes early target misses, never
+      // treating those unauthenticated candidates as validated proofs. Replies
       // from parallel workers may arrive out of order, so never add it twice.
       const observed = observation.successfulConnections === undefined
         ? (count < MAX_P2C_SUCCESSFUL_CONNECTIONS ? count + 1n : count)
@@ -594,31 +595,37 @@ export class ClaimsEngine {
   observeResult(request, result) {
     if (request.resultObserved) throw new Error('Duplicate connection validation observation');
     request.resultObserved = true;
-    if (Object.hasOwn(result, 'blocked') && (result.blocked !== 'budget' || result.captured ||
+    if (Object.hasOwn(result, 'blocked') && (result.blocked !== 'budget' || result.captured || result.targetMiss === true ||
         result.proof !== null || result.verified !== false || result.validationPassed !== null ||
         (!result.started && result.seconds !== 0))) {
       throw new Error('Invalid blocked connection observation');
     }
     if (Object.hasOwn(result, 'localUnavailable') && (result.localUnavailable !== true ||
-        result.captured || result.proof !== null || result.verified !== false || result.validationPassed === true || result.blocked)) {
+        result.captured || result.targetMiss === true || result.proof !== null || result.verified !== false || result.validationPassed === true || result.blocked)) {
       throw new Error('Invalid local-unavailable connection observation');
+    }
+    if ((Object.hasOwn(result, 'targetMiss') && typeof result.targetMiss !== 'boolean') ||
+        (result.targetMiss === true && (!result.started || result.captured || result.proof !== null ||
+          result.verified !== false || result.validationPassed !== null))) {
+      throw new Error('Invalid early target-miss connection observation');
     }
     if (![true, false, null].includes(result.validationPassed) ||
         typeof result.seconds !== 'number' || !Number.isFinite(result.seconds) || result.seconds < 0 || result.seconds > 3600 ||
         (result.validationPassed !== null && !result.started) ||
         (result.validationPassed === true && !result.captured) ||
         (result.validationPassed === null && result.started && !result.cancelled &&
-          result.blocked !== 'budget' && result.localUnavailable !== true)) {
+          result.blocked !== 'budget' && result.localUnavailable !== true && result.targetMiss !== true)) {
       throw new Error('Invalid connection validation observation');
     }
-    // Null means cancellation or admission revoked after ACK, before TCP.
-    // A target miss is still true: work probability already enters rawPriority.
+    // An early miss is an unauthenticated, target-evaluable candidate, not a
+    // validated proof. It still measures endpoint throughput: work probability
+    // already enters rawPriority and must not penalize this score a second time.
     // Local route/family limitations do not measure remote proof quality.
-    if (result.validationPassed === null || result.localUnavailable === true) return;
+    if ((result.validationPassed === null && result.targetMiss !== true) || result.localUnavailable === true) return;
     const { job } = request;
     const domainMask = `${job.bounty.domain}:${job.bounty.signature_algorithms_mask}`;
     const stats = this.domainStats.get(domainMask) ?? new P2CDomainStats(); this.domainStats.set(domainMask, stats);
-    stats.record(result.validationPassed, result.seconds);
+    stats.record(result.targetMiss === true || result.validationPassed, result.seconds);
   }
   dispatch(selection, generation) {
     const [key, job] = selection;
@@ -702,7 +709,7 @@ export class ClaimsEngine {
       } else {
         if (result.message && !result.cancelled) this.jobError(job, new Error(result.message), stage, false,
           { durationMs: Math.round(performance.now() - operationStarted), attempts: 1 });
-        if (!result.captured && !result.cancelled) await this.pauseWorker(controller.signal);
+        if (!result.captured && result.targetMiss !== true && !result.cancelled) await this.pauseWorker(controller.signal);
       }
     }).catch(async error => {
       this.finishOperation(operation, error.name === 'AbortError' && !error.unknownOutcome ? 'cancelled' : 'failed');

@@ -1485,3 +1485,24 @@ test('metrics count only actual starts, release active requests on rejection, an
   assert.equal(metrics.snapshot().connectionsPerSecond, 0);
   assert.equal(metrics.buckets.length, 100);
 });
+
+test('early target misses finish once without inflating valid, failed or winning proof counters', async () => {
+  const metrics = new ClaimMetrics({ now: () => 0 });
+  const miss = { started: true, captured: false, targetMiss: true, validationPassed: null,
+    proof: null, verified: false, cancelled: false };
+  const pool = metrics.wrap({ async attempt(_context, options) {
+    options.onStarted(); options.onResult(miss); return miss;
+  } });
+  await pool.attempt({});
+  assert.deepEqual(metrics.snapshot(), { connectionsStarted: 1, activeConnections: 0, connectionsPerSecond: 0.1,
+    attemptsFinished: 1, valid: 0, invalid: 0, cancelled: 0, targetReached: 0, targetMisses: 1 });
+  const cancelled = metrics.wrap({ async attempt(_context, options) {
+    options.onStarted(); options.onResult({ ...miss, cancelled: true });
+    throw Object.assign(new Error('cancelled'), { name: 'AbortError' });
+  } });
+  await assert.rejects(cancelled.attempt({}), /cancelled/);
+  assert.equal(metrics.snapshot().attemptsFinished, 2);
+  assert.equal(metrics.snapshot().targetMisses, 2);
+  assert.equal(metrics.snapshot().cancelled, 1);
+  assert.equal(metrics.snapshot().activeConnections, 0);
+});

@@ -91,9 +91,15 @@ working directory. Source runs default to `./claimer.conf`.
 - Alternates domain rotation and expected return, using each domain's best
   eligible bounty. Keeps endpoint rotation and successful-connection budgets
   from the desktop engine; performance estimates use the rolling window below.
-- Captures through **CertificateVerify**, without waiting for Finished, while
-  still verifying certificate path, domain, signature policy, proof binding and
-  target before accepting a winning proof. Uses the pinned consensus roots.
+- Checks the work target immediately after **Certificate** and discards misses
+  without waiting for CertificateVerify or verifying signatures. The hash covers
+  ClientHello, ServerHello, EncryptedExtensions and Certificate. Candidates that
+  meet the target continue through **CertificateVerify**, without waiting for
+  Finished, and still require certificate path, domain, time, usage, signature
+  policy, proof binding, signature and target validation before acceptance.
+  Uses the pinned consensus roots. Early discards are reported as `target misses`,
+  separately from valid proofs and failures; each consumes one candidate budget
+  slot, never a claim or authenticated-proof counter.
   The abbreviated capture omits only the TLS library's unused Certificate
   transcript checksum; the proof verifier still hashes and authenticates the
   exact captured transcript. Completed TLS handshakes keep their usual checksum.
@@ -209,7 +215,7 @@ working directory. Source runs default to `./claimer.conf`.
   chain identity, malformed snapshots and fatal helper errors stop the client.
 
 Terminal output reports TCP connection attempts, active started connections, valid and
-failed observations, targets reached and accepted submissions. The recent rate
+failed observations, early target misses, targets reached and accepted submissions. The recent rate
 uses a bounded ten-second window. `accepted` means the RPC acknowledged the
 transaction, **not** that it is confirmed in a block. Duplicate winning proofs
 for the same bounty are not submitted concurrently.
@@ -229,20 +235,26 @@ bandwidth and CPU; a configured rate does not guarantee earnings.
 ### Recent domain and IP performance
 
 Each tracked domain/signature policy and native DNS endpoint/signature policy keeps
-up to **60 one-minute buckets**: concluded observations, locally validated proofs
+up to **60 one-minute buckets**: concluded observations, usable work candidates
 and total TCP/TLS duration. The estimated rate includes a fixed smoothing base:
 
-`rate = (5 + valid proofs in the window) / (1 + total TCP/TLS seconds in the window)`
+`rate = (5 + usable candidates in the window) / (1 + total TCP/TLS seconds in the window)`
+
+A usable candidate is a fully validated proof or a structurally checked
+Certificate prefix discarded because its work hash misses the target. The
+latter measures connection throughput, not authenticated server identity; it
+never increments the valid-proof counter. Winners must pass full verification.
 
 The base is **5 virtual successes and 1 second**, applied once at score lookup,
 not once per observation or per bucket. It never appears in real attempt/proof
 counters, successful-capture budgets or claims. This is a fixed-window ratio with
 a smoothing base, not an exponential moving average or a wall-clock start rate.
 Failed conclusive attempts
-contribute time but no valid proof; cancellation without a validation result is
-not an observation. Explicit local route/family failures retain their actual
+contribute time but no usable candidate; cancellation before a conclusive
+validation or target-miss result is not an observation. Explicit local route/family failures retain their actual
 attempt counters but do not penalize remote domain or endpoint quality. Ordinary
-timeouts still contribute failed observations. All certificate and proof validations still run.
+timeouts still contribute failed observations. All certificate and proof validations
+still run before accepting a winning proof.
 
 The current minute and the previous 59 minutes are retained. This is a
 minute-granularity window: a sample expires approximately 59–60 minutes after
@@ -276,7 +288,7 @@ a concurrent budget/endpoint invalidation vetoes TCP immediately after the ACK;
 such a result never invents a capture, proof, or remote-quality observation.
 Sampler state is bounded to 256 policies. Catalog cleanup or eviction may begin
 a new sampling episode on re-entry, but never resets the global 250 ms deadline.
-Real validated observations alone determine promotion to ordinary economic work;
+Real target-evaluable or validated observations determine promotion to ordinary economic work;
 sampling does not inflate the smoothing base or any actual success counter.
 
 The numeric buckets occupy 1,440 bytes per allocated history, plus metadata.

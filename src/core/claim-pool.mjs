@@ -192,9 +192,11 @@ export class ConnectionPool {
     if (Object.keys(context).some(key => context[key] !== request.body.context[key])) throw new Error('Proof does not match the prepared claim');
     if (typeof message.started !== 'boolean' || message.started !== request.started || typeof message.captured !== 'boolean' || typeof message.cancelled !== 'boolean' ||
         typeof message.seconds !== 'number' || !Number.isFinite(message.seconds) || message.seconds < 0 || message.seconds > 3600 ||
-        (message.captured && !message.started)) throw new Error('Invalid helper capture status');
+        (message.captured && !message.started) ||
+        (Object.hasOwn(message, 'targetMiss') && typeof message.targetMiss !== 'boolean') ||
+        (message.targetMiss === true && (!message.started || message.captured))) throw new Error('Invalid helper capture status');
     counter(message.successfulConnections);
-    const minimum = BigInt(request.body.successfulConnections) + (message.captured ? 1n : 0n);
+    const minimum = BigInt(request.body.successfulConnections) + (message.captured || message.targetMiss === true ? 1n : 0n);
     if (BigInt(message.successfulConnections) < (minimum > MAX_COUNTER ? MAX_COUNTER : minimum)) throw new Error('Helper connection counter moved backwards');
     if (message.type === 'capture') {
       if (Object.hasOwn(message, 'blocked') || Object.hasOwn(message, 'retryAfterMs') || Object.hasOwn(message, 'localUnavailable')) throw new Error('Invalid blocked capture observation');
@@ -203,14 +205,17 @@ export class ConnectionPool {
     }
     if (request.started && !request.capture) throw new Error('Missing helper capture observation');
     if (Object.hasOwn(message, 'blocked')) {
-      if (message.blocked !== 'budget' || message.captured || message.proof !== null ||
+      if (message.blocked !== 'budget' || message.captured || message.targetMiss === true || message.proof !== null ||
           message.verified !== false || message.validationPassed !== null || (!message.started && message.seconds !== 0)) throw new Error('Invalid blocked helper result');
     }
     if (Object.hasOwn(message, 'retryAfterMs')) throw new Error('Unexpected endpoint retry delay');
     if (Object.hasOwn(message, 'localUnavailable') && (message.localUnavailable !== true ||
-        message.captured || message.proof !== null || message.verified !== false || message.validationPassed === true ||
+        message.captured || message.targetMiss === true || message.proof !== null || message.verified !== false || message.validationPassed === true ||
         Object.hasOwn(message, 'blocked'))) throw new Error('Invalid local-unavailable helper result');
-    if (request.capture && (request.capture.captured !== message.captured || request.capture.seconds !== message.seconds ||
+    if (message.targetMiss === true && (message.validationPassed !== null || message.proof !== null || message.verified !== false)) {
+      throw new Error('Invalid early target-miss result');
+    }
+    if (request.capture && (request.capture.captured !== message.captured || (request.capture.targetMiss === true) !== (message.targetMiss === true) || request.capture.seconds !== message.seconds ||
         request.capture.successfulConnections !== message.successfulConnections)) throw new Error('Conflicting helper capture observation');
     if (![true, false, null].includes(message.validationPassed) ||
         (message.validationPassed !== null && !message.started) ||
@@ -219,7 +224,7 @@ export class ConnectionPool {
         // started ACK is being written. The rechecked gate then makes no TCP
         // call. Only these explicitly validated outcomes may be inconclusive.
         (message.validationPassed === null && message.started && !message.cancelled &&
-          message.blocked !== 'budget' && message.localUnavailable !== true)) {
+          message.blocked !== 'budget' && message.localUnavailable !== true && message.targetMiss !== true)) {
       throw new Error('Invalid helper validation observation');
     }
     if (message.proof !== null) {

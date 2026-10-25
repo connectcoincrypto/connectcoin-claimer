@@ -80,6 +80,25 @@ test('recapturing an orphaned confirmed claim permits work without counting the 
   assert.equal(engine.snapshot().completed, 2);
 });
 
+test('early target misses release capacity without failure backoff and preserve the next winning proof', async t => {
+  const { engine, attempts, submissions } = fixture(t, { minExpectedReturn: 0,
+    options: { connectionsPerSecond: 100, concurrency: 1 }, transformPool: pool => ({ ...pool, pacesStarts: true }) });
+  let pauses = 0;
+  engine.pauseWorker = async () => { pauses++; };
+  const bounty = { ...row(), connection_work_target: `7${'f'.repeat(63)}` };
+  engine.enqueue([bounty]); engine.start();
+  await until(() => attempts.length === 1);
+  attempts[0].finish({ captured: false, targetMiss: true, validationPassed: null, successfulConnections: '1' });
+  await until(() => attempts.length === 2);
+  assert.equal(pauses, 0); assert.equal(engine.snapshot().attempts, 2);
+  assert.equal(engine.successCounts.get(key(bounty)), 1n);
+  assert.equal(submissions.length, 0);
+  attempts[1].finish({ captured: true, validationPassed: true, proof: '020100', verified: true, successfulConnections: '2' });
+  await until(() => engine.completed.has(key(bounty)));
+  assert.equal(pauses, 0); assert.deepEqual(submissions, [key(bounty)]);
+  assert.equal(engine.snapshot().completed, 1);
+});
+
 test('orphan recapture accounting is bounded and survives suspension without evicting an outstanding ID', async t => {
   const { engine } = fixture(t, { maxQueue: 1 });
   const first = key(row(1)), second = key(row(2));

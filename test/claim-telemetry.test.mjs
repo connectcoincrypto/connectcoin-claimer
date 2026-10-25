@@ -91,6 +91,28 @@ test('legacy proof generation accepts high-rate bounded progress without importi
   assert.deepEqual(observed.map(value => value.attemptStats), messages.map(value => value.attemptStats));
 });
 
+test('legacy progress counts early target misses separately from authenticated validation samples', async () => {
+  const first = progress(0, []), final = progress(1, [[true, 0.1]]);
+  first.attempts = 5; first.attemptStats.targetMisses = 5;
+  final.attempts = 7; final.attemptStats.targetMisses = 6;
+  const observed = [];
+  assert.equal(await runner([first, final])(context, { onProgress: value => observed.push(value) }), '020100');
+  assert.deepEqual(observed.map(value => value.attempts), [5, 7]);
+  assert.equal(observed.at(-1).attemptStats.completed, 1);
+  assert.deepEqual(observed.at(-1).attemptStats.recent, [[true, 0.1]]);
+  await assert.rejects(runner([first])(context), /lacks TLS statistics/);
+});
+
+test('legacy target-miss counts are bounded and individually monotonic', async () => {
+  for (const targetMisses of [-1, 1.5, null, false, '1', NaN, Infinity, Number.MAX_SAFE_INTEGER, 1000]) {
+    assert.throws(() => validateAttemptStats({ validation: 'certificate-proof-v1', completed: 1, recent: [[true, 0]], targetMisses }, 1000), /statistics/);
+  }
+  const first = progress(1, [[true, 0]]), later = progress(3, [[true, 0], [true, 0], [true, 0]]);
+  first.attemptStats.targetMisses = 5; first.attempts = 6;
+  later.attemptStats.targetMisses = 4; later.attempts = 7;
+  await assert.rejects(runner([first, later])(context), /sequence/);
+});
+
 test('statistics validator rejects malformed or oversized completion records', () => {
   const invalid = [
     null, false, [], {}, { validation: 'certificate-proof-v1', completed: -1, recent: [] }, { validation: 'certificate-proof-v1', completed: 1.5, recent: [] },

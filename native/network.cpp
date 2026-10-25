@@ -611,7 +611,13 @@ static CapturedProof CaptureImpl(const PreparedContext& prepared, const Endpoint
             const auto* message = connection.ssl.in_msg;
             const auto length = connection.ssl.in_hslen;
             Append(proof, message, length, expected);
-            if (expected == 11) ValidateCertificateMessage({message, length});
+            if (expected == 11) {
+                ValidateCertificateMessage({message, length});
+                if (!complete_handshake && !CertificatePrefixMeetsTarget(proof, prepared)) {
+                    Check(control, deadline);
+                    throw CaptureTargetMiss();
+                }
+            }
             if (expected == 15) {
                 // Structural checks and signature-mask enforcement only. Full
                 // certificate/CV authentication is the caller's responsibility.

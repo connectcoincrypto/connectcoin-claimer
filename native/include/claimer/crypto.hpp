@@ -88,6 +88,9 @@ CertificateCacheStats CertificateCacheStatsForTesting();
 void ClearCertificateCacheForTesting();
 #endif
 void ValidateCertificateMessage(std::span<const unsigned char> message);
+// Only a work filter, never authentication. The version-2 prefix must end
+// exactly after Certificate; winners still require complete proof verification.
+bool CertificatePrefixMeetsTarget(std::span<const unsigned char> prefix, const PreparedContext& context);
 void InitializeCrypto();
 void RandomBytes(std::span<unsigned char> output);
 std::string Hex(std::span<const unsigned char> bytes);

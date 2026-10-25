@@ -86,6 +86,8 @@ export function createProofRunner({ helper, basePath = BASE, resourcesPath, spaw
       let settled = false;
       let exitCode;
       let completedAttempts = 0;
+      let validatedAttempts = 0;
+      let targetMisses = 0;
       const stop = (error) => {
         failure ??= error;
         // Terminate the sole helper process, including its worker threads/sockets.
@@ -114,11 +116,15 @@ export function createProofRunner({ helper, basePath = BASE, resourcesPath, spaw
           if (typeof message.elapsed !== 'number' || !Number.isFinite(message.elapsed) || message.elapsed < 0) throw new Error('Invalid helper progress');
           if (message.attemptStats === undefined) throw new Error('Claims helper lacks TLS statistics. Update the app or run npm run build:claims.');
           validateAttemptStats(message.attemptStats, limits.maxAttempts);
-          if (message.attemptStats.completed < completedAttempts || message.attemptStats.completed !== message.attempts) throw new Error('Invalid helper attempt sequence');
-          completedAttempts = message.attemptStats.completed;
+          const misses = message.attemptStats.targetMisses ?? 0;
+          if (message.attemptStats.completed < validatedAttempts || misses < targetMisses ||
+              message.attemptStats.completed + misses !== message.attempts) throw new Error('Invalid helper attempt sequence');
+          validatedAttempts = message.attemptStats.completed;
+          targetMisses = misses;
+          completedAttempts = message.attempts;
           try { onProgress({ attempts: message.attempts, elapsed: message.elapsed, attemptStats: message.attemptStats }); } catch { /* UI callbacks cannot compromise cancellation. */ }
         } else if (message.type === 'result') {
-          if (!completedAttempts) throw new Error('Claims helper lacks TLS statistics. Update the app or run npm run build:claims.');
+          if (!validatedAttempts) throw new Error('Claims helper lacks TLS statistics. Update the app or run npm run build:claims.');
           integer(message.attempts, 1, limits.maxAttempts, 'proof attempts');
           if (message.attempts !== completedAttempts) throw new Error('Invalid helper final attempt sequence');
           const returnedContext = validateClaimContext(message.context);

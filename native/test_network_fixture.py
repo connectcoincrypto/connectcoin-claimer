@@ -26,6 +26,8 @@ from connectcoin_p2c_tools.verify import verify_connection_proof
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM, ChaCha20Poly1305
+from cryptography.hazmat.primitives.kdf.hkdf import HKDFExpand
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID, ObjectIdentifier
 
 
@@ -150,6 +152,113 @@ class Fixture:
             raise AssertionError("Loopback fixture did not stop")
         if self.errors:
             raise AssertionError(self.errors)
+
+
+class CertificatePrefixFixture(Fixture):
+    """Withhold CV on the wire using only this fixture's generated TLS keys.
+
+    OpenSSL normally writes Certificate and CertificateVerify in one flight.
+    MemoryBIO lets the offline fixture reseal that flight ending at Certificate,
+    proving the native client does not need to receive CV to reject a miss.
+    These keys belong only to the generated loopback server, never real traffic.
+    """
+    def __init__(self, context, directory, mode="prefix", *, actions=None):
+        super().__init__(context, mode, len(actions) if actions else 1, actions=actions)
+        self.keylog = directory / "loopback-prefix.keys"
+        self.keylog.write_text("", encoding="ascii")
+        self.tls_context.keylog_filename = str(self.keylog)
+        self.certificates_sent = 0
+
+    def handle(self, connection, action):
+        if action == "tls":
+            return super().handle(connection, action)
+        try:
+            with connection:
+                connection.settimeout(2)
+                incoming, outgoing = ssl.MemoryBIO(), ssl.MemoryBIO()
+                server = self.tls_context.wrap_bio(incoming, outgoing, server_side=True)
+                while not outgoing.pending:
+                    received = connection.recv(16384)
+                    if not received:
+                        raise ConnectionResetError("Loopback client closed before ClientHello")
+                    incoming.write(received)
+                    try:
+                        server.do_handshake()
+                    except ssl.SSLWantReadError:
+                        pass
+                flight = outgoing.read()
+                records = []
+                offset = 0
+                while offset < len(flight):
+                    size = 5 + int.from_bytes(flight[offset + 3:offset + 5], "big")
+                    records.append(flight[offset:offset + size])
+                    offset += size
+                require(offset == len(flight), "Incomplete MemoryBIO server flight")
+                hello = next(record[5:] for record in records if record[0] == 22)
+                suite_offset = 4 + 34 + 1 + hello[4 + 34]
+                suite = int.from_bytes(hello[suite_offset:suite_offset + 2], "big")
+                require(suite in (0x1301, 0x1303), "Unexpected fixture cipher")
+                secret = bytes.fromhex(next(line.split()[2] for line in reversed(self.keylog.read_text().splitlines())
+                                            if line.startswith("SERVER_HANDSHAKE_TRAFFIC_SECRET ")))
+                def expand(label, size):
+                    label = b"tls13 " + label
+                    info = size.to_bytes(2, "big") + bytes([len(label)]) + label + b"\x00"
+                    return HKDFExpand(hashes.SHA256(), size, info).derive(secret)
+                cipher = AESGCM(expand(b"key", 16)) if suite == 0x1301 else ChaCha20Poly1305(expand(b"key", 32))
+                iv = expand(b"iv", 12)
+                def nonce(sequence):
+                    return bytes(a ^ b for a, b in zip(iv, sequence.to_bytes(12, "big")))
+                handshake = bytearray()
+                sequence = 0
+                for record in records:
+                    if record[0] != 23:
+                        connection.sendall(record)
+                        continue
+                    plain = cipher.decrypt(nonce(sequence), record[5:], record[:5]).rstrip(b"\x00")
+                    require(plain[-1] == 22, "Unexpected server inner content type")
+                    handshake.extend(plain[:-1])
+                    sequence += 1
+                offset, certificate_end, verify_offset = 0, None, None
+                while offset < len(handshake):
+                    end = offset + 4 + int.from_bytes(handshake[offset + 1:offset + 4], "big")
+                    require(end <= len(handshake), "Truncated fixture handshake message")
+                    if handshake[offset] == 11:
+                        certificate_end = end
+                        if action == "bad-certificate":
+                            # Corrupt the leaf DER SEQUENCE, keeping envelope
+                            # and record authentication intact.
+                            handshake[offset + 4 + 1 + 3 + 3] = 0x31
+                    if handshake[offset] == 15:
+                        verify_offset = offset
+                        if action == "bad-verify":
+                            handshake[end - 1] ^= 1
+                    offset = end
+                require(certificate_end is not None and verify_offset is not None,
+                        "Fixture did not produce Certificate/CertificateVerify")
+                if action != "bad-verify":
+                    del handshake[certificate_end:]
+                for sequence, offset in enumerate(range(0, len(handshake), 16384)):
+                    plain = bytes(handshake[offset:offset + 16384]) + b"\x16"
+                    header = b"\x17\x03\x03" + (len(plain) + 16).to_bytes(2, "big")
+                    connection.sendall(header + cipher.encrypt(nonce(sequence), plain, header))
+                self.certificates_sent += 1
+                connection.settimeout(0.1)
+                while not self.stop.is_set():
+                    try:
+                        if not connection.recv(1024):
+                            break
+                    except TimeoutError:
+                        pass
+        except (ssl.SSLError, ConnectionResetError, BrokenPipeError, TimeoutError):
+            pass
+        except BaseException as error:
+            self.errors.append(error)
+
+    def __exit__(self, *args):
+        try:
+            super().__exit__(*args)
+        finally:
+            self.tls_context.keylog_filename = None
 
 
 def run(binary: Path, mode: str, fixture: Fixture, timeout: int = 1500, roots: Path | None = None):
@@ -354,7 +463,7 @@ def main() -> None:
             context.minimum_version = context.maximum_version = ssl.TLSVersion.TLSv1_3
             context.load_cert_chain(cert, key)
             context.num_tickets = 0
-            for mode in ("capture", "complete", "slow-start", "parallel", "repeat", f"capture-mask-{2 if rsa else 1}"):
+            for mode in ("capture", "complete", "complete-target-miss", "slow-start", "parallel", "repeat", f"capture-mask-{2 if rsa else 1}"):
                 count = 16 if mode == "parallel" else 2 if mode == "repeat" else 1
                 with Fixture(context, mode, count) as fixture:
                     result, elapsed = run(binary, mode, fixture, roots=roots)
@@ -386,11 +495,36 @@ def main() -> None:
                     require(parsed.certificate_verify_scheme == (0x0804 if rsa else 0x0403), "Unexpected TLS signature scheme")
                 require(len(hellos) == count, "Ephemeral ClientHello randomness was reused")
                 require(len(key_shares) == count, "Ephemeral ClientHello key share was reused")
-                if mode == "complete":
+                if mode in ("complete", "complete-target-miss"):
                     require(fixture.completed == 1, "Full TLS handshake was not completed")
                 if mode == "slow-start":
                     require(elapsed > 1.5, "Slow start fixture did not delay callback")
                 checks += 1
+            with CertificatePrefixFixture(context, root) as fixture:
+                result, _ = run(binary, "target-miss", fixture, roots=roots)
+            require(result.returncode == 0 and result.stdout.strip() == "target-miss" and fixture.certificates_sent == 1,
+                    f"Target miss waited for absent CertificateVerify: {result.stderr}")
+            checks += 1
+            with CertificatePrefixFixture(context, root, actions=("prefix", "tls")) as fixture:
+                result, _ = run(binary, "target-miss-reuse", fixture, roots=roots)
+            require(result.returncode == 0 and fixture.accepted == 2 and fixture.certificates_sent == 1,
+                    f"Target miss corrupted reused TLS state: {result.stderr}")
+            checks += 1
+            with CertificatePrefixFixture(context, root) as fixture:
+                result, _ = run(binary, "capture", fixture, roots=roots)
+            require(result.returncode == 1 and "timed out" in result.stderr and fixture.certificates_sent == 1,
+                    "Winning prefix without CertificateVerify was accepted")
+            checks += 1
+            with CertificatePrefixFixture(context, root, "bad-certificate") as fixture:
+                result, _ = run(binary, "target-miss-malformed", fixture, roots=roots)
+            require(result.returncode == 1 and fixture.certificates_sent == 1 and "timed out" not in result.stderr,
+                    "Malformed losing Certificate was treated as an ordinary target miss")
+            checks += 1
+            with CertificatePrefixFixture(context, root, "bad-verify") as fixture:
+                result, _ = run(binary, "capture", fixture, roots=roots)
+            require(result.returncode == 1 and fixture.certificates_sent == 1 and "timed out" not in result.stderr,
+                    "Winning proof skipped CertificateVerify signature validation")
+            checks += 1
             with Fixture(context, "capture") as fixture:
                 result, _ = run(binary, f"capture-mask-{1 if rsa else 2}", fixture, roots=roots)
             require(result.returncode == 1, "Incompatible signature policy was accepted")
